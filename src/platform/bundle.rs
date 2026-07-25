@@ -256,17 +256,32 @@ pub fn map_bundle_to_policy(file: &SignedBundleFile, caller: &Caller) -> Resolve
                 column_masks: HashMap::new(),
                 row_filter: None,
                 dp_columns: HashMap::new(),
+                projection: None,
             };
         }
     }
 
+    // The contract's read PROJECTION applies to EVERY caller — it is the set of
+    // columns the contract EXPOSES, owner or not. A VIEW hides its non-projected
+    // columns (so `SELECT *` returns only the exposed set and a hidden column is
+    // unresolvable); the base contract's template lists every column, so the
+    // projection is a no-op restriction there. This is what makes a view a real
+    // boundary rather than a mask-only overlay. Derived from the read template's
+    // SELECT list (`projection_from_sql`); enforced by `ContractTableProvider`.
+    let template = non_owner_template(&file.bundle);
+    let projection = template.and_then(projection_from_sql);
+
     let is_owner = !owner.is_empty() && caller.tenant == owner;
     if is_owner {
-        return ResolvedPolicy::allow_all(contract_id, version, owner);
+        // The owner sees raw VALUES (no masks) but still only the columns the
+        // contract exposes — a view restricts the owner's column set too.
+        let mut policy = ResolvedPolicy::allow_all(contract_id, version, owner);
+        policy.projection = projection;
+        return policy;
     }
 
     // Non-owner: derive masks + row filter from the non-owner read SQL template.
-    let (column_masks, row_filter) = match non_owner_template(&file.bundle) {
+    let (column_masks, row_filter) = match template {
         Some(t) => (masks_from_sql(t), row_filter_from_sql(t)),
         None => (HashMap::new(), None),
     };
@@ -279,6 +294,70 @@ pub fn map_bundle_to_policy(file: &SignedBundleFile, caller: &Caller) -> Resolve
         column_masks,
         row_filter,
         dp_columns: HashMap::new(),
+        projection,
+    }
+}
+
+/// Extract the ORDERED output column names from a read template's SELECT list —
+/// the contract's projection (the columns it exposes). Examples:
+/// `SELECT policy_no, sha256_hex(email) AS email FROM {table} WHERE 1=1`
+/// → `Some(["policy_no", "email"])`; `SELECT * FROM {table}` → `None` (no
+/// restriction — expose every column). A masked column always carries an explicit
+/// `AS <col>` alias (T03's bundle compiler emits `<fn>(col) AS col`), so the output
+/// name is the alias when present, else the bare column name (an unaliased
+/// `func(col)` falls back to its inner column). Commas inside function-argument
+/// parentheses are not treated as list separators.
+fn projection_from_sql(sql: &str) -> Option<Vec<String>> {
+    let upper = sql.to_ascii_uppercase();
+    let sel = upper.find("SELECT ")? + "SELECT ".len();
+    let from_rel = upper[sel..].find(" FROM ")?;
+    let list = sql[sel..sel + from_rel].trim();
+    if list == "*" || list.is_empty() {
+        return None;
+    }
+
+    // Split on top-level commas (paren-depth aware).
+    let mut items: Vec<&str> = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, ch) in list.char_indices() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                items.push(&list[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    items.push(&list[start..]);
+
+    let mut out = Vec::with_capacity(items.len());
+    for item in items {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        // Prefer an explicit `... AS <name>` alias (case-insensitive).
+        let iu = item.to_ascii_uppercase();
+        let name = if let Some(pos) = iu.rfind(" AS ") {
+            item[pos + " AS ".len()..].trim()
+        } else if let (Some(op), Some(cl)) = (item.find('('), item.rfind(')')) {
+            // Unaliased `func(col)` → the inner column.
+            item[op + 1..cl].trim()
+        } else {
+            item
+        };
+        let name = name.trim().trim_matches('"').trim();
+        if !name.is_empty() {
+            out.push(name.to_string());
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
     }
 }
 
@@ -450,5 +529,54 @@ mod tests {
         let file = SignedBundleFile::from_json(&demo_bundle_json()).unwrap();
         let policy = map_bundle_to_policy(&file, &Caller::new("u", "marketing", "globex"));
         assert!(!policy.is_allowed());
+    }
+
+    #[test]
+    fn policy_carries_the_read_projection_for_every_caller() {
+        // The read template projects `[user_id, email]` — a view exposes exactly
+        // those columns. Both the non-owner AND the owner see that projection (a
+        // view hides its dropped columns for everyone, even the data owner).
+        let file = SignedBundleFile::from_json(&demo_bundle_json()).unwrap();
+        let non_owner = map_bundle_to_policy(&file, &Caller::new("u", "analytics", "globex"));
+        assert_eq!(
+            non_owner.projection.as_deref(),
+            Some(["user_id".to_string(), "email".to_string()].as_slice())
+        );
+        let owner = map_bundle_to_policy(&file, &Caller::new("u", "analytics", "acme"));
+        assert_eq!(
+            owner.projection.as_deref(),
+            Some(["user_id".to_string(), "email".to_string()].as_slice()),
+            "the owner sees the view's projection too (columns hidden), just unmasked"
+        );
+    }
+
+    #[test]
+    fn projection_from_sql_extracts_aliased_and_bare_columns() {
+        let sql =
+            "SELECT policy_no, product, sha256_hex(branch) AS branch, status FROM {table} WHERE 1=1";
+        assert_eq!(
+            projection_from_sql(sql),
+            Some(vec![
+                "policy_no".to_string(),
+                "product".to_string(),
+                "branch".to_string(),
+                "status".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn projection_from_sql_star_is_no_restriction() {
+        assert_eq!(projection_from_sql("SELECT * FROM {table} WHERE 1=1"), None);
+        assert_eq!(projection_from_sql("SELECT   *   FROM {table}"), None);
+    }
+
+    #[test]
+    fn projection_from_sql_unaliased_func_falls_back_to_inner_column() {
+        // Defensive: an unaliased mask fn still names the column it exposes.
+        assert_eq!(
+            projection_from_sql("SELECT id, sha256_hex(email) FROM {table} WHERE 1=1"),
+            Some(vec!["id".to_string(), "email".to_string()])
+        );
     }
 }

@@ -52,6 +52,14 @@ pub struct ContractTableProvider {
     /// `ProjectionPushdown` rejects the plan with a "Schema mismatch" error.
     /// (Task #26.)
     governed_schema: SchemaRef,
+    /// The contract's read PROJECTION as indices into the FULL governed schema
+    /// (the columns the contract exposes, in the contract's declared order).
+    /// `None` = expose every column (the base contract's identity projection).
+    /// `Some(idx)` narrows `governed_schema` to exactly these columns: `SELECT *`
+    /// returns only them and a non-exposed column is unresolvable — a VIEW hides
+    /// its dropped columns, it is not a mask-only overlay. Derived from
+    /// `policy.projection` (the read template's SELECT list).
+    contract_projection: Option<Vec<usize>>,
 }
 
 impl ContractTableProvider {
@@ -63,14 +71,38 @@ impl ContractTableProvider {
         // failure (which `MaskingExec::new` will also hit and surface loudly at
         // scan time), fall back to the inner schema rather than panicking here.
         let inner_schema = inner.schema();
-        let governed_schema =
+        let full_governed =
             masked_schema_for_bundle(&inner_schema, &bundle).unwrap_or(inner_schema);
+
+        // Resolve the contract's projection (column NAMES) to indices into the
+        // governed schema, in the contract's declared order. A projected column
+        // absent from the table is omitted — narrowing only ever REMOVES columns,
+        // so a name mismatch can never leak an unexposed column (fail-closed).
+        let contract_projection: Option<Vec<usize>> = policy.projection.as_ref().map(|cols| {
+            cols.iter()
+                .filter_map(|name| full_governed.index_of(name).ok())
+                .collect()
+        });
+
+        // The schema DataFusion plans against: narrowed to the projected columns
+        // when the contract sets a projection, else the full governed schema.
+        // `project` cannot fail — every index came from `index_of` on this schema.
+        let governed_schema = match &contract_projection {
+            Some(idx) => Arc::new(
+                full_governed
+                    .project(idx)
+                    .expect("projection indices are valid governed-schema positions"),
+            ),
+            None => full_governed,
+        };
+
         Self {
             inner,
             bundle,
             tenant_id: policy.tenant_id.clone(),
             has_dp: policy.has_dp(),
             governed_schema,
+            contract_projection,
         }
     }
 }
@@ -147,8 +179,23 @@ impl TableProvider for ContractTableProvider {
             masked
         };
 
-        // Honor the query's projection and limit on top of the governed plan.
-        let projected = match projection {
+        // Compose the CONTRACT projection with the QUERY's projection, then honor
+        // the limit, on top of the governed (full-schema) plan.
+        //
+        // `self.contract_projection` holds the exposed columns as indices into the
+        // full governed plan. The query's `projection` indexes the NARROWED
+        // `schema()` the planner saw. So a query index `i` maps to the full-plan
+        // index `contract_projection[i]`; a bare `SELECT *` (query projection
+        // `None`) selects exactly the contract's exposed columns. This is what
+        // makes a view hide its non-exposed columns AND still respect the query's
+        // own SELECT list — enforced here, in the engine, for every caller.
+        let final_indices: Option<Vec<usize>> = match (&self.contract_projection, projection) {
+            (Some(view_idx), Some(q)) => Some(q.iter().map(|&i| view_idx[i]).collect()),
+            (Some(view_idx), None) => Some(view_idx.clone()),
+            (None, Some(q)) => Some(q.clone()),
+            (None, None) => None,
+        };
+        let projected = match &final_indices {
             Some(indices) => apply_projection(governed, indices)?,
             None => governed,
         };

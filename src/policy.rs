@@ -106,10 +106,20 @@ pub struct ResolvedPolicy {
     pub row_filter: Option<String>,
     /// Per-column differential-privacy parameters.
     pub dp_columns: HashMap<String, DpParam>,
+    /// The contract's read PROJECTION — the ordered set of columns this contract
+    /// (base or view) EXPOSES. `None` = expose every column of the underlying
+    /// table (the base contract's identity projection, unchanged behaviour).
+    /// `Some(cols)` restricts the governed table schema to exactly `cols`, in
+    /// order: `SELECT *` returns only these, and a column outside the set is
+    /// unresolvable (a view masks AND hides — it is not a mask-only overlay).
+    /// Derived from the read template's SELECT list; enforced by
+    /// [`crate::contract_table_provider::ContractTableProvider`].
+    pub projection: Option<Vec<String>>,
 }
 
 impl ResolvedPolicy {
-    /// An allow-everything policy (no masks, no filter, no DP) for `contract`.
+    /// An allow-everything policy (no masks, no filter, no DP, no projection
+    /// restriction) for `contract`.
     pub fn allow_all(
         contract_id: impl Into<String>,
         contract_version: impl Into<String>,
@@ -123,6 +133,7 @@ impl ResolvedPolicy {
             column_masks: HashMap::new(),
             row_filter: None,
             dp_columns: HashMap::new(),
+            projection: None,
         }
     }
 

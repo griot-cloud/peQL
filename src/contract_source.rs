@@ -169,6 +169,7 @@ impl ContractSource for JsonContractSource {
                 column_masks: HashMap::new(),
                 row_filter: None,
                 dp_columns: HashMap::new(),
+                projection: None,
             });
         }
 
@@ -200,6 +201,8 @@ impl ContractSource for JsonContractSource {
             column_masks,
             row_filter: contract.row_filter.clone(),
             dp_columns: contract.dp_columns.clone(),
+            // The JSON demo source has no projection concept — expose all columns.
+            projection: None,
         })
     }
 }
