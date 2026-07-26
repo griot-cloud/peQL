@@ -12,7 +12,7 @@ use p256::ecdsa::{signature::Verifier, Signature, VerifyingKey};
 use sha2::{Digest, Sha256};
 
 use crate::contract_source::Caller;
-use crate::policy::{Decision, MaskAction, ResolvedPolicy};
+use crate::policy::{Decision, DpParam, MaskAction, ResolvedPolicy};
 
 // ─── On-disk / on-the-wire shapes (mirror T03 `serialise_signed_bundle`) ──────
 
@@ -277,13 +277,14 @@ pub fn map_bundle_to_policy(file: &SignedBundleFile, caller: &Caller) -> Resolve
         // contract exposes — a view restricts the owner's column set too.
         let mut policy = ResolvedPolicy::allow_all(contract_id, version, owner);
         policy.projection = projection;
+        policy.dp_columns = template.map(dp_from_sql).unwrap_or_default();
         return policy;
     }
 
     // Non-owner: derive masks + row filter from the non-owner read SQL template.
-    let (column_masks, row_filter) = match template {
-        Some(t) => (masks_from_sql(t), row_filter_from_sql(t)),
-        None => (HashMap::new(), None),
+    let (column_masks, row_filter, dp_columns) = match template {
+        Some(t) => (masks_from_sql(t), row_filter_from_sql(t), dp_from_sql(t)),
+        None => (HashMap::new(), None, HashMap::new()),
     };
 
     ResolvedPolicy {
@@ -293,7 +294,7 @@ pub fn map_bundle_to_policy(file: &SignedBundleFile, caller: &Caller) -> Resolve
         decision: Decision::Allow,
         column_masks,
         row_filter,
-        dp_columns: HashMap::new(),
+        dp_columns,
         projection,
     }
 }
@@ -402,6 +403,48 @@ fn masks_from_sql(sql: &str) -> HashMap<String, MaskAction> {
         }
     }
     masks
+}
+
+/// Extract `dp_noise(col, epsilon, sensitivity) AS col` projections as
+/// differential-privacy column parameters — the platform's compiled form of a
+/// view's "blur this number column" rule. The engine's `LaplaceNoiseExec` then
+/// adds noise with scale `sensitivity / epsilon`.
+///
+/// A malformed or non-positive parameter is SKIPPED rather than defaulted: a
+/// silently-wrong epsilon would change how much privacy the column actually gets.
+fn dp_from_sql(sql: &str) -> HashMap<String, DpParam> {
+    let mut out = HashMap::new();
+    const FUNC: &str = "dp_noise(";
+    let mut rest = sql;
+    while let Some(pos) = rest.find(FUNC) {
+        let after = &rest[pos + FUNC.len()..];
+        let Some(close) = after.find(')') else { break };
+        let args = &after[..close];
+        rest = &after[close + 1..];
+
+        let mut parts = args.split(',').map(str::trim);
+        let (Some(col), Some(eps), Some(sens)) = (parts.next(), parts.next(), parts.next()) else {
+            continue;
+        };
+        let col = col.trim_matches('"').trim();
+        let (Ok(epsilon), Ok(sensitivity)) = (eps.parse::<f64>(), sens.parse::<f64>()) else {
+            continue;
+        };
+        if col.is_empty()
+            || !(epsilon.is_finite() && epsilon > 0.0)
+            || !(sensitivity.is_finite() && sensitivity > 0.0)
+        {
+            continue;
+        }
+        out.insert(
+            col.to_string(),
+            DpParam {
+                sensitivity,
+                epsilon,
+            },
+        );
+    }
+    out
 }
 
 /// Extract the `WHERE` clause as a row filter (a trivial `1=1` means no filter).
@@ -563,6 +606,31 @@ mod tests {
                 "status".to_string(),
             ])
         );
+    }
+
+    #[test]
+    fn dp_from_sql_reads_blurred_number_columns() {
+        // T03 compiles a view's "Blur column" choice to dp_noise(col, ε, s).
+        let sql = "SELECT branch, dp_noise(premium_kes, 1, 1) AS premium_kes FROM {table} WHERE 1=1";
+        let dp = dp_from_sql(sql);
+        let p = dp.get("premium_kes").expect("blurred column is parsed");
+        assert_eq!(p.epsilon, 1.0);
+        assert_eq!(p.sensitivity, 1.0);
+        assert_eq!(dp.len(), 1, "only the blurred column carries DP params");
+    }
+
+    #[test]
+    fn dp_from_sql_skips_nonsense_parameters() {
+        // A zero/negative/NaN epsilon would make the noise scale meaningless —
+        // skip the column rather than silently defaulting it.
+        for bad in [
+            "SELECT dp_noise(x, 0, 1) AS x FROM {table}",
+            "SELECT dp_noise(x, -1, 1) AS x FROM {table}",
+            "SELECT dp_noise(x, 1, 0) AS x FROM {table}",
+            "SELECT dp_noise(x) AS x FROM {table}",
+        ] {
+            assert!(dp_from_sql(bad).is_empty(), "must skip: {bad}");
+        }
     }
 
     #[test]
