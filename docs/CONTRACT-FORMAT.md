@@ -35,9 +35,9 @@ it, and how it is masked/filtered for non-owners. The open-source engine
 | `version` | yes | Contract version string. |
 | `dataset` | yes | The name queries target: `SELECT * FROM "<dataset>"`. Must be unique across loaded contracts. |
 | `binding.parquet` | yes | Path to the local Parquet file holding the rows. |
-| `owner_tenant` | yes | The tenant that sees raw data. Callers with `Caller.tenant == owner_tenant` bypass masking/filtering. |
+| `owner_tenant` | yes | The tenant that sees raw data. Callers with `Caller.tenant == owner_tenant` bypass masking/filtering — but still only see the columns `columns` exposes. |
 | `purposes` | no | Allowed query purposes. If non-empty, a `Caller.purpose` not listed is **denied**. Empty/absent = any purpose. |
-| `columns` | no | Column declarations; a column may carry a `mask`. |
+| `columns` | no | The contract's **read projection**: the columns it exposes, in order. A column may carry a `mask`. Listing a subset **hides** the rest — `SELECT *` returns only these, and selecting an undeclared column is an error. Omit `columns` entirely to expose every column of the bound Parquet file. |
 | `columns[].name` | yes | Column name. |
 | `columns[].type` | no | Informational (`int`/`text`/`float`/…); the actual types come from the Parquet file. |
 | `columns[].sensitivity` | no | Informational label (e.g. `pii`). |
@@ -60,8 +60,14 @@ Unknown values are a hard error at load time.
 
 ## Semantics
 
-- **Owner vs. non-owner.** `owner_tenant` callers get raw data. Everyone else
-  gets `mask`-ed columns + `row_filter` + `dp_columns`.
+- **Projection.** `columns` is the contract's shape: the engine narrows the table
+  to exactly those columns before anything else runs. It applies to **every**
+  caller, owner included — hiding a column is a property of the contract, not of
+  who is asking. A contract that declares a subset is the open-source equivalent
+  of a platform "view".
+- **Owner vs. non-owner.** `owner_tenant` callers get raw values. Everyone else
+  gets `mask`-ed columns + `row_filter` + `dp_columns`. Both see the same
+  projection.
 - **Purpose gate.** Evaluated before anything else; a disallowed purpose denies
   the whole query.
 - **Row filter** is a SQL expression over the dataset's columns. It is applied

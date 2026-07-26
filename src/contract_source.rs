@@ -173,14 +173,29 @@ impl ContractSource for JsonContractSource {
             });
         }
 
-        // The owning tenant sees raw data; everyone else gets masks + filters.
+        // `columns`, when declared, IS the contract's read projection — the set of
+        // columns this contract EXPOSES, in declared order. A contract that lists a
+        // subset therefore HIDES the rest (`SELECT *` returns only the declared
+        // columns; anything else is unresolvable), exactly like a platform view.
+        // Omitting `columns` entirely = expose every column of the bound table.
+        let projection: Option<Vec<String>> = if contract.columns.is_empty() {
+            None
+        } else {
+            Some(contract.columns.iter().map(|c| c.name.clone()).collect())
+        };
+
+        // The owning tenant sees raw VALUES (no masks / filter / DP) but still only
+        // the columns the contract exposes — the projection is the contract's shape,
+        // not a per-caller restriction.
         let is_owner = caller.tenant == contract.owner_tenant;
         if is_owner {
-            return Ok(ResolvedPolicy::allow_all(
+            let mut policy = ResolvedPolicy::allow_all(
                 contract.contract_id.clone(),
                 contract.version.clone(),
                 contract.owner_tenant.clone(),
-            ));
+            );
+            policy.projection = projection;
+            return Ok(policy);
         }
 
         let mut column_masks = HashMap::new();
@@ -201,8 +216,7 @@ impl ContractSource for JsonContractSource {
             column_masks,
             row_filter: contract.row_filter.clone(),
             dp_columns: contract.dp_columns.clone(),
-            // The JSON demo source has no projection concept — expose all columns.
-            projection: None,
+            projection,
         })
     }
 }
@@ -237,4 +251,68 @@ pub enum ContractError {
     /// (feature `platform`).
     #[error("platform bundle error: {0}")]
     Platform(String),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn contract_json(columns: &str) -> String {
+        format!(
+            r#"{{
+              "contract_id": "acme/orders",
+              "version": "1",
+              "dataset": "orders",
+              "binding": {{ "parquet": "/tmp/orders.parquet" }},
+              "owner_tenant": "acme",
+              "columns": {columns}
+            }}"#
+        )
+    }
+
+    async fn policy_for(columns: &str, tenant: &str) -> ResolvedPolicy {
+        let src = JsonContractSource::from_json_strs([contract_json(columns)]).unwrap();
+        ContractSource::resolve(
+            &src,
+            &DatasetRef::new("orders"),
+            &Caller::new("u", "analytics", tenant),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn declared_columns_are_the_read_projection() {
+        // A contract declaring a SUBSET exposes exactly that subset — the
+        // open-source equivalent of a platform view.
+        let p = policy_for(
+            r#"[{"name":"order_id"},{"name":"email","mask":"hash_sha256"}]"#,
+            "globex",
+        )
+        .await;
+        assert_eq!(
+            p.projection.as_deref(),
+            Some(["order_id".to_string(), "email".to_string()].as_slice())
+        );
+        assert_eq!(p.column_masks.get("email"), Some(&MaskAction::HashSha256));
+    }
+
+    #[tokio::test]
+    async fn the_owner_sees_the_projection_too() {
+        // Hiding a column is a property of the CONTRACT, not of who is asking:
+        // the owner gets raw values but the same narrowed column set.
+        let p = policy_for(r#"[{"name":"order_id"},{"name":"email"}]"#, "acme").await;
+        assert_eq!(
+            p.projection.as_deref(),
+            Some(["order_id".to_string(), "email".to_string()].as_slice())
+        );
+        assert!(p.column_masks.is_empty(), "owner reads raw values");
+    }
+
+    #[tokio::test]
+    async fn omitting_columns_exposes_everything() {
+        // Back-compat: no `columns` block = no restriction.
+        let p = policy_for("[]", "globex").await;
+        assert_eq!(p.projection, None);
+    }
 }
