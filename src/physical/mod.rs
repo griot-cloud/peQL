@@ -13,7 +13,8 @@
 //!       └─ MaskingExec
 //!           └─ RowFilterExec
 //!               └─ ContractApprovedExec
-//!                   └─ <any DataFusion physical plan>
+//!                   └─ ScanMetricsExec (records raw scan rows/bytes; ADR-0052 follow-up #42)
+//!                       └─ <any DataFusion physical plan>
 //! ```
 //!
 //! # ADR-0002 verified-binary surface
@@ -37,6 +38,7 @@ pub mod contract_approved_exec;
 pub mod laplace_noise_exec;
 pub mod masking_exec;
 pub mod row_filter_exec;
+pub mod scan_metrics_exec;
 
 // ─── Shared physical-layer types ─────────────────────────────────────────────
 

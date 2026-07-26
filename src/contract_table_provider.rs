@@ -32,6 +32,7 @@ use crate::physical::contract_approved_exec::ContractApprovedExec;
 use crate::physical::laplace_noise_exec::LaplaceNoiseExec;
 use crate::physical::masking_exec::{masked_schema_for_bundle, MaskingExec};
 use crate::physical::row_filter_exec::RowFilterExec;
+use crate::physical::scan_metrics_exec::ScanMetricsExec;
 use crate::physical::PhysicalError;
 use crate::policy::ResolvedPolicy;
 use crate::ContractBundleHandle;
@@ -156,12 +157,20 @@ impl TableProvider for ContractTableProvider {
         // the contract references, regardless of the query's SELECT list.
         let inner_plan = self.inner.scan(state, None, &[], None).await?;
 
+        // Record the raw (pre-enforcement) scan volume — rows and bytes — before
+        // any contract operator narrows the result. This is the figure K04D's
+        // cost-metering emitter bills on (ADR-0052 follow-up #42): "what did the
+        // engine have to read", not "what did it hand back". See the module docs
+        // on `ScanMetricsExec` for why this can't just be read off the raw plan's
+        // own `metrics()` (the platform's and the OSS engine's `TableProvider`
+        // implementations both load fully into a `MemTable`, which reports none).
+        let metered: Arc<dyn ExecutionPlan> = Arc::new(ScanMetricsExec::new(inner_plan));
+
         // Build the contract enforcement stack. `ContractApprovedExec` is the
         // proof the scan was contract-checked; the downstream operators refuse
         // to run without it upstream.
-        let approved: Arc<dyn ExecutionPlan> = Arc::new(
-            ContractApprovedExec::new(self.bundle.clone(), inner_plan).map_err(phys_to_df)?,
-        );
+        let approved: Arc<dyn ExecutionPlan> =
+            Arc::new(ContractApprovedExec::new(self.bundle.clone(), metered).map_err(phys_to_df)?);
         let filtered: Arc<dyn ExecutionPlan> =
             Arc::new(RowFilterExec::new(self.bundle.clone(), approved).map_err(phys_to_df)?);
         let masked: Arc<dyn ExecutionPlan> =

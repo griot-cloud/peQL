@@ -16,11 +16,13 @@ use std::sync::Arc;
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
+use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::binding::BindingResolver;
 use crate::catalog::{GriotCatalogProvider, GriotSchemaProvider};
 use crate::contract_source::{Caller, ContractError, ContractSource, JsonContractSource};
+use crate::physical::scan_metrics_exec::BYTES_SCANNED_METRIC;
 use crate::{DdlGuard, EngineError};
 
 /// DataFusion's `ProjectionPushdown` physical-optimizer rule, which we drop for
@@ -95,7 +97,30 @@ impl GriotEngine {
     /// Datasets are referenced by their (quoted) URI, e.g.
     /// `SELECT * FROM "sales/orders/v1"`. Masking, row filtering and DP noise
     /// from the governing contract are applied inside the query plan.
+    ///
+    /// This is a thin wrapper over [`GriotEngine::query_with_stats`] that
+    /// drops the scan-accounting [`QueryStats`] for callers that don't need
+    /// it. Behaviourally identical to the pre-ADR-0052-follow-up-#42 `query`.
     pub async fn query(&self, sql: &str, caller: Caller) -> Result<Vec<RecordBatch>, EngineError> {
+        Ok(self.query_with_stats(sql, caller).await?.batches)
+    }
+
+    /// Run `sql` as `caller`, returning governed rows PLUS scan-level
+    /// accounting metadata (ADR-0052 follow-up #42).
+    ///
+    /// Identical governed-query semantics to [`GriotEngine::query`] — same
+    /// contract resolution, same masking/row-filter/DP enforcement, same
+    /// errors. The only difference is that this method retains the physical
+    /// plan after execution and sums the `bytes_scanned` metric (see
+    /// [`crate::physical::scan_metrics_exec::ScanMetricsExec`]) across every
+    /// scan node in the tree, giving callers a real "what did the engine
+    /// have to read" figure instead of having to approximate it from the
+    /// (already filtered/masked/limited) result batches.
+    pub async fn query_with_stats(
+        &self,
+        sql: &str,
+        caller: Caller,
+    ) -> Result<QueryOutcome, EngineError> {
         // Defence-in-depth: reject unsafe DDL before planning.
         DdlGuard::reject_unsafe_ddl(sql)?;
 
@@ -112,8 +137,78 @@ impl GriotEngine {
         ctx.register_catalog(CATALOG_NAME, catalog);
 
         let df = ctx.sql(sql).await?;
-        let batches = df.collect().await?;
-        Ok(batches)
+        let task_ctx = ctx.task_ctx();
+        let plan = df.create_physical_plan().await?;
+        let batches = datafusion::physical_plan::collect(plan.clone(), task_ctx).await?;
+        let stats = scan_stats_from_plan(plan.as_ref());
+        Ok(QueryOutcome { batches, stats })
+    }
+}
+
+/// The result of a governed query: the enforced rows plus the raw scan-level
+/// accounting the physical plan reported (ADR-0052 follow-up #42).
+#[derive(Debug, Clone)]
+pub struct QueryOutcome {
+    /// The enforced (masked / row-filtered / projected / limited) result rows
+    /// — identical to what [`GriotEngine::query`] returns.
+    pub batches: Vec<RecordBatch>,
+    /// Scan-level accounting, summed across every scan node in the physical
+    /// plan. All-zero (not absent) for a query that touches no table (e.g.
+    /// `SELECT 1`) or whose scan produced zero rows.
+    pub stats: QueryStats,
+}
+
+/// Raw (pre-enforcement) scan volume for a single query, summed across every
+/// table it read.
+///
+/// "Raw" means: before `RowFilterExec`/`MaskingExec` narrow the rows, and
+/// before the query's own projection/`LIMIT` trims the result — this is the
+/// volume the engine had to read off storage to answer the query, which is
+/// what a usage/billing meter should charge on. It is intentionally NOT the
+/// size of `QueryOutcome::batches` (the enforced result), which can be many
+/// orders of magnitude smaller for a selective filter or an aggregate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryStats {
+    /// Total bytes scanned, summed across every table this query read.
+    ///
+    /// Measured as the Arrow in-memory size
+    /// (`RecordBatch::get_array_memory_size`) of the raw batches each scan
+    /// produced — the truest figure available without a native file-level
+    /// byte-scan metric from the underlying `TableProvider`. See
+    /// [`crate::physical::scan_metrics_exec::ScanMetricsExec`]'s module doc
+    /// for why the platform's and the OSS engine's current `MemTable`-backed
+    /// readers don't expose one natively.
+    pub bytes_scanned: u64,
+    /// Total rows scanned (raw, pre-filter), summed across every table this
+    /// query read.
+    pub rows_scanned: u64,
+}
+
+/// Walk `plan` and every descendant, summing the `bytes_scanned` metric
+/// (and the co-located `output_rows` metric on the same node) wherever a
+/// [`crate::physical::scan_metrics_exec::ScanMetricsExec`] — or any future
+/// scan node that reports a metric of that name — appears in the tree.
+///
+/// Metrics are recorded per-partition and DataFusion's `MetricsSet::sum_by_name`
+/// already aggregates across partitions for a single node, so this only needs
+/// to sum across NODES, not partitions.
+fn scan_stats_from_plan(plan: &dyn ExecutionPlan) -> QueryStats {
+    let mut stats = QueryStats::default();
+    accumulate_scan_stats(plan, &mut stats);
+    stats
+}
+
+fn accumulate_scan_stats(plan: &dyn ExecutionPlan, stats: &mut QueryStats) {
+    if let Some(metrics) = plan.metrics() {
+        if let Some(bytes) = metrics.sum_by_name(BYTES_SCANNED_METRIC) {
+            stats.bytes_scanned += bytes.as_usize() as u64;
+            if let Some(rows) = metrics.output_rows() {
+                stats.rows_scanned += rows as u64;
+            }
+        }
+    }
+    for child in plan.children() {
+        accumulate_scan_stats(child.as_ref(), stats);
     }
 }
 
