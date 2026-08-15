@@ -141,8 +141,6 @@ holds by construction. Full design: **[GRAPH-QUERY.md](GRAPH-QUERY.md)**.
 
 ## Deliberate non-goals (today)
 
-- Column **hiding** (masking is wired; dropping columns from the visible schema is
-  a follow-up).
 - Streaming large files (local binding uses an in-memory `MemTable`).
 - Auto-attaching signed **attestation** envelopes to results.
 - Wiring this engine into the Griot Cloud deployment (replacing the in-cluster
