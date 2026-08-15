@@ -121,6 +121,24 @@ is exercised offline in `tests/platform_bundle.rs` and
 | `src/physical/*` | the enforcement operators (reused unchanged) |
 | `src/platform/*` | T03 signed-bundle adapter (feature `platform`) |
 
+## Graph surface (2.0, in progress)
+
+The 2.0 line extends the same architecture to **graphs**. A compiled
+process-graph snapshot (nodes/edges Parquet + manifest + cert) is just a
+contract-bound dataset with two access surfaces, both hanging off one governed
+handle produced only through contract resolution:
+
+- **Relational** — `graph_nodes(ref)` / `graph_edges(ref)` are `ContractTableProvider`s
+  over the snapshot's Parquet, governed by the **existing operator stack**, unchanged.
+- **Traversal** — six SQL table functions (`graph_node`, `graph_neighbors`,
+  `graph_edges`, `graph_subtree`, `graph_path`, `graph_reachable`) walk the graph.
+
+The same `ResolvedPolicy` governs both: `masks` → output masking, `row_filter`
+(a node predicate) → a **visibility bitmask** the traversal consults as a *wall*
+(a filtered node is non-existent **and** non-traversable — no path routes through
+it), plus a graph-only `edge_filter` to hide relationships. "No un-governed path"
+holds by construction. Full design: **[GRAPH-QUERY.md](GRAPH-QUERY.md)**.
+
 ## Deliberate non-goals (today)
 
 - Column **hiding** (masking is wired; dropping columns from the visible schema is

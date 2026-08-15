@@ -75,6 +75,32 @@ Unknown values are a hard error at load time.
 - **DP** adds Laplace noise to the named columns (sensitivity/ε); it is an
   engine capability and has no T03-platform equivalent.
 
+## Graph contracts (2.0, in progress)
+
+A process-graph snapshot is a contract-bound dataset too. Its contract is the
+same format with two additions (full design in [GRAPH-QUERY.md](GRAPH-QUERY.md)):
+
+```json
+{
+  "contract_id": "zijani_ops_graph",
+  "dataset": "process-graphs/zijani-operations/v7",
+  "binding": { "graph_snapshot": "lakehouse://process-graphs/zijani-operations/v7/" },
+  "owner_tenant": "zijani",
+  "purposes": ["process_analysis"],
+  "masks":       { "owner": "redact", "system_ref": "redact", "condition": "redact" },
+  "node_filter": "kind != 'system'",
+  "edge_filter": "edge_type != 'depends_on'"
+}
+```
+
+- **`binding.graph_snapshot`** points at a snapshot bundle directory (nodes/edges
+  Parquet + manifest + cert), not a single Parquet file.
+- **`masks`** / **`node_filter`** are the tabular `column_masks` / `row_filter`
+  reinterpreted over node columns. Crucially, `node_filter` makes a filtered node
+  a **wall** — absent *and* non-traversable, so no path routes through it.
+- **`edge_filter`** is graph-only: it hides a *relationship* (e.g. all
+  `depends_on` edges) even between two visible nodes — a lever tables don't have.
+
 ## Relationship to Griot Cloud (T03) contracts
 
 This JSON is an engine-native, open-source format. On the platform, the same

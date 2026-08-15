@@ -15,6 +15,13 @@ GriotQL works two ways from the same core:
 - **Open-source / standalone** — contracts are simple JSON; data is local Parquet. No services, no network, no `protoc`.
 - **Platform** (`--features platform`) — contracts are Griot Cloud's signed T03 bundles (ECDSA-P256), consumed and verified, mapping to the exact same enforcement.
 
+> **Coming in 2.0 — graphs.** GriotQL is growing SQL graph traversal
+> (`graph_neighbors`, `graph_path`, `graph_reachable`, …) over compiled
+> process-graph snapshots, governed by the *same* contract policy: a
+> policy-filtered node becomes a **wall** — non-existent *and* non-traversable —
+> so governance applies to the walk, not just the output. Design:
+> [docs/GRAPH-QUERY.md](docs/GRAPH-QUERY.md).
+
 ---
 
 ## Quickstart (60 seconds)

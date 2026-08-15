@@ -3,6 +3,25 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [2.0.0] — Unreleased — graph query capability
+
+The 2.0 line adds **SQL graph traversal** over compiled process-graph snapshots,
+governed by the same contract policy as tabular datasets. Version is `2.0.0-dev`
+until the feature ships.
+
+- **Design landed** (this change): [`docs/GRAPH-QUERY.md`](docs/GRAPH-QUERY.md) —
+  the grounding spec (governance model, architecture mapping, the six functions,
+  the graph contract format, fixtures, and the phased build + R→T test matrix).
+  Docs updated: README, `docs/ARCHITECTURE.md`, `docs/CONTRACT-FORMAT.md`.
+- **Governance model:** one `ResolvedPolicy` governs two surfaces — the graph's
+  relational node/edge tables (existing operator stack, unchanged) and the six
+  traversal functions. A policy-filtered node becomes a **wall** (non-existent
+  *and* non-traversable), so no path routes through it; plus a graph-only
+  `edge_filter` to hide relationships. "No un-governed path" holds by construction.
+- **Implementation:** in progress — `graph_node` / `graph_neighbors` /
+  `graph_edges` / `graph_subtree` / `graph_path` / `graph_reachable`, a governed
+  snapshot handle + session cache, bundle verification, and Python parity.
+
 ## [0.2.0] — contract resolution spine + platform adapter
 
 Turned the engine from "mask a hand-fed batch" into "query a contract": you now
