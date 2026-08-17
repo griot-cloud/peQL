@@ -80,12 +80,29 @@ struct JsonContract {
     row_filter: Option<String>,
     #[serde(default)]
     dp_columns: HashMap<String, DpParam>,
+    /// Flat column→mask map (graph-style authoring); merged with
+    /// `columns[].mask`. Either spelling works for either dataset shape.
+    #[serde(default)]
+    masks: HashMap<String, String>,
+    /// Graph alias for `row_filter`: a predicate over NODE columns. For graph
+    /// datasets a filtered node is a WALL (absent and non-traversable).
+    #[serde(default)]
+    node_filter: Option<String>,
+    /// Graph-only: a predicate over EDGE columns hiding relationships even
+    /// between visible nodes (e.g. `edge_type != 'depends_on'`).
+    #[serde(default)]
+    edge_filter: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct JsonBinding {
-    /// Path to a local Parquet file holding this dataset's rows.
-    parquet: String,
+    /// Path to a local Parquet file holding this dataset's rows (tabular).
+    #[serde(default)]
+    parquet: Option<String>,
+    /// Path to a local graph snapshot bundle DIRECTORY (nodes/edges Parquet +
+    /// manifest.json) for graph datasets. A `file://` prefix is tolerated.
+    #[serde(default)]
+    graph_snapshot: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -170,6 +187,7 @@ impl ContractSource for JsonContractSource {
                 row_filter: None,
                 dp_columns: HashMap::new(),
                 projection: None,
+                graph_edge_filter: None,
             });
         }
 
@@ -207,6 +225,13 @@ impl ContractSource for JsonContractSource {
                 }
             }
         }
+        // The flat `masks` map (graph-style authoring) merges in on top.
+        for (col, mask) in &contract.masks {
+            let action = MaskAction::parse(mask)?;
+            if action != MaskAction::Noop {
+                column_masks.insert(col.clone(), action);
+            }
+        }
 
         Ok(ResolvedPolicy {
             contract_id: contract.contract_id.clone(),
@@ -214,9 +239,12 @@ impl ContractSource for JsonContractSource {
             tenant_id: contract.owner_tenant.clone(),
             decision: Decision::Allow,
             column_masks,
-            row_filter: contract.row_filter.clone(),
+            // `node_filter` is the graph spelling of `row_filter`; for graphs a
+            // filtered node is a wall (docs/GRAPH-QUERY.md §3).
+            row_filter: contract.row_filter.clone().or(contract.node_filter.clone()),
             dp_columns: contract.dp_columns.clone(),
             projection,
+            graph_edge_filter: contract.edge_filter.clone(),
         })
     }
 }
@@ -228,7 +256,26 @@ impl BindingResolver for JsonContractSource {
             .contracts
             .get(dataset.as_str())
             .ok_or_else(|| BindingError::NotFound(dataset.to_string()))?;
-        load_parquet_as_provider(Path::new(&contract.binding.parquet))
+        let parquet = contract
+            .binding
+            .parquet
+            .as_ref()
+            .ok_or_else(|| BindingError::NotFound(format!(
+                "{dataset} has no tabular binding (it is a graph dataset; use the graph_* functions)"
+            )))?;
+        load_parquet_as_provider(Path::new(parquet))
+    }
+
+    fn resolve_graph_dir(&self, dataset: &DatasetRef) -> Option<std::path::PathBuf> {
+        let raw = self
+            .contracts
+            .get(dataset.as_str())?
+            .binding
+            .graph_snapshot
+            .as_deref()?;
+        Some(std::path::PathBuf::from(
+            raw.strip_prefix("file://").unwrap_or(raw),
+        ))
     }
 }
 

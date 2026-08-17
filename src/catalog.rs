@@ -67,13 +67,20 @@ impl SchemaProvider for GriotSchemaProvider {
     async fn table(&self, name: &str) -> DFResult<Option<Arc<dyn TableProvider>>> {
         let dataset = DatasetRef::new(name);
 
-        let policy = self
-            .source
-            .resolve(&dataset, &self.caller)
-            .await
-            .map_err(|e| {
-                DataFusionError::Plan(format!("contract resolution failed for '{name}': {e}"))
-            })?;
+        let policy = match self.source.resolve(&dataset, &self.caller).await {
+            Ok(p) => p,
+            // Unknown dataset: report "no such table" (`Ok(None)`) rather than
+            // erroring — DataFusion pre-resolves EVERY name in a FROM clause
+            // through the catalog, including table-FUNCTION names like
+            // `graph_nodes(...)`, before the planner consults the function
+            // registry. An `Err` here would kill valid graph-function queries.
+            Err(crate::contract_source::ContractError::NotFound(_)) => return Ok(None),
+            Err(e) => {
+                return Err(DataFusionError::Plan(format!(
+                    "contract resolution failed for '{name}': {e}"
+                )))
+            }
+        };
 
         match &policy.decision {
             Decision::Deny { reason } => Err(DataFusionError::Plan(format!(

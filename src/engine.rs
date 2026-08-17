@@ -58,12 +58,25 @@ const SCHEMA_NAME: &str = "data";
 pub struct GriotEngine {
     source: Arc<dyn ContractSource>,
     binding: Arc<dyn BindingResolver>,
+    /// Engine-lifetime graph snapshot cache (G02 R5): loaded bundles are shared
+    /// read-only; governed views are keyed by (snapshot, policy fingerprint) so
+    /// callers with different policies never share a structure.
+    graph_cache: Arc<crate::graph::snapshot::GraphCache>,
 }
 
 impl GriotEngine {
     /// Build from any contract source + binding resolver.
     pub fn new(source: Arc<dyn ContractSource>, binding: Arc<dyn BindingResolver>) -> Self {
-        Self { source, binding }
+        Self {
+            source,
+            binding,
+            graph_cache: Arc::new(crate::graph::snapshot::GraphCache::default()),
+        }
+    }
+
+    /// The graph snapshot cache (exposed for R5/T5 observability in tests).
+    pub fn graph_cache(&self) -> &Arc<crate::graph::snapshot::GraphCache> {
+        &self.graph_cache
     }
 
     /// Build an open-source engine from a directory of JSON contracts. The same
@@ -124,6 +137,7 @@ impl GriotEngine {
         // Defence-in-depth: reject unsafe DDL before planning.
         DdlGuard::reject_unsafe_ddl(sql)?;
 
+        let graph_caller = caller.clone();
         let schema = Arc::new(GriotSchemaProvider::new(
             self.source.clone(),
             self.binding.clone(),
@@ -135,6 +149,15 @@ impl GriotEngine {
             SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, SCHEMA_NAME),
         );
         ctx.register_catalog(CATALOG_NAME, catalog);
+
+        // Graph table functions, bound to this caller (docs/GRAPH-QUERY.md §4.3).
+        let graph_session = Arc::new(crate::graph::snapshot::GraphSession {
+            source: self.source.clone(),
+            binding: self.binding.clone(),
+            caller: graph_caller,
+            cache: self.graph_cache.clone(),
+        });
+        crate::graph::functions::register_graph_functions(&ctx, graph_session);
 
         let df = ctx.sql(sql).await?;
         let task_ctx = ctx.task_ctx();

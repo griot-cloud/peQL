@@ -15,12 +15,14 @@ GriotQL works two ways from the same core:
 - **Open-source / standalone** — contracts are simple JSON; data is local Parquet. No services, no network, no `protoc`.
 - **Platform** (`--features platform`) — contracts are Griot Cloud's signed T03 bundles (ECDSA-P256), consumed and verified, mapping to the exact same enforcement.
 
-> **Coming in 2.0 — graphs.** GriotQL is growing SQL graph traversal
-> (`graph_neighbors`, `graph_path`, `graph_reachable`, …) over compiled
-> process-graph snapshots, governed by the *same* contract policy: a
-> policy-filtered node becomes a **wall** — non-existent *and* non-traversable —
-> so governance applies to the walk, not just the output. Design:
-> [docs/GRAPH-QUERY.md](docs/GRAPH-QUERY.md).
+> **New in 2.0 — graphs.** GriotQL traverses compiled business-process graphs
+> in plain SQL — `graph_neighbors`, `graph_path`, `graph_reachable`,
+> `graph_subtree`, `graph_node`, `graph_edges`, `graph_nodes` — governed by the
+> *same* contract policy as tables: a policy-filtered node is a **wall**
+> (non-existent *and* non-traversable, no topology leak), an `edge_filter` can
+> hide relationships, and masks apply to traversal output. Traversal runs on the
+> bundle's precompiled CSR offsets — no query-time index build. Try it:
+> `cargo run --example graph_query`. Design + as-built: [docs/GRAPH-QUERY.md](docs/GRAPH-QUERY.md).
 
 ---
 
@@ -109,6 +111,7 @@ A clean checkout builds and tests with **only Rust + cargo** — no `protoc`, no
 |---|---|---|
 | **Contract query** | `cargo run --example contract_query` | The headline: `SELECT … FROM "<dataset>"` resolves a JSON contract + local Parquet → governed rows; owner vs. outsider; purpose-gate deny. |
 | **Platform bundle** | `cargo run --example platform_bundle --features platform` | Governance driven by a **real T03 signed bundle** (`fixtures/…gdcpc.signed`) — same engine, no live services. |
+| **Graph traversal (2.0)** | `cargo run --example graph_query` | Walk the real `zijani-operations` process graph (271 nodes) in SQL: neighbors, reachability, masked outsider view, and the governance **wall**. |
 | Plain SQL | `cargo run --example plain_sql` | It's a real DataFusion engine; INV-1 gate + DDL guard. |
 | Column masking | `cargo run --example column_masking` | The masking operator in isolation. |
 | Row filter | `cargo run --example row_filter` | The row-filter operator in isolation. |

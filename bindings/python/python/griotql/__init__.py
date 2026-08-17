@@ -21,7 +21,7 @@ import pyarrow as _pa
 from ._native import Caller, Engine as _NativeEngine
 
 __all__ = ["Engine", "Caller"]
-__version__ = "2.0.0.dev0"
+__version__ = "2.0.0"
 
 
 class Engine:
