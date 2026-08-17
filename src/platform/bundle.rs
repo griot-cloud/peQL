@@ -257,6 +257,7 @@ pub fn map_bundle_to_policy(file: &SignedBundleFile, caller: &Caller) -> Resolve
                 row_filter: None,
                 dp_columns: HashMap::new(),
                 projection: None,
+                graph_edge_filter: None,
             };
         }
     }
@@ -296,6 +297,7 @@ pub fn map_bundle_to_policy(file: &SignedBundleFile, caller: &Caller) -> Resolve
         row_filter,
         dp_columns,
         projection,
+        graph_edge_filter: None,
     }
 }
 
@@ -611,7 +613,8 @@ mod tests {
     #[test]
     fn dp_from_sql_reads_blurred_number_columns() {
         // T03 compiles a view's "Blur column" choice to dp_noise(col, ε, s).
-        let sql = "SELECT branch, dp_noise(premium_kes, 1, 1) AS premium_kes FROM {table} WHERE 1=1";
+        let sql =
+            "SELECT branch, dp_noise(premium_kes, 1, 1) AS premium_kes FROM {table} WHERE 1=1";
         let dp = dp_from_sql(sql);
         let p = dp.get("premium_kes").expect("blurred column is parsed");
         assert_eq!(p.epsilon, 1.0);

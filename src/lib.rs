@@ -659,3 +659,7 @@ pub mod engine;
 /// Platform adapter: consume T03's signed contract bundle (feature `platform`).
 #[cfg(feature = "platform")]
 pub mod platform;
+
+/// Graph query capability (2.0): governed traversal over compiled
+/// process-graph snapshot bundles. See `docs/GRAPH-QUERY.md`.
+pub mod graph;

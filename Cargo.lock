@@ -3450,7 +3450,7 @@ dependencies = [
 
 [[package]]
 name = "griot"
-version = "2.0.0-dev"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "arrow 55.2.0",

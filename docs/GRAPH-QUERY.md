@@ -1,6 +1,6 @@
 # GriotQL Graph Query — Design & Implementation Spec (2.0)
 
-**Status:** design locked, implementation pending · **Requirements:** G01 (bundle) + G02 (query) · **This doc:** how G02 lands on GriotQL's real architecture and governance.
+**Status:** **implemented (2.0.0)** — see §11 for the as-built notes · **Requirements:** G01 (bundle) + G02 (query) · **This doc:** how G02 lands on GriotQL's real architecture and governance.
 
 This is the single grounding artifact for the graph capability. G01 and G02 are
 the *requirements* (bundle schema, R1–R11, acceptance tests T1–T10); this doc is
@@ -195,3 +195,32 @@ tables (designed-for, not built — the opaque-surface rule, R9, is the whole
 forward-compat investment); no large-graph frontier regime (v1 envelope
 ≤50k nodes / 200k edges; exceeding it fails with a clear error); no cross-graph
 traversal (join across graphs relationally instead).
+
+## 11. As-built notes (v2.0.0)
+
+- **Module layout** is exactly §4.2: `src/graph/{types,bundle,policy,traverse,snapshot,functions}.rs`.
+- **Arguments are positional** (D3 resolved: DataFusion 47 UDTFs receive a
+  positional literal list; `=>` named notation is not part of its UDTF surface).
+  Signatures:
+  `graph_node(ref, node)` ·
+  `graph_neighbors(ref, node [, direction [, edge_types_csv]])` ·
+  `graph_edges(ref [, node [, direction [, edge_types_csv]]])` ·
+  `graph_subtree(ref, node [, max_depth [, follow_call_refs]])` ·
+  `graph_path(ref, from, to [, direction [, max_depth [, edge_types_csv]]])` ·
+  `graph_reachable(ref, node [, direction [, max_depth [, edge_types_csv]]])` ·
+  `graph_nodes(ref)` (R11 relational scan; `graph_edges(ref)` is the edge scan).
+- **Disclosure**: every result carries a `snapshot_version` column (R7); results
+  with caps carry a `truncated` column distinguishing "no more" from "cut".
+- **Masking** runs the assembled traversal output through the *real*
+  `ContractApprovedExec → MaskingExec` operators — graph masking is
+  byte-identical to tabular masking.
+- **Policy compilation** evaluates `node_filter`/`edge_filter` with DataFusion
+  itself over the snapshot's node/edge batches (no bespoke predicate language).
+- **Certificate verification** is not wired in v1 standalone (the OSS posture;
+  fixture bundles carry no certificate). Digest + format verification is
+  mandatory and tested. Platform-path GDCP verification remains follow-up.
+- **Test coverage**: `tests/graph_bundle.rs` (loader + verification, real
+  bundle), `tests/graph_traverse.rs` (33 algorithm tests incl. the mini-T7 wall
+  suite), `tests/graph_functions.rs` (10 SQL end-to-end tests on the real
+  271-node zijani bundle: T1/T2/T3/T4/T5/T7/T10), Python parity in
+  `bindings/python/tests`.

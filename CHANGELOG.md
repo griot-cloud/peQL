@@ -3,24 +3,38 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [2.0.0] — Unreleased — graph query capability
+## [2.0.0] — graph query capability
 
-The 2.0 line adds **SQL graph traversal** over compiled process-graph snapshots,
-governed by the same contract policy as tabular datasets. Version is `2.0.0-dev`
-until the feature ships.
+GriotQL traverses compiled business-process graphs in plain SQL, governed by
+the same contract policy as tables.
 
-- **Design landed** (this change): [`docs/GRAPH-QUERY.md`](docs/GRAPH-QUERY.md) —
-  the grounding spec (governance model, architecture mapping, the six functions,
-  the graph contract format, fixtures, and the phased build + R→T test matrix).
-  Docs updated: README, `docs/ARCHITECTURE.md`, `docs/CONTRACT-FORMAT.md`.
-- **Governance model:** one `ResolvedPolicy` governs two surfaces — the graph's
-  relational node/edge tables (existing operator stack, unchanged) and the six
-  traversal functions. A policy-filtered node becomes a **wall** (non-existent
-  *and* non-traversable), so no path routes through it; plus a graph-only
-  `edge_filter` to hide relationships. "No un-governed path" holds by construction.
-- **Implementation:** in progress — `graph_node` / `graph_neighbors` /
-  `graph_edges` / `graph_subtree` / `graph_path` / `graph_reachable`, a governed
-  snapshot handle + session cache, bundle verification, and Python parity.
+- **Seven SQL table functions**: `graph_node`, `graph_neighbors`, `graph_edges`,
+  `graph_subtree`, `graph_path`, `graph_reachable`, and the relational
+  `graph_nodes` — each returns an ordinary table that composes with joins,
+  CTEs and aggregation. Positional arguments; results disclose
+  `snapshot_version` and (where capped) `truncated`.
+- **Governed traversal**: a policy-filtered node is a **wall** — absent from
+  every result *and* non-traversable (no path routes through it; nothing
+  reachable only via it is reachable) — closing the topology-leak class. A
+  graph-only `edge_filter` hides relationships between visible nodes. Column
+  masks run through the real masking operators, byte-identical to tables.
+  Deny and unknown-graph are byte-identical (no existence oracle); unknown
+  nodes return near-miss suggestions.
+- **Snapshot bundles** (G01 format): loaded from `nodes/edges/edges_rev.parquet`
+  + `manifest.json` with mandatory sha256 + `bundle_format` verification and
+  structural invariant checks; traversal runs on the precompiled CSR offset
+  columns — no query-time index build. Per-engine cache keyed by
+  (snapshot, policy fingerprint): bundles load once; different policies never
+  share a governed structure. v1 envelope ≤50k nodes / 200k edges, enforced.
+- **Contract format**: graph datasets bind via `binding.graph_snapshot`;
+  policy via `masks`, `node_filter` (row_filter alias over node columns) and
+  `edge_filter`. `ResolvedPolicy` gains `graph_edge_filter`.
+- **Python parity**: the same graph SQL works through the wheel unchanged;
+  list columns (`data_refs` …) round-trip to pyarrow.
+- Verified end-to-end against the real compiled `zijani-operations` bundle
+  (271 nodes / 562 edges): examples/graph_query.rs + 10 SQL E2E tests,
+  33 traversal-algorithm tests, and bundle loader tests.
+- Design + as-built spec: [`docs/GRAPH-QUERY.md`](docs/GRAPH-QUERY.md).
 
 ## [0.2.0] — contract resolution spine + platform adapter
 

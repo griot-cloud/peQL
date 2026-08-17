@@ -115,6 +115,11 @@ pub struct ResolvedPolicy {
     /// Derived from the read template's SELECT list; enforced by
     /// [`crate::contract_table_provider::ContractTableProvider`].
     pub projection: Option<Vec<String>>,
+    /// Graph-only: a SQL boolean predicate over **edge** columns (e.g.
+    /// `edge_type != 'depends_on'`) hiding relationships even between two
+    /// visible nodes. Ignored for tabular datasets. `None` = no edge filter.
+    /// See `docs/GRAPH-QUERY.md` §3.3.
+    pub graph_edge_filter: Option<String>,
 }
 
 impl ResolvedPolicy {
@@ -134,6 +139,7 @@ impl ResolvedPolicy {
             row_filter: None,
             dp_columns: HashMap::new(),
             projection: None,
+            graph_edge_filter: None,
         }
     }
 

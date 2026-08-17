@@ -41,6 +41,13 @@ impl std::fmt::Display for DatasetRef {
 pub trait BindingResolver: Send + Sync {
     /// Return the raw (ungoverned) table provider for `dataset`.
     async fn resolve(&self, dataset: &DatasetRef) -> Result<Arc<dyn TableProvider>, BindingError>;
+
+    /// If `dataset` is a **graph** dataset, return the local directory of its
+    /// snapshot bundle (nodes/edges Parquet + manifest). `None` = not a graph
+    /// (the default for tabular-only resolvers).
+    fn resolve_graph_dir(&self, _dataset: &DatasetRef) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// Load a local Parquet file fully into memory and expose it as a table.
