@@ -7,9 +7,6 @@ on:
       - ".github/workflows/docs.yml"
   push:
     branches: [main]
-    paths:
-      - "docs/**"
-      - ".github/workflows/docs.yml"
 
 permissions:
   contents: read
