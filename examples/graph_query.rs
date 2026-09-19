@@ -14,8 +14,8 @@
 //!   cargo run --example graph_query
 
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use griot::contract_source::Caller;
-use griot::engine::GriotEngine;
+use peql::contract_source::Caller;
+use peql::engine::Engine;
 
 const GRAPH: &str = "process-graphs/zijani-operations/v1";
 
@@ -41,7 +41,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .to_string();
 
-    let engine = GriotEngine::from_json_contracts([contract])?;
+    let engine = Engine::from_json_contracts([contract])?;
     let owner = Caller::new("user:ops", "process_analysis", "zijani");
     let outsider = Caller::new("svc:partner", "process_analysis", "globex");
 

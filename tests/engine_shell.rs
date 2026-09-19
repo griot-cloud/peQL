@@ -20,7 +20,7 @@ use bytes::Bytes;
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
-use griot::{ContractBundleHandle, DdlGuard, EngineError, InitConfig, K04DEngine};
+use peql::{ContractBundleHandle, DdlGuard, EngineError, InitConfig, K04DEngine};
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -153,10 +153,10 @@ fn tc_02b_engine_tenant_id_matches_config() {
 // compile only because K04DEngine implements sealed::EngineCore, which
 // exposes `tenant_id()` and `has_contract_bundle()`.  They do NOT allow
 // external code to create a *new* EngineCore implementation.
-fn engine_has_bundle(e: &dyn griot::sealed::EngineCore) -> bool {
+fn engine_has_bundle(e: &dyn peql::sealed::EngineCore) -> bool {
     e.has_contract_bundle()
 }
-fn engine_tenant_id(e: &dyn griot::sealed::EngineCore) -> &str {
+fn engine_tenant_id(e: &dyn peql::sealed::EngineCore) -> &str {
     e.tenant_id()
 }
 
@@ -459,7 +459,7 @@ async fn tc_10_install_rejected_even_with_bundle() {
 #[test]
 fn tc_08_no_zone_t_imports_in_engine_shell() {
     // Verify at runtime that we are not in zone-t by checking that no
-    // zone-t types are accessible via griot.  This is enforced
+    // zone-t types are accessible via peql. This is enforced
     // structurally (the engine imports only datafusion, tokio, serde,
     // thiserror, anyhow, tracing, uuid), but we state it as a test for
     // catalog completeness.
@@ -474,7 +474,7 @@ fn tc_08_no_zone_t_imports_in_engine_shell() {
     // which would be a critical architecture violation.
     let crate_name = env!("CARGO_PKG_NAME");
     assert_eq!(
-        crate_name, "griot",
-        "this test must run in the standalone griot crate"
+        crate_name, "peql",
+        "this test must run in the standalone peql crate"
     );
 }

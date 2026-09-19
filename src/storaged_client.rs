@@ -1,6 +1,6 @@
 //! StoragedClient — T04 byte-read Unix domain socket client.
 //!
-//! The GriotQL engine's ONLY data-access path is through T04's storaged
+//! The peQL engine's ONLY data-access path is through T04's storaged
 //! byte-read socket. This module implements the client side of that protocol.
 //!
 //! # Socket protocol

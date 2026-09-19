@@ -1461,42 +1461,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
 
 [[package]]
-name = "griot"
-version = "2.0.0-dev"
-dependencies = [
- "anyhow",
- "arrow",
- "async-trait",
- "base64",
- "bytes",
- "chrono",
- "datafusion",
- "futures",
- "hex",
- "lru",
- "parquet",
- "rand",
- "rand_distr",
- "serde",
- "serde_json",
- "sha2",
- "thiserror 1.0.69",
- "tokio",
- "tracing",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
-name = "griotql-python"
-version = "2.0.0-dev"
-dependencies = [
- "griot",
- "pyo3",
- "tokio",
-]
-
-[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2122,6 +2086,42 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
+name = "peql"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "datafusion",
+ "futures",
+ "hex",
+ "lru",
+ "parquet",
+ "rand",
+ "rand_distr",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+ "uuid",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "peql-python"
+version = "0.3.0"
+dependencies = [
+ "peql",
+ "pyo3",
+ "tokio",
+]
 
 [[package]]
 name = "percent-encoding"

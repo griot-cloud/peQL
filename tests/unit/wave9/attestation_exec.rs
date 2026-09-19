@@ -34,13 +34,13 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
-use griot::physical::attestation_exec::AttestationExec;
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::laplace_noise_exec::LaplaceNoiseExec;
-use griot::physical::masking_exec::MaskingExec;
-use griot::physical::row_filter_exec::RowFilterExec;
-use griot::physical::{AttestationEnvelope, PhysicalError};
-use griot::ContractBundleHandle;
+use peql::physical::attestation_exec::AttestationExec;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::laplace_noise_exec::LaplaceNoiseExec;
+use peql::physical::masking_exec::MaskingExec;
+use peql::physical::row_filter_exec::RowFilterExec;
+use peql::physical::{AttestationEnvelope, PhysicalError};
+use peql::ContractBundleHandle;
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

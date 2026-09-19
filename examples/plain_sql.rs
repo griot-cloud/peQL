@@ -1,6 +1,6 @@
 //! Example 1 — plain SQL over an in-memory table.
 //!
-//! Shows that GriotQL is, at its core, a real Apache DataFusion engine: you
+//! Shows that peQL is, at its core, a real Apache DataFusion engine: you
 //! register Arrow data in memory and run ordinary SQL against it. No Griot
 //! services (T04/T05), no network, no files.
 //!
@@ -21,7 +21,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 
-use griot::{ContractBundleHandle, InitConfig, K04DEngine};
+use peql::{ContractBundleHandle, InitConfig, K04DEngine};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

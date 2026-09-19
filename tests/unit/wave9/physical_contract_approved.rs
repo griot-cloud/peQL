@@ -30,9 +30,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::PhysicalError;
-use griot::ContractBundleHandle;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::PhysicalError;
+use peql::ContractBundleHandle;
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

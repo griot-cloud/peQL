@@ -1,5 +1,5 @@
 //! Integration tests for the graph snapshot bundle loader
-//! (`griot::graph::bundle::load_bundle`) against the real compiled fixture
+//! (`peql::graph::bundle::load_bundle`) against the real compiled fixture
 //! bundle in `fixtures/graph/zijani-operations-v1/`.
 
 use std::fs;
@@ -10,9 +10,9 @@ use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
 
-use griot::graph::bundle::load_bundle;
-use griot::graph::types::{is_ulid_shaped, resolve_node, GraphError, GraphPolicy};
-use griot::policy::ResolvedPolicy;
+use peql::graph::bundle::load_bundle;
+use peql::graph::types::{is_ulid_shaped, resolve_node, GraphError, GraphPolicy};
+use peql::policy::ResolvedPolicy;
 
 /// The real compiled fixture bundle (271 nodes / 562 edges).
 const FIXTURE: &str = concat!(

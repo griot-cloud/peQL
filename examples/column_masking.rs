@@ -1,6 +1,6 @@
 //! Example 2 — column masking.
 //!
-//! GriotQL's distinctive behaviour: a contract attached to the query rewrites
+//! peQL's distinctive behaviour: a contract attached to the query rewrites
 //! the result so that sensitive columns come back masked. Here `email` is
 //! redacted to `***` and `ssn` is replaced by its SHA-256 hash — at read time,
 //! enforced inside the engine, with no application code doing the masking.
@@ -23,9 +23,9 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::masking_exec::MaskingExec;
-use griot::ContractBundleHandle;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::masking_exec::MaskingExec;
+use peql::ContractBundleHandle;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

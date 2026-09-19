@@ -7,9 +7,9 @@
 //! self-signed round-trip unit test in `src/platform/bundle.rs`.)
 #![cfg(feature = "platform")]
 
-use griot::contract_source::Caller;
-use griot::platform::{map_bundle_to_policy, SignedBundleFile};
-use griot::policy::MaskAction;
+use peql::contract_source::Caller;
+use peql::platform::{map_bundle_to_policy, SignedBundleFile};
+use peql::policy::MaskAction;
 
 fn load_fixture() -> SignedBundleFile {
     let path = concat!(

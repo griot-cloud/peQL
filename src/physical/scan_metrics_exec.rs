@@ -36,7 +36,7 @@
 //! If a future `BindingResolver` DOES back onto a real streaming scan node
 //! that tracks its own native `bytes_scanned` (e.g. a `ParquetExec`-backed
 //! Iceberg reader), that node's metric coexists with this one at a distinct
-//! plan node — [`crate::engine::GriotEngine::query_with_stats`] sums by
+//! plan node — [`crate::engine::Engine::query_with_stats`] sums by
 //! metric NAME across the whole physical-plan tree, so every scan node that
 //! reports `bytes_scanned` contributes, with no double counting (this
 //! operator wraps the scan node directly; the two are never both present
@@ -61,7 +61,7 @@ use datafusion::physical_plan::{
 };
 use futures::StreamExt;
 
-/// The metric name [`crate::engine::GriotEngine::query_with_stats`] sums
+/// The metric name [`crate::engine::Engine::query_with_stats`] sums
 /// across the physical plan tree to produce
 /// [`crate::engine::QueryStats::bytes_scanned`].
 pub const BYTES_SCANNED_METRIC: &str = "bytes_scanned";

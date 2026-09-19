@@ -15,7 +15,7 @@
 //! They also verify that legitimate SQL (SELECT, WITH, CREATE TABLE, CREATE VIEW)
 //! continues to pass.
 
-use griot::{DdlGuard, EngineError};
+use peql::{DdlGuard, EngineError};
 
 // ─── Bypass-via-block-comment tests ──────────────────────────────────────────
 

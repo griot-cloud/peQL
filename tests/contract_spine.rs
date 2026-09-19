@@ -11,8 +11,8 @@ use datafusion::arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 
-use griot::contract_source::Caller;
-use griot::engine::GriotEngine;
+use peql::contract_source::Caller;
+use peql::engine::Engine;
 
 /// Write the sample `orders` dataset to `path` and return the JSON contract that
 /// governs it (owned by `acme`; outsiders get `email` hashed + EU-only rows).
@@ -63,10 +63,10 @@ fn write_dataset_and_contract(path: &std::path::Path) -> String {
     .to_string()
 }
 
-fn engine_with_dataset(dir: &tempfile::TempDir) -> GriotEngine {
+fn engine_with_dataset(dir: &tempfile::TempDir) -> Engine {
     let path = dir.path().join("orders.parquet");
     let contract = write_dataset_and_contract(&path);
-    GriotEngine::from_json_contracts([contract]).unwrap()
+    Engine::from_json_contracts([contract]).unwrap()
 }
 
 fn string_col(batch: &RecordBatch, name: &str) -> Vec<String> {

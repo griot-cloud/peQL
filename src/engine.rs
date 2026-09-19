@@ -1,14 +1,14 @@
-//! [`GriotEngine`] — the high-level, contract-resolving query API.
+//! [`Engine`] — the high-level, contract-resolving query API.
 //!
 //! ```ignore
-//! let engine = GriotEngine::from_json_contracts_dir("./contracts")?;
+//! let engine = Engine::from_json_contracts_dir("./contracts")?;
 //! let rows = engine
 //!     .query(r#"SELECT * FROM "sales/orders/v1""#, Caller::new("user:bob", "analytics", "globex"))
 //!     .await?;
 //! ```
 //!
 //! Each query runs in a fresh DataFusion session whose default catalog is a
-//! caller-bound [`GriotCatalogProvider`], so the caller's identity flows into
+//! caller-bound [`PeqlCatalogProvider`], so the caller's identity flows into
 //! contract resolution without any global state.
 
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
 
 use crate::binding::BindingResolver;
-use crate::catalog::{GriotCatalogProvider, GriotSchemaProvider};
+use crate::catalog::{PeqlCatalogProvider, PeqlSchemaProvider};
 use crate::contract_source::{Caller, ContractError, ContractSource, JsonContractSource};
 use crate::physical::scan_metrics_exec::BYTES_SCANNED_METRIC;
 use crate::{DdlGuard, EngineError};
@@ -49,13 +49,13 @@ use crate::{DdlGuard, EngineError};
 const PROJECTION_PUSHDOWN_RULE: &str = "ProjectionPushdown";
 
 /// The catalog name bare quoted dataset references resolve under.
-const CATALOG_NAME: &str = "griot";
-/// The schema name within the griot catalog.
+const CATALOG_NAME: &str = "peql";
+/// The schema name within the peql catalog.
 const SCHEMA_NAME: &str = "data";
 
 /// A query engine that resolves a contract + a data location for every query and
 /// returns governed rows.
-pub struct GriotEngine {
+pub struct Engine {
     source: Arc<dyn ContractSource>,
     binding: Arc<dyn BindingResolver>,
     /// Engine-lifetime graph snapshot cache (G02 R5): loaded bundles are shared
@@ -64,7 +64,7 @@ pub struct GriotEngine {
     graph_cache: Arc<crate::graph::snapshot::GraphCache>,
 }
 
-impl GriotEngine {
+impl Engine {
     /// Build from any contract source + binding resolver.
     pub fn new(source: Arc<dyn ContractSource>, binding: Arc<dyn BindingResolver>) -> Self {
         Self {
@@ -111,7 +111,7 @@ impl GriotEngine {
     /// `SELECT * FROM "sales/orders/v1"`. Masking, row filtering and DP noise
     /// from the governing contract are applied inside the query plan.
     ///
-    /// This is a thin wrapper over [`GriotEngine::query_with_stats`] that
+    /// This is a thin wrapper over [`Engine::query_with_stats`] that
     /// drops the scan-accounting [`QueryStats`] for callers that don't need
     /// it. Behaviourally identical to the pre-ADR-0052-follow-up-#42 `query`.
     pub async fn query(&self, sql: &str, caller: Caller) -> Result<Vec<RecordBatch>, EngineError> {
@@ -121,7 +121,7 @@ impl GriotEngine {
     /// Run `sql` as `caller`, returning governed rows PLUS scan-level
     /// accounting metadata (ADR-0052 follow-up #42).
     ///
-    /// Identical governed-query semantics to [`GriotEngine::query`] — same
+    /// Identical governed-query semantics to [`Engine::query`] — same
     /// contract resolution, same masking/row-filter/DP enforcement, same
     /// errors. The only difference is that this method retains the physical
     /// plan after execution and sums the `bytes_scanned` metric (see
@@ -138,12 +138,12 @@ impl GriotEngine {
         DdlGuard::reject_unsafe_ddl(sql)?;
 
         let graph_caller = caller.clone();
-        let schema = Arc::new(GriotSchemaProvider::new(
+        let schema = Arc::new(PeqlSchemaProvider::new(
             self.source.clone(),
             self.binding.clone(),
             caller,
         ));
-        let catalog = Arc::new(GriotCatalogProvider::new(SCHEMA_NAME, schema));
+        let catalog = Arc::new(PeqlCatalogProvider::new(SCHEMA_NAME, schema));
 
         let ctx = governed_session_context(
             SessionConfig::new().with_default_catalog_and_schema(CATALOG_NAME, SCHEMA_NAME),
@@ -173,7 +173,7 @@ impl GriotEngine {
 #[derive(Debug, Clone)]
 pub struct QueryOutcome {
     /// The enforced (masked / row-filtered / projected / limited) result rows
-    /// — identical to what [`GriotEngine::query`] returns.
+    /// — identical to what [`Engine::query`] returns.
     pub batches: Vec<RecordBatch>,
     /// Scan-level accounting, summed across every scan node in the physical
     /// plan. All-zero (not absent) for a query that touches no table (e.g.

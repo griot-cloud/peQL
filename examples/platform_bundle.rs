@@ -18,9 +18,9 @@ use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 
-use griot::contract_source::Caller;
-use griot::contract_table_provider::ContractTableProvider;
-use griot::platform::{map_bundle_to_policy, SignedBundleFile};
+use peql::contract_source::Caller;
+use peql::contract_table_provider::ContractTableProvider;
+use peql::platform::{map_bundle_to_policy, SignedBundleFile};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
