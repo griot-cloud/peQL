@@ -1,7 +1,4 @@
-```{image} _static/peql-mark.svg
-:alt: peQL logo
-:class: peql-hero-logo
-```
+<div class="peql-hero-logo" role="img" aria-label="peQL logo"></div>
 
 # Documentation
 

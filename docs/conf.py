@@ -16,7 +16,6 @@ myst_heading_anchors = 3
 
 html_theme = "shibuya"
 html_title = "peQL — Policy-Enforcing Query Engine"
-html_logo = "_static/peql-mark.svg"
 html_static_path = ["_static"]
 html_css_files = ["peql.css"]
 html_theme_options = {

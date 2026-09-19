@@ -28,10 +28,28 @@ body {
   max-width: 48rem;
 }
 
-.yue img.peql-hero-logo {
+.sy-head-brand strong,
+.peql-hero-logo {
+  background-color: white;
+  background-image: url("peql-logo.jpeg");
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 140% auto;
+}
+
+.sy-head-brand strong {
   display: block;
-  width: 180px;
-  height: auto;
+  width: 88px;
+  height: 30px;
+  overflow: hidden;
+  color: transparent;
+  font-size: 0;
+}
+
+.yue .peql-hero-logo {
+  width: 300px;
+  height: 100px;
+  max-width: 100%;
   margin: 0 0 1.25rem;
 }
 
