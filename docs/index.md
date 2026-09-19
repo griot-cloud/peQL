@@ -3,7 +3,7 @@
 # Documentation
 
 peQL is a policy-enforcing query engine built on Apache DataFusion.
-Let people query your data while keeping control over what they can see.
+Define your data policies. peQL enforces them whenever your data is queried.
 
 ## The query path
 
