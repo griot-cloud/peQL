@@ -1,4 +1,4 @@
-"""Tests for the GriotQL Python wheel.
+"""Tests for the peQL Python wheel.
 
 Run (from `bindings/python`, after `maturin develop`):
     pytest
@@ -10,7 +10,7 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-import griotql
+import peql
 
 
 def _engine(tmp_path):
@@ -49,7 +49,7 @@ def _engine(tmp_path):
             "row_filter": "region = 'EU'",
         }
     )
-    return griotql.Engine.from_json_contracts([contract])
+    return peql.Engine.from_json_contracts([contract])
 
 
 SQL = 'SELECT order_id, email, region FROM "sales/orders/v1" ORDER BY order_id'
@@ -57,7 +57,7 @@ SQL = 'SELECT order_id, email, region FROM "sales/orders/v1" ORDER BY order_id'
 
 def test_outsider_is_masked_and_filtered(tmp_path):
     eng = _engine(tmp_path)
-    t = eng.query(SQL, griotql.Caller("user:bob", "analytics", "globex"))
+    t = eng.query(SQL, peql.Caller("user:bob", "analytics", "globex"))
     assert t.num_rows == 2  # EU-only
     emails = t.column("email").to_pylist()
     assert all("@" not in e and len(e) == 64 for e in emails)  # SHA-256 hex
@@ -65,7 +65,7 @@ def test_outsider_is_masked_and_filtered(tmp_path):
 
 def test_owner_sees_raw(tmp_path):
     eng = _engine(tmp_path)
-    t = eng.query(SQL, griotql.Caller("user:alice", "analytics", "acme"))
+    t = eng.query(SQL, peql.Caller("user:alice", "analytics", "acme"))
     assert t.num_rows == 5
     assert any("@" in e for e in t.column("email").to_pylist())
 
@@ -73,13 +73,13 @@ def test_owner_sees_raw(tmp_path):
 def test_disallowed_purpose_is_denied(tmp_path):
     eng = _engine(tmp_path)
     with pytest.raises(Exception) as exc:
-        eng.query(SQL, griotql.Caller("u", "marketing", "globex"))
+        eng.query(SQL, peql.Caller("u", "marketing", "globex"))
     assert "denied" in str(exc.value)
 
 
 def test_returns_pyarrow_table(tmp_path):
     eng = _engine(tmp_path)
-    t = eng.query(SQL, griotql.Caller("u", "analytics", "acme"))
+    t = eng.query(SQL, peql.Caller("u", "analytics", "acme"))
     assert isinstance(t, pa.Table)
 
 
@@ -108,14 +108,14 @@ def _graph_engine():
             "masks": {"owner": "redact"},
         }
     )
-    return griotql.Engine.from_json_contracts([contract])
+    return peql.Engine.from_json_contracts([contract])
 
 
 def test_graph_nodes_scan_from_python():
     eng = _graph_engine()
     t = eng.query(
         f"SELECT name, kind, data_refs FROM graph_nodes('{GRAPH_REF}')",
-        griotql.Caller("user:ops", "process_analysis", "zijani"),
+        peql.Caller("user:ops", "process_analysis", "zijani"),
     )
     assert t.num_rows == 271
     # list columns round-trip to pyarrow (R10).
@@ -127,7 +127,7 @@ def test_graph_traversal_masked_for_outsider():
     t = eng.query(
         f"SELECT name, owner, min_depth FROM graph_reachable('{GRAPH_REF}', "
         "'Collection quarantined; jericans to segregated disposal', 'both', 3)",
-        griotql.Caller("svc:x", "process_analysis", "globex"),
+        peql.Caller("svc:x", "process_analysis", "globex"),
     )
     assert t.num_rows > 0
     assert all(o == "***" for o in t.column("owner").to_pylist())

@@ -3,9 +3,9 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "griotql"
-version = "2.0.0"
-description = "GriotQL — a contract-resolving, privacy-enforcing SQL engine"
+name = "peql"
+version = "0.3.0"
+description = "peQL — a contract-resolving, privacy-enforcing SQL engine"
 readme = "README.md"
 requires-python = ">=3.9"
 license = { text = "TBD" }
@@ -13,9 +13,9 @@ keywords = ["sql", "datafusion", "data-contract", "privacy", "governance", "arro
 dependencies = ["pyarrow>=14"]
 
 [project.urls]
-Source = "https://github.com/Griot-Data-Technologies/griot"
+Source = "https://github.com/griot-cloud/peQL"
 
 [tool.maturin]
-module-name = "griotql._native"
+module-name = "peql._native"
 python-source = "python"
 features = ["pyo3/extension-module"]

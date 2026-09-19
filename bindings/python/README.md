@@ -1,20 +1,20 @@
-# GriotQL (Python)
+# peQL (Python)
 
 A contract-resolving, privacy-enforcing SQL engine — point SQL at a *contract*,
-get *governed* rows. Python bindings for the [GriotQL](../../README.md) engine.
+get *governed* rows. Python bindings for the [peQL](../../README.md) engine.
 
 ```bash
-pip install griotql
+pip install peql
 ```
 
 ```python
-import griotql
+import peql
 
-engine = griotql.Engine.from_json_contracts_dir("./contracts")
+engine = peql.Engine.from_json_contracts_dir("./contracts")
 
 table = engine.query(
     'SELECT email, region FROM "sales/orders/v1"',
-    griotql.Caller("user:bob", purpose="analytics", tenant="globex"),
+    peql.Caller("user:bob", purpose="analytics", tenant="globex"),
 )
 print(table.to_pandas())   # email is SHA-256 hashed for the outside tenant
 ```

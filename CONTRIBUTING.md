@@ -1,6 +1,6 @@
-# Contributing to GriotQL
+# Contributing to peQL
 
-Thanks for your interest. GriotQL is a standalone snapshot of the query engine
+Thanks for your interest. peQL is a standalone snapshot of the query engine
 from the Griot Cloud platform (see [Provenance](README.md#provenance)).
 
 ## Development setup
@@ -9,7 +9,7 @@ You only need a recent stable Rust toolchain (≥ 1.88). Everything else is
 vendored through cargo.
 
 ```bash
-git clone <this-repo> griotql && cd griotql
+git clone <this-repo> peql && cd peql
 cargo build
 cargo test
 ```

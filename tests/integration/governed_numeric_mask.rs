@@ -28,9 +28,9 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::prelude::SessionConfig;
-use griot::contract_table_provider::ContractTableProvider;
-use griot::engine::governed_session_context;
-use griot::policy::{MaskAction, ResolvedPolicy};
+use peql::contract_table_provider::ContractTableProvider;
+use peql::engine::governed_session_context;
+use peql::policy::{MaskAction, ResolvedPolicy};
 use sha2::{Digest, Sha256};
 
 /// SHA-256 hex of a value's canonical string form — what the engine must emit.

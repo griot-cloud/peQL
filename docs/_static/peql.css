@@ -1,0 +1,80 @@
+:root {
+  --griot-teal: #137c8b;
+  --griot-muted: #667085;
+  --griot-border: #e4e7ec;
+  --griot-surface: #f8fafc;
+}
+
+html[data-theme="light"] {
+  --sy-c-primary: var(--griot-teal);
+  --sy-c-link: var(--griot-teal);
+}
+
+html[data-theme="dark"] {
+  --sy-c-primary: #2cb9d1;
+  --sy-c-link: #2cb9d1;
+}
+
+body {
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+    "Segoe UI", sans-serif;
+}
+
+.sy-main > .sy-container {
+  max-width: 90rem;
+}
+
+.sy-content {
+  max-width: 48rem;
+}
+
+.yue img.peql-hero-logo {
+  display: block;
+  width: 180px;
+  height: auto;
+  margin: 0 0 1.25rem;
+}
+
+.sy-head { border-bottom: 1px solid var(--griot-border); }
+.sy-sidebar { border-right: 1px solid var(--griot-border); }
+
+.sy-content h1 {
+  font-size: clamp(2rem, 4vw, 2.75rem);
+  letter-spacing: -0.035em;
+  line-height: 1.12;
+  margin-bottom: 1rem;
+}
+
+.sy-content h2 {
+  border-top: 1px solid var(--griot-border);
+  margin-top: 3rem;
+  padding-top: 1.5rem;
+}
+
+.sy-content h1 + p {
+  color: var(--griot-muted);
+  font-size: 1.125rem;
+  line-height: 1.65;
+}
+
+.sd-card {
+  background: var(--griot-surface);
+  border-color: var(--griot-border);
+  border-radius: 0.75rem;
+  box-shadow: none;
+  transition: border-color 160ms ease, transform 160ms ease;
+}
+
+.sd-card:hover {
+  border-color: var(--sy-c-primary);
+  transform: translateY(-2px);
+}
+
+.sd-card-title { font-size: 1.05rem; font-weight: 650; }
+.sd-card-text { color: var(--griot-muted); }
+.sy-content pre { border: 1px solid var(--griot-border); border-radius: 0.625rem; padding: 1rem; }
+.sy-content table { border-color: var(--griot-border); }
+
+@media (prefers-color-scheme: dark) {
+  :root { --griot-muted: #a8b3c2; --griot-border: #293341; --griot-surface: #17212b; }
+}

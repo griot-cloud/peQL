@@ -15,7 +15,7 @@ struct FakeEngine;
 
 // This impl requires `sealed::private::Sealed` but that trait is `pub(crate)`
 // inside griot and therefore unreachable from here.
-impl griot::sealed::EngineCore for FakeEngine {
+impl peql::sealed::EngineCore for FakeEngine {
     fn tenant_id(&self) -> &str {
         "evil-tenant"
     }

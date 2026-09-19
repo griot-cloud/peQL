@@ -3,9 +3,16 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
-## [2.0.0] — graph query capability
+## [0.3.0] — graph queries, peQL naming, and documentation
 
-GriotQL traverses compiled business-process graphs in plain SQL, governed by
+This release follows `0.2.0`. The premature `v2.0.0` tag is withdrawn; the
+graph work below is included in `0.3.0` instead. The Rust crate and Python
+package are now named `peql`. The high-level Rust query type is `Engine`;
+`K04DEngine` remains available as a separate lower-level Rust API. The
+documentation is rebuilt with Sphinx and organized into learning, how-to,
+reference, explanation, and contribution paths.
+
+peQL traverses compiled business-process graphs in plain SQL, governed by
 the same contract policy as tables.
 
 - **Seven SQL table functions**: `graph_node`, `graph_neighbors`, `graph_edges`,
@@ -48,7 +55,7 @@ name a contract-bound dataset in SQL and get governed rows.
   primitive), `contract_source` (`ContractSource` + `JsonContractSource`),
   `binding` (`BindingResolver` + local Parquet loader), `contract_table_provider`
   (`ContractTableProvider`), `catalog` (lazy DataFusion `SchemaProvider`/
-  `CatalogProvider`), and `engine` (`GriotEngine`).
+  `CatalogProvider`), and `engine` (`Engine`).
 - **Open-source path.** A simple JSON contract format + local Parquet — no
   services, no `protoc`. See `docs/CONTRACT-FORMAT.md`.
 - **Platform adapter** (`--features platform`). `PlatformBundleSource` fetches a
@@ -62,7 +69,7 @@ name a contract-bound dataset in SQL and get governed rows.
 
 ## [0.1.0] — initial snapshot
 
-Initial standalone snapshot of the GriotQL query engine, **copied** out of the
+Initial standalone snapshot of the peQL query engine, **copied** out of the
 Griot Cloud platform monorepo.
 
 - **Source:** `griot-cloud` @ commit `5b999ed0010aeb86ae703076798f035b9c0c9121`

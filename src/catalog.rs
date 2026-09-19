@@ -2,7 +2,7 @@
 //! through a contract.
 //!
 //! When DataFusion encounters a (quoted) table reference it cannot find, it asks
-//! the registered [`SchemaProvider`] to produce it. [`GriotSchemaProvider`]
+//! the registered [`SchemaProvider`] to produce it. [`PeqlSchemaProvider`]
 //! treats the reference as a dataset URI, resolves the governing contract for
 //! the current caller into a [`ResolvedPolicy`], resolves the physical binding,
 //! and returns a [`ContractTableProvider`] — so the very act of naming a dataset
@@ -24,21 +24,21 @@ use crate::policy::Decision;
 
 /// A schema whose tables are contract-bound datasets resolved on demand for one
 /// caller.
-pub struct GriotSchemaProvider {
+pub struct PeqlSchemaProvider {
     source: Arc<dyn ContractSource>,
     binding: Arc<dyn BindingResolver>,
     caller: Caller,
 }
 
-impl fmt::Debug for GriotSchemaProvider {
+impl fmt::Debug for PeqlSchemaProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GriotSchemaProvider")
+        f.debug_struct("PeqlSchemaProvider")
             .field("caller", &self.caller.id)
             .finish()
     }
 }
 
-impl GriotSchemaProvider {
+impl PeqlSchemaProvider {
     /// Build a schema bound to one caller's identity.
     pub fn new(
         source: Arc<dyn ContractSource>,
@@ -54,7 +54,7 @@ impl GriotSchemaProvider {
 }
 
 #[async_trait]
-impl SchemaProvider for GriotSchemaProvider {
+impl SchemaProvider for PeqlSchemaProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }
@@ -102,23 +102,23 @@ impl SchemaProvider for GriotSchemaProvider {
     }
 }
 
-/// A catalog exposing a single [`GriotSchemaProvider`] schema.
-pub struct GriotCatalogProvider {
+/// A catalog exposing a single [`PeqlSchemaProvider`] schema.
+pub struct PeqlCatalogProvider {
     schema_name: String,
-    schema: Arc<GriotSchemaProvider>,
+    schema: Arc<PeqlSchemaProvider>,
 }
 
-impl fmt::Debug for GriotCatalogProvider {
+impl fmt::Debug for PeqlCatalogProvider {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("GriotCatalogProvider")
+        f.debug_struct("PeqlCatalogProvider")
             .field("schema_name", &self.schema_name)
             .finish()
     }
 }
 
-impl GriotCatalogProvider {
+impl PeqlCatalogProvider {
     /// Wrap `schema` under the schema name `schema_name`.
-    pub fn new(schema_name: impl Into<String>, schema: Arc<GriotSchemaProvider>) -> Self {
+    pub fn new(schema_name: impl Into<String>, schema: Arc<PeqlSchemaProvider>) -> Self {
         Self {
             schema_name: schema_name.into(),
             schema,
@@ -126,7 +126,7 @@ impl GriotCatalogProvider {
     }
 }
 
-impl CatalogProvider for GriotCatalogProvider {
+impl CatalogProvider for PeqlCatalogProvider {
     fn as_any(&self) -> &dyn Any {
         self
     }

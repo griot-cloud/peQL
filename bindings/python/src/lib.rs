@@ -1,7 +1,7 @@
-//! PyO3 bindings exposing the GriotQL open-source engine to Python.
+//! PyO3 bindings exposing the peQL open-source engine to Python.
 //!
 //! The native module returns query results as Arrow IPC stream bytes; the thin
-//! Python wrapper (`python/griotql/__init__.py`) turns them into a
+//! Python wrapper (`python/peql/__init__.py`) turns them into a
 //! `pyarrow.Table`. This keeps the native surface free of any pyarrow/pyo3
 //! version coupling.
 
@@ -9,9 +9,9 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
-use griot::contract_source::Caller as RsCaller;
-use griot::engine::GriotEngine;
-use griot::result_formatter::{ResultFormat, ResultFormatter};
+use peql::contract_source::Caller as RsCaller;
+use peql::engine::Engine as RsEngine;
+use peql::result_formatter::{ResultFormat, ResultFormatter};
 
 /// The identity + intent of whoever runs a query.
 #[pyclass]
@@ -53,7 +53,7 @@ impl Caller {
 /// A contract-resolving query engine.
 #[pyclass]
 struct Engine {
-    inner: GriotEngine,
+    inner: RsEngine,
     rt: tokio::runtime::Runtime,
 }
 
@@ -62,7 +62,7 @@ impl Engine {
     /// Build from a directory of JSON contracts (+ local Parquet bindings).
     #[staticmethod]
     fn from_json_contracts_dir(dir: String) -> PyResult<Self> {
-        let inner = GriotEngine::from_json_contracts_dir(&dir).map_err(to_py)?;
+        let inner = RsEngine::from_json_contracts_dir(&dir).map_err(to_py)?;
         Ok(Self {
             inner,
             rt: runtime()?,
@@ -72,7 +72,7 @@ impl Engine {
     /// Build from in-memory JSON contract documents.
     #[staticmethod]
     fn from_json_contracts(docs: Vec<String>) -> PyResult<Self> {
-        let inner = GriotEngine::from_json_contracts(docs).map_err(to_py)?;
+        let inner = RsEngine::from_json_contracts(docs).map_err(to_py)?;
         Ok(Self {
             inner,
             rt: runtime()?,

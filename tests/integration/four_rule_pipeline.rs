@@ -26,9 +26,9 @@
 //! * INV-5: No zone-t imports in this test file.
 
 use bytes::Bytes;
-use griot::optimizer_rules::pipeline::{build_permissive_pipeline, RULE_ORDER};
-use griot::optimizer_rules::Principal;
-use griot::ContractBundleHandle;
+use peql::optimizer_rules::pipeline::{build_permissive_pipeline, RULE_ORDER};
+use peql::optimizer_rules::Principal;
+use peql::ContractBundleHandle;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

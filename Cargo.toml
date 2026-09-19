@@ -1,4 +1,4 @@
-# GriotQL — a privacy-and-contract-enforcing SQL engine.
+# peQL — a policy-enforcing query engine.
 #
 # Apache DataFusion 47 + Arrow 55, extended with native contract enforcement
 # implemented as DataFusion optimizer rules and physical operators. Every query
@@ -10,14 +10,14 @@
 # README.md (Provenance) and CHANGELOG.md for the exact source commit.
 
 [package]
-name = "griot"
-version = "2.0.0"
+name = "peql"
+version = "0.3.0"
 edition = "2021"
 # datafusion v47 transitively requires getrandom 0.4 (edition2024, stable >=1.85),
 # serde_with 3.20 and time 0.3.47 (stable >=1.88), and uuid >=1.16. Pin a recent
 # stable toolchain; see rust-toolchain.toml.
 rust-version = "1.88"
-description = "GriotQL — a privacy-and-contract-enforcing SQL engine (DataFusion with governance compiled into the query plan)"
+description = "peQL — a policy-enforcing query engine (DataFusion with governance compiled into the query plan)"
 # License: TBD (intended for open-source release). See README.md.
 
 [features]
@@ -32,7 +32,7 @@ platform = ["dep:reqwest", "dep:p256"]
 default = []
 
 [lib]
-name = "griot"
+name = "peql"
 path = "src/lib.rs"
 
 [dependencies]

@@ -1,11 +1,11 @@
-# Python bindings for GriotQL (PyO3 + maturin).
+# Python bindings for peQL (PyO3 + maturin).
 #
 # Builds a `pip install`-able wheel exposing the open-source engine to Python.
 # Self-contained workspace so it does not entangle the parent crate.
 
 [package]
-name = "griotql-python"
-version = "2.0.0"
+name = "peql-python"
+version = "0.3.0"
 edition = "2021"
 publish = false
 
@@ -16,6 +16,6 @@ name = "_native"
 crate-type = ["cdylib"]
 
 [dependencies]
-griot = { path = "../.." }
+peql = { path = "../.." }
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }

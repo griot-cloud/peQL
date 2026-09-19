@@ -20,10 +20,10 @@ use bytes::Bytes;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::OptimizerRule;
-use griot::optimizer_rules::contract_check::ContractCheckRule;
-use griot::optimizer_rules::masking::{MaskPolicy, MaskingRule};
-use griot::optimizer_rules::Principal;
-use griot::ContractBundleHandle;
+use peql::optimizer_rules::contract_check::ContractCheckRule;
+use peql::optimizer_rules::masking::{MaskPolicy, MaskingRule};
+use peql::optimizer_rules::Principal;
+use peql::ContractBundleHandle;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

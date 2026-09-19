@@ -1,5 +1,5 @@
 //! Unit/integration tests for the pure graph-traversal algorithms
-//! (`griot::graph::traverse`) over hand-built [`GraphData`] fixtures.
+//! (`peql::graph::traverse`) over hand-built [`GraphData`] fixtures.
 //!
 //! The centrepiece is the governance **wall** suite (mini-T7): a
 //! policy-hidden node must never appear in any result and must never be
@@ -13,12 +13,12 @@ use datafusion::arrow::array::Int32Array;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 
-use griot::graph::traverse::{edges_of, neighbors, reachable, shortest_path, subtree};
-use griot::graph::types::{
+use peql::graph::traverse::{edges_of, neighbors, reachable, shortest_path, subtree};
+use peql::graph::types::{
     Caps, Direction, EdgeFile, GraphData, GraphManifest, GraphPolicy, NeighborHit, PathHop,
     ReachRow, SubtreeRow, TypeFilter,
 };
-use griot::policy::ResolvedPolicy;
+use peql::policy::ResolvedPolicy;
 
 // ─── Fixture builder ──────────────────────────────────────────────────────────
 

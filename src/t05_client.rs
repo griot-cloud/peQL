@@ -1,6 +1,6 @@
 //! T05Client — T05 GDCP Notary attestation-signing UDS client.
 //!
-//! The GriotQL engine submits attestation envelopes to T05 for ES256 JWS signing
+//! The peQL engine submits attestation envelopes to T05 for ES256 JWS signing
 //! instead of computing a self-hash. This upholds ADR-0002 wave-10 requirement:
 //! "AttestationExec submits to T05 over UDS for real JWS signing."
 //!

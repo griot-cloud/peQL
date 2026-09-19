@@ -29,11 +29,11 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
-use griot::optimizer_rules::masking::MaskPolicy;
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::masking_exec::MaskingExec;
-use griot::physical::PhysicalError;
-use griot::ContractBundleHandle;
+use peql::optimizer_rules::masking::MaskPolicy;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::masking_exec::MaskingExec;
+use peql::physical::PhysicalError;
+use peql::ContractBundleHandle;
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -757,7 +757,7 @@ async fn msk_c2_unknown_masking_policy_returns_hard_error() {
         .unwrap();
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(
             make_bundle_with_redact("contract-msk-c2-inner"),
             inner,
         )
@@ -841,7 +841,7 @@ async fn msk_c5_int64_redact_returns_zeros() {
         .unwrap();
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(bundle.clone(), inner)
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(bundle.clone(), inner)
             .unwrap(),
     );
 

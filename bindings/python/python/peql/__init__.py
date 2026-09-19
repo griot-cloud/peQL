@@ -1,15 +1,15 @@
-"""GriotQL — a contract-resolving, privacy-enforcing SQL engine.
+"""peQL — a contract-resolving, privacy-enforcing SQL engine.
 
 Point SQL at a contract-bound dataset and get governed rows: the engine resolves
 the contract for the caller, locates the data, and applies the contract's masking
 and row filtering inside the query plan.
 
-    import griotql
+    import peql
 
-    engine = griotql.Engine.from_json_contracts_dir("./contracts")
+    engine = peql.Engine.from_json_contracts_dir("./contracts")
     table = engine.query(
         'SELECT email, region FROM "sales/orders/v1"',
-        griotql.Caller("user:bob", "analytics", "globex"),
+        peql.Caller("user:bob", "analytics", "globex"),
     )
     print(table.to_pandas())   # email is masked for the outside tenant
 """
@@ -21,7 +21,7 @@ import pyarrow as _pa
 from ._native import Caller, Engine as _NativeEngine
 
 __all__ = ["Engine", "Caller"]
-__version__ = "2.0.0"
+__version__ = "0.3.0"
 
 
 class Engine:

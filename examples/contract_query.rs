@@ -20,8 +20,8 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 
-use griot::contract_source::Caller;
-use griot::engine::GriotEngine;
+use peql::contract_source::Caller;
+use peql::engine::Engine;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -76,7 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     })
     .to_string();
 
-    let engine = GriotEngine::from_json_contracts([contract])?;
+    let engine = Engine::from_json_contracts([contract])?;
 
     let sql = r#"SELECT order_id, email, region, amount FROM "sales/orders/v1" ORDER BY order_id"#;
 

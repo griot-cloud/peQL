@@ -29,10 +29,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::row_filter_exec::RowFilterExec;
-use griot::physical::PhysicalError;
-use griot::ContractBundleHandle;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::row_filter_exec::RowFilterExec;
+use peql::physical::PhysicalError;
+use peql::ContractBundleHandle;
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -335,14 +335,14 @@ async fn rfe_c1_malformed_bundle_json_returns_hard_error() {
         .unwrap();
 
     // Bundle with syntactically invalid JSON bytes.
-    let malformed_bundle = griot::ContractBundleHandle::from_x02_bytes(
+    let malformed_bundle = peql::ContractBundleHandle::from_x02_bytes(
         "contract-rfe-c1",
         "test-tenant",
         bytes::Bytes::from(b"{ this is not valid json !!!".to_vec()),
     );
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(
             make_bundle_no_filter("contract-rfe-c1-inner"),
             inner,
         )

@@ -22,9 +22,9 @@ use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{collect, ExecutionPlan};
 
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::laplace_noise_exec::LaplaceNoiseExec;
-use griot::ContractBundleHandle;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::laplace_noise_exec::LaplaceNoiseExec;
+use peql::ContractBundleHandle;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

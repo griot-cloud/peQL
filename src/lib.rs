@@ -653,7 +653,7 @@ pub mod contract_table_provider;
 /// The DataFusion catalog that resolves `SELECT * FROM "<dataset-uri>"`.
 pub mod catalog;
 
-/// The high-level, contract-resolving `GriotEngine` query API.
+/// The high-level, contract-resolving `Engine` query API.
 pub mod engine;
 
 /// Platform adapter: consume T03's signed contract bundle (feature `platform`).

@@ -20,9 +20,9 @@
 
 use bytes::Bytes;
 use datafusion::execution::context::SessionContext;
-use griot::optimizer_rules::contract_check::{ApprovedTableSet, ContractCheckRule};
-use griot::optimizer_rules::{AuditKind, ContractCheckMarker, Principal};
-use griot::ContractBundleHandle;
+use peql::optimizer_rules::contract_check::{ApprovedTableSet, ContractCheckRule};
+use peql::optimizer_rules::{AuditKind, ContractCheckMarker, Principal};
+use peql::ContractBundleHandle;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

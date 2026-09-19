@@ -1,6 +1,6 @@
 //! End-to-end tests for the graph SQL functions against the REAL
 //! `zijani-operations` snapshot bundle (271 nodes / 562 edges), through
-//! `GriotEngine::query` — contract resolution, governed traversal, masking,
+//! `Engine::query` — contract resolution, governed traversal, masking,
 //! walls, caching, and SQL composability.
 //!
 //! G02 acceptance mapping: T1/T2 (resolution + uniform deny), T3 (schemas +
@@ -10,8 +10,8 @@
 use datafusion::arrow::array::{Array, StringArray};
 use datafusion::arrow::record_batch::RecordBatch;
 
-use griot::contract_source::Caller;
-use griot::engine::GriotEngine;
+use peql::contract_source::Caller;
+use peql::engine::Engine;
 
 const GRAPH_REF: &str = "process-graphs/zijani-operations/v1";
 
@@ -45,8 +45,8 @@ fn graph_contract(node_filter: Option<&str>, edge_filter: Option<&str>) -> Strin
     c.to_string()
 }
 
-fn engine(node_filter: Option<&str>, edge_filter: Option<&str>) -> GriotEngine {
-    GriotEngine::from_json_contracts([graph_contract(node_filter, edge_filter)]).unwrap()
+fn engine(node_filter: Option<&str>, edge_filter: Option<&str>) -> Engine {
+    Engine::from_json_contracts([graph_contract(node_filter, edge_filter)]).unwrap()
 }
 
 fn owner() -> Caller {

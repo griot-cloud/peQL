@@ -38,7 +38,7 @@ jobs:
         shell: bash
         run: |
           python -m pip install --upgrade pip pyarrow pytest
-          python -m pip install --no-index --find-links dist griotql
+          python -m pip install --no-index --find-links dist peql
           python -m pytest -q
 
       - uses: actions/upload-artifact@v4

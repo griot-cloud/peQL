@@ -3449,42 +3449,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "griot"
-version = "2.0.0"
-dependencies = [
- "anyhow",
- "arrow 55.2.0",
- "async-trait",
- "base64",
- "bytes",
- "chrono",
- "datafusion 47.0.0",
- "futures",
- "hex",
- "lance",
- "lance-core",
- "lance-io",
- "lru",
- "object_store 0.11.2",
- "p256",
- "parquet",
- "rand 0.8.6",
- "rand_distr 0.4.3",
- "reqwest",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 1.0.69",
- "tokio",
- "tokio-test",
- "tracing",
- "trybuild",
- "uuid",
- "xxhash-rust",
-]
-
-[[package]]
 name = "group"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5435,6 +5399,42 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "88b39c9bfcfc231068454382784bb460aae594343fb030d46e9f50a645418412"
 dependencies = [
  "base64ct",
+]
+
+[[package]]
+name = "peql"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "arrow 55.2.0",
+ "async-trait",
+ "base64",
+ "bytes",
+ "chrono",
+ "datafusion 47.0.0",
+ "futures",
+ "hex",
+ "lance",
+ "lance-core",
+ "lance-io",
+ "lru",
+ "object_store 0.11.2",
+ "p256",
+ "parquet",
+ "rand 0.8.6",
+ "rand_distr 0.4.3",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-test",
+ "tracing",
+ "trybuild",
+ "uuid",
+ "xxhash-rust",
 ]
 
 [[package]]

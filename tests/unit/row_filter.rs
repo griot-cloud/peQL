@@ -17,10 +17,10 @@
 
 use bytes::Bytes;
 use datafusion::execution::context::SessionContext;
-use griot::optimizer_rules::contract_check::ContractCheckRule;
-use griot::optimizer_rules::row_filter::RowFilterRule;
-use griot::optimizer_rules::Principal;
-use griot::ContractBundleHandle;
+use peql::optimizer_rules::contract_check::ContractCheckRule;
+use peql::optimizer_rules::row_filter::RowFilterRule;
+use peql::optimizer_rules::Principal;
+use peql::ContractBundleHandle;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 

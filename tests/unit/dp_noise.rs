@@ -20,10 +20,10 @@ use bytes::Bytes;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::optimizer::OptimizerRule;
-use griot::optimizer_rules::contract_check::ContractCheckRule;
-use griot::optimizer_rules::dp_noise::{DPNoiseRule, PrivacyBudgetTracker};
-use griot::optimizer_rules::{AuditKind, Principal};
-use griot::ContractBundleHandle;
+use peql::optimizer_rules::contract_check::ContractCheckRule;
+use peql::optimizer_rules::dp_noise::{DPNoiseRule, PrivacyBudgetTracker};
+use peql::optimizer_rules::{AuditKind, Principal};
+use peql::ContractBundleHandle;
 use std::collections::HashMap;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

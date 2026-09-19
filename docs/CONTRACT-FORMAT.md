@@ -1,10 +1,10 @@
-# The GriotQL JSON contract format
+# JSON contract format
 
-A contract is the governance surface for one dataset: what it is, who may read
-it, and how it is masked/filtered for non-owners. The open-source engine
-(`JsonContractSource`) reads the format below. One JSON document = one dataset.
+`JsonContractSource` reads one JSON object per dataset. The object defines
+policy inputs and a data binding. The engine evaluates it for each caller and
+enforces the resulting decision and transformations during query execution.
 
-## Full example
+## Example
 
 ```json
 {
@@ -13,98 +13,104 @@ it, and how it is masked/filtered for non-owners. The open-source engine
   "dataset": "sales/orders/v1",
   "binding": { "parquet": "/data/orders.parquet" },
   "owner_tenant": "acme",
-  "purposes": ["analytics", "marketplace-listing"],
+  "purposes": ["analytics"],
   "columns": [
-    { "name": "order_id", "type": "int" },
-    { "name": "email",    "type": "text",  "sensitivity": "pii", "mask": "hash_sha256" },
-    { "name": "region",   "type": "text" },
-    { "name": "amount",   "type": "float" }
+    { "name": "order_id" },
+    { "name": "email", "mask": "hash_sha256" },
+    { "name": "region" }
   ],
-  "row_filter": "region = 'EU'",
-  "dp_columns": {
-    "amount": { "sensitivity": 1.0, "epsilon": 0.1 }
-  }
+  "row_filter": "region = 'EU'"
 }
 ```
 
+For a caller whose tenant is `acme`, peQL exposes the three listed columns
+with original values and all rows. For another tenant with purpose
+`analytics`, peQL filters to EU rows and hashes `email`. A caller with a
+different purpose is denied before the binding is opened.
+
 ## Fields
 
-| Field | Required | Meaning |
-|---|---|---|
-| `contract_id` | yes | Stable contract identifier (flows into attestation). |
-| `version` | yes | Contract version string. |
-| `dataset` | yes | The name queries target: `SELECT * FROM "<dataset>"`. Must be unique across loaded contracts. |
-| `binding.parquet` | yes | Path to the local Parquet file holding the rows. |
-| `owner_tenant` | yes | The tenant that sees raw data. Callers with `Caller.tenant == owner_tenant` bypass masking/filtering — but still only see the columns `columns` exposes. |
-| `purposes` | no | Allowed query purposes. If non-empty, a `Caller.purpose` not listed is **denied**. Empty/absent = any purpose. |
-| `columns` | no | The contract's **read projection**: the columns it exposes, in order. A column may carry a `mask`. Listing a subset **hides** the rest — `SELECT *` returns only these, and selecting an undeclared column is an error. Omit `columns` entirely to expose every column of the bound Parquet file. |
-| `columns[].name` | yes | Column name. |
-| `columns[].type` | no | Informational (`int`/`text`/`float`/…); the actual types come from the Parquet file. |
-| `columns[].sensitivity` | no | Informational label (e.g. `pii`). |
-| `columns[].mask` | no | Mask action applied for non-owners (see below). |
-| `row_filter` | no | A SQL boolean predicate; non-owners only see rows satisfying it. |
-| `dp_columns` | no | Map of column → `{ sensitivity, epsilon }` for differential-privacy noise. |
+| Field | Required | Engine interpretation |
+| --- | --- | --- |
+| `contract_id` | Yes | Identifier carried into the resolved policy and operator bundle. |
+| `version` | Yes | Version string carried into the resolved policy. |
+| `dataset` | Yes | Quoted table name in SQL; it is the lookup key for the JSON source. |
+| `binding` | Yes | Physical location. Use `parquet` for tables or `graph_snapshot` for graphs. |
+| `owner_tenant` | Yes | Tenant that receives unmasked, unfiltered values after the purpose check. |
+| `purposes` | No | Allowed purpose strings. Empty or omitted means any purpose. |
+| `columns` | No | Ordered names exposed by tabular scans to every caller. Omitted or empty exposes all source columns. |
+| `columns[].name` | When a column is listed | Name of an exposed source column. |
+| `columns[].mask` | No | Mask for non-owner callers. |
+| `masks` | No | Additional column-to-mask map; it overrides a mask for the same name in `columns`. |
+| `row_filter` | No | SQL predicate that restricts non-owner table rows. |
+| `dp_columns` | No | Per-column `sensitivity` and `epsilon` for Laplace noise on non-owner scans. |
+| `node_filter` | No | Graph alias for a node row predicate; ignored when `row_filter` is present. |
+| `edge_filter` | No | Graph edge predicate that removes relationships from traversal. |
 
-## Mask actions (`columns[].mask`)
+`columns[].type` and `columns[].sensitivity` can appear in JSON, but the
+current parser does not use them. Arrow types come from the bound Parquet file.
 
-| Value | Effect on non-owner reads |
-|---|---|
-| `redact` | every value → `<REDACTED>` |
-| `hash_sha256` | every value → its SHA-256 hex digest |
-| `tokenize` | deterministic token (SHA-256) |
-| `partial` | keep the last 4 characters, mask the rest |
-| `null` | typed NULL |
-| `noop` | unchanged (same as omitting `mask`) |
+## Column exposure and masks
 
-Unknown values are a hard error at load time.
+For a tabular dataset, the engine reports only names listed in `columns` to
+the SQL planner. A query for another source column fails resolution, including
+for the owner. After scanning, peQL masks values and applies the
+exposed-column projection. Graph table functions use their own result schemas;
+this projection is not applied to graph function output.
 
-## Semantics
+| Mask | Current effect |
+| --- | --- |
+| `redact` | String becomes `***`; supported numeric values become zero and booleans become false. |
+| `hash_sha256` | SHA-256 hex digest of the value's string representation. |
+| `tokenize` | Currently the same deterministic SHA-256 digest as `hash_sha256`. |
+| `partial` | `***` followed by the last four characters. |
+| `null` | Empty string for a non-null string; zero or false for supported non-string types. Existing nulls remain null. |
+| `noop` | Original value. |
 
-- **Projection.** `columns` is the contract's shape: the engine narrows the table
-  to exactly those columns before anything else runs. It applies to **every**
-  caller, owner included — hiding a column is a property of the contract, not of
-  who is asking. A contract that declares a subset is the open-source equivalent
-  of a platform "view".
-- **Owner vs. non-owner.** `owner_tenant` callers get raw values. Everyone else
-  gets `mask`-ed columns + `row_filter` + `dp_columns`. Both see the same
-  projection.
-- **Purpose gate.** Evaluated before anything else; a disallowed purpose denies
-  the whole query.
-- **Row filter** is a SQL expression over the dataset's columns. It is applied
-  even when the referenced column is not in the `SELECT` list.
-- **DP** adds Laplace noise to the named columns (sensitivity/ε); it is an
-  engine capability and has no T03-platform equivalent.
+The current `null` action does not turn a non-null input into an Arrow null.
+An unknown mask name is an error. A string-producing mask on a non-string
+column changes the output Arrow type to `Utf8`. Read the output schema rather
+than assuming it matches the Parquet schema.
 
-## Graph contracts (2.0, in progress)
+## Row filtering and differential privacy
 
-A process-graph snapshot is a contract-bound dataset too. Its contract is the
-same format with two additions (full design in [GRAPH-QUERY.md](GRAPH-QUERY.md)):
+`row_filter` is a SQL boolean expression over source columns. It applies to
+non-owner callers before masking and before the query's own projection. A
+filter may therefore use a column that the query does not select.
+
+`dp_columns` has this shape:
+
+```json
+"dp_columns": {
+  "amount": { "sensitivity": 1.0, "epsilon": 0.1 }
+}
+```
+
+When present, `Engine` adds `LaplaceNoiseExec` to the governed scan using its
+permissive budget tracker. This path adds noise but does **not** enforce a
+cross-query privacy budget. The lower-level operator has a constructor that
+accepts a budget tracker. Do not present `dp_columns` alone as a complete
+privacy-budget system.
+
+## Graph binding
+
+For a graph, `binding.graph_snapshot` names a local directory containing
+`manifest.json`, `nodes.parquet`, `edges.parquet`, and `edges_rev.parquet`:
 
 ```json
 {
-  "contract_id": "zijani_ops_graph",
-  "dataset": "process-graphs/zijani-operations/v7",
-  "binding": { "graph_snapshot": "lakehouse://process-graphs/zijani-operations/v7/" },
-  "owner_tenant": "zijani",
+  "contract_id": "operations_graph",
+  "version": "1",
+  "dataset": "process-graphs/operations/v1",
+  "binding": { "graph_snapshot": "/data/operations-v1" },
+  "owner_tenant": "acme",
   "purposes": ["process_analysis"],
-  "masks":       { "owner": "redact", "system_ref": "redact", "condition": "redact" },
+  "masks": { "owner": "redact" },
   "node_filter": "kind != 'system'",
   "edge_filter": "edge_type != 'depends_on'"
 }
 ```
 
-- **`binding.graph_snapshot`** points at a snapshot bundle directory (nodes/edges
-  Parquet + manifest + cert), not a single Parquet file.
-- **`masks`** / **`node_filter`** are the tabular `column_masks` / `row_filter`
-  reinterpreted over node columns. Crucially, `node_filter` makes a filtered node
-  a **wall** — absent *and* non-traversable, so no path routes through it.
-- **`edge_filter`** is graph-only: it hides a *relationship* (e.g. all
-  `depends_on` edges) even between two visible nodes — a lever tables don't have.
-
-## Relationship to Griot Cloud (T03) contracts
-
-This JSON is an engine-native, open-source format. On the platform, the same
-engine instead consumes T03's compiled, signed bundle
-(`--features platform`), which expresses the equivalent policy as Rego + SQL
-templates. Both are mapped to the same internal `ResolvedPolicy`; see
-[ARCHITECTURE.md](ARCHITECTURE.md).
+The standalone resolver accepts a `file://` prefix on the directory path.
+Graph policy compilation evaluates node and edge predicates using DataFusion.
+See {doc}`GRAPH-QUERY` for traversal behavior.

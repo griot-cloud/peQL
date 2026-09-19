@@ -1,147 +1,100 @@
-# GriotQL architecture
+# Query architecture
 
-GriotQL turns "name a dataset in SQL" into "execute the governing contract". This
-document explains the moving parts and the seam that lets one engine serve both
-the open-source and the platform worlds.
+This page follows the high-level `peql::engine::Engine` path. The source code
+for each stage is named so a contributor can move between this explanation and
+the implementation.
 
-## The one idea
+## 1. Create a caller-bound session
 
-Governance does not live in the engine — it lives in the **contract**. The engine
-only *executes* a decision the contract already made. That decision is captured
-by one engine-agnostic type, **`ResolvedPolicy`** (`src/policy.rs`):
+`Engine::query_with_stats(sql, caller)` in `src/engine.rs` rejects unsafe DDL,
+creates a new DataFusion session, and registers a catalog bound to that
+`Caller`. It also registers graph table functions bound to the same caller.
+`Engine::query` calls this method and returns only its record batches.
 
-```
-ResolvedPolicy {
-  contract_id, contract_version, tenant_id,
-  decision:      Allow | Deny { reason },
-  column_masks:  { column -> redact|hash_sha256|tokenize|partial|null|noop },
-  row_filter:    Option<SQL predicate>,
-  dp_columns:    { column -> { sensitivity, epsilon } },
-}
-```
+The caller is supplied by the embedding application. Authentication is
+outside this crate; the engine acts on the caller context it receives.
 
-Whoever resolves a contract for a caller produces a `ResolvedPolicy`; the engine
-turns it into governed execution. Because the policy is engine-agnostic, the
-*source* of contracts is pluggable.
+## 2. Resolve each table reference
 
-## The two seams
+For `FROM "sales/orders/v1"`, DataFusion asks `PeqlSchemaProvider::table` in
+`src/catalog.rs` for the named table. The provider calls
+`ContractSource::resolve(dataset, caller)`.
 
-```
-            ┌─────────────────────────┐
-  caller ─► │  ContractSource         │ ─► ResolvedPolicy
-            │  (JSON | T03 bundle)    │
-            └─────────────────────────┘
-            ┌─────────────────────────┐
- dataset ─► │  BindingResolver        │ ─► Arc<dyn TableProvider>  (raw data)
-            │  (local Parquet | T02)  │
-            └─────────────────────────┘
-```
+- On `Deny`, planning stops with an access error.
+- On `Allow`, the provider calls `BindingResolver::resolve(dataset)` and wraps
+  the returned raw table in `ContractTableProvider`.
+- On an unknown name, the provider reports no table. Graph function names
+  must remain available to DataFusion's function registry.
 
-| Trait | Open-source impl | Platform impl |
-|---|---|---|
-| `ContractSource` | `JsonContractSource` (reads JSON contracts) | `PlatformBundleSource` (fetch + verify T03 signed bundle) |
-| `BindingResolver` | `JsonContractSource` (local Parquet → `MemTable`) | T02-backed (e.g. the `lance` table provider) |
+`ResolvedPolicy` in `src/policy.rs` is the data passed between resolution and
+execution. It includes the decision, masks, row predicate, optional noise
+parameters, exposed columns, and graph edge predicate. The engine serializes
+the operator fields to the JSON format consumed by its physical operators.
 
-## The execution spine
+## 3. Build a governed scan
 
-When a query names a dataset, DataFusion asks our catalog to resolve it:
+`ContractTableProvider::scan` in `src/contract_table_provider.rs` asks the raw
+provider for all columns and no pushed filter or limit. It then wraps that
+plan in the following order:
 
-```
-SELECT … FROM "sales/orders/v1"
-  │
-  ▼  GriotSchemaProvider::table("sales/orders/v1")        (src/catalog.rs)
-  │     1. ContractSource.resolve(dataset, caller) → ResolvedPolicy
-  │     2. if Deny → error;  else
-  │     3. BindingResolver.resolve(dataset)        → raw TableProvider
-  │     4. ContractTableProvider::new(raw, policy)
-  ▼
-ContractTableProvider::scan()                            (src/contract_table_provider.rs)
-  │  raw.scan(full, no projection)                        ← operators need all columns
-  │  → ContractApprovedExec   (proof the scan was contract-checked)
-  │  → RowFilterExec          (drop rows the contract forbids)
-  │  → MaskingExec            (mask sensitive columns)
-  │  → LaplaceNoiseExec       (DP noise, if any)
-  │  → ProjectionExec/LimitExec (honor the query's SELECT/LIMIT)
-  ▼
-governed RecordBatches
+```text
+raw TableProvider scan
+└─ ScanMetricsExec
+   └─ ContractApprovedExec
+      └─ RowFilterExec
+         └─ MaskingExec
+            └─ LaplaceNoiseExec, when dp_columns is set
+               └─ contract projection
+                  └─ query projection and limit
 ```
 
-`GriotEngine::query(sql, caller)` (`src/engine.rs`) ties it together: it builds a
-fresh DataFusion session whose **default catalog** is a caller-bound
-`GriotCatalogProvider`, so the caller's identity flows into resolution with no
-global state. Naming a dataset is the *only* way to get a table, and every such
-table is a `ContractTableProvider` — so there is no un-governed scan path.
+The diagram reads from input at the top to output at the bottom. The engine
+needs the full raw schema because a contract row predicate can reference a
+column absent from the query result. `ContractApprovedExec` supplies the
+marker required by downstream enforcement operators.
 
-### Why scan-in-full-then-project
+`MaskingExec` can change a field's Arrow type. The provider computes its
+governed schema before DataFusion plans expressions, then projects only the
+contract's exposed columns. `governed_session_context` omits DataFusion 47's
+physical `ProjectionPushdown` rule because that rule can move projections
+through a type-changing mask and produce a schema mismatch.
 
-The contract's row filter may reference a column the query didn't select (e.g.
-filter on `region` while `SELECT order_id`). So the inner table is scanned in
-full, the operators enforce on all columns, and the caller's projection/limit are
-applied on top — keeping enforcement correct and the output schema right.
+## 4. Execute and account
 
-## Reused enforcement operators
+The engine creates a physical plan, collects Arrow `RecordBatch`es, and walks
+the plan for scan metrics. `QueryStats` reports rows scanned and Arrow
+in-memory bytes from `ScanMetricsExec`, before contract filtering and result
+limits. These counters are not storage I/O bytes.
 
-The `ResolvedPolicy` is serialised (`to_bundle_bytes`) into the exact JSON the
-pre-existing physical operators (`src/physical/*`) already parse —
-`column_masking`, `row_filter`, `dp_columns`, `contract_id`,
-`contract_version` — so the spine reuses them unchanged. The operators are
-sealed (no public constructor bypasses the contract bundle) and each refuses to
-run without a `ContractApprovedExec` upstream.
+The standalone Parquet binding (`src/binding.rs`) reads the entire file into a
+DataFusion `MemTable`. There is no streaming local-file reader in this path.
 
-## The platform adapter (`src/platform/`, feature `platform`)
+## Alternative sources
 
-T03 compiles a contract into a **signed `CompiledBundle`**: WASM carriers + Rego
-policies + SQL templates + a resolution map, ECDSA-P256-signed. `PlatformBundleSource`:
+`JsonContractSource` (`src/contract_source.rs`) supplies both contract
+resolution and local binding. With the `platform` feature,
+`PlatformBundleSource` fetches a T03 bundle over HTTP and maps its SQL and
+Rego content to `ResolvedPolicy`. Signature verification occurs only when a
+`VerifyingKey` is configured. This adapter does not provide a storage
+`BindingResolver`; an application must supply one. The mapping recognizes
+the current T03 template forms, so it is not a general SQL or Rego evaluator.
 
-1. **Fetches** the `.gdcpc.signed` JSON from T03 over HTTP.
-2. **Verifies** the signature — `src/platform/bundle.rs` reproduces T03's
-   `canonical_digest` / `canonical_signing_payload` byte-for-byte and checks the
-   DER ECDSA-P256 signature with `p256`. (Kept in sync with T03's `bundle-signer`;
-   a shared crate would remove the duplication.)
-3. **Maps** the bundle → `ResolvedPolicy`. Because T03 expresses masking as SQL
-   templates (`sha256_hex(email) AS email`) and purpose gates as Rego, the mapping
-   *parses* the non-owner read template for masks + row filter and the purpose-gate
-   Rego for allowed purposes. Heuristic but faithful to the bundles T03 emits;
-   DP is never present (absent from the T03 model).
+## Graph execution
 
-The mapped policy then flows through the identical spine. A real committed bundle
-is exercised offline in `tests/platform_bundle.rs` and
-`examples/platform_bundle.rs`.
+`src/graph/functions.rs` registers SQL table functions per caller-bound
+session. `GraphSession::governed` resolves the contract before opening the
+snapshot, then loads and verifies the snapshot through `src/graph/bundle.rs`.
+It caches immutable raw data and separately caches compiled visibility masks
+by policy fingerprint. `src/graph/traverse.rs` consults those masks while
+walking the graph. Output assembly applies masking before returning a
+DataFusion table. The graph loader checks format, file digests, and structural
+invariants; this standalone path does not verify a signed certificate.
 
-## Module map
+## The other Rust entry point
 
-| Path | Role |
-|---|---|
-| `src/policy.rs` | `ResolvedPolicy`, `MaskAction`, `Decision` — the engine-agnostic primitive |
-| `src/contract_source.rs` | `ContractSource`, `Caller`, `JsonContractSource` |
-| `src/binding.rs` | `BindingResolver`, `DatasetRef`, local-Parquet loader |
-| `src/contract_table_provider.rs` | the governed `TableProvider` (operator stack) |
-| `src/catalog.rs` | `GriotSchemaProvider` / `GriotCatalogProvider` (lazy URI resolution) |
-| `src/engine.rs` | `GriotEngine` high-level API |
-| `src/physical/*` | the enforcement operators (reused unchanged) |
-| `src/platform/*` | T03 signed-bundle adapter (feature `platform`) |
-
-## Graph surface (2.0, in progress)
-
-The 2.0 line extends the same architecture to **graphs**. A compiled
-process-graph snapshot (nodes/edges Parquet + manifest + cert) is just a
-contract-bound dataset with two access surfaces, both hanging off one governed
-handle produced only through contract resolution:
-
-- **Relational** — `graph_nodes(ref)` / `graph_edges(ref)` are `ContractTableProvider`s
-  over the snapshot's Parquet, governed by the **existing operator stack**, unchanged.
-- **Traversal** — six SQL table functions (`graph_node`, `graph_neighbors`,
-  `graph_edges`, `graph_subtree`, `graph_path`, `graph_reachable`) walk the graph.
-
-The same `ResolvedPolicy` governs both: `masks` → output masking, `row_filter`
-(a node predicate) → a **visibility bitmask** the traversal consults as a *wall*
-(a filtered node is non-existent **and** non-traversable — no path routes through
-it), plus a graph-only `edge_filter` to hide relationships. "No un-governed path"
-holds by construction. Full design: **[GRAPH-QUERY.md](GRAPH-QUERY.md)**.
-
-## Deliberate non-goals (today)
-
-- Streaming large files (local binding uses an in-memory `MemTable`).
-- Auto-attaching signed **attestation** envelopes to results.
-- Wiring this engine into the Griot Cloud deployment (replacing the in-cluster
-  K04D) — a separate effort.
+`K04DEngine` in `src/lib.rs` creates a DataFusion session with direct table
+registration methods. Its `query` method checks for an injected bundle handle
+and rejects unsafe DDL. It does not resolve that bundle into a policy or wrap
+directly registered tables with `ContractTableProvider`. Applications using
+this API must account for that difference; the high-level enforcement path
+described above is specific to `Engine`.

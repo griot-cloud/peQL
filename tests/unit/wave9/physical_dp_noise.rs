@@ -29,10 +29,10 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::datasource::MemTable;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
-use griot::physical::contract_approved_exec::ContractApprovedExec;
-use griot::physical::laplace_noise_exec::LaplaceNoiseExec;
-use griot::physical::PhysicalError;
-use griot::ContractBundleHandle;
+use peql::physical::contract_approved_exec::ContractApprovedExec;
+use peql::physical::laplace_noise_exec::LaplaceNoiseExec;
+use peql::physical::PhysicalError;
+use peql::ContractBundleHandle;
 use std::sync::Arc;
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -312,14 +312,14 @@ async fn dpe_c3_malformed_bundle_json_returns_hard_error() {
         .await
         .unwrap();
 
-    let malformed_bundle = griot::ContractBundleHandle::from_x02_bytes(
+    let malformed_bundle = peql::ContractBundleHandle::from_x02_bytes(
         "contract-dpe-c3",
         "test-tenant",
         bytes::Bytes::from(b"{ not valid json }".to_vec()),
     );
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(
             make_dp_bundle("contract-dpe-c3-inner"),
             inner,
         )
@@ -373,7 +373,7 @@ async fn dpe_c6_invalid_epsilon_zero_returns_hard_error() {
         .unwrap();
 
     // epsilon=0.0 is invalid.
-    let bad_bundle = griot::ContractBundleHandle::from_x02_bytes(
+    let bad_bundle = peql::ContractBundleHandle::from_x02_bytes(
         "contract-dpe-c6",
         "test-tenant",
         bytes::Bytes::from(
@@ -393,7 +393,7 @@ async fn dpe_c6_invalid_epsilon_zero_returns_hard_error() {
     );
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(
             make_dp_bundle("contract-dpe-c6-inner"),
             inner,
         )
@@ -441,7 +441,7 @@ async fn dpe_c6b_invalid_epsilon_negative_returns_hard_error() {
         .await
         .unwrap();
 
-    let bad_bundle = griot::ContractBundleHandle::from_x02_bytes(
+    let bad_bundle = peql::ContractBundleHandle::from_x02_bytes(
         "contract-dpe-c6b",
         "test-tenant",
         bytes::Bytes::from(
@@ -458,7 +458,7 @@ async fn dpe_c6b_invalid_epsilon_negative_returns_hard_error() {
     );
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(
             make_dp_bundle("contract-dpe-c6b-inner"),
             inner,
         )
@@ -498,7 +498,7 @@ async fn dpe_c7_int64_column_receives_noise() {
         ),
     ]));
 
-    let bundle = griot::ContractBundleHandle::from_x02_bytes(
+    let bundle = peql::ContractBundleHandle::from_x02_bytes(
         "contract-dpe-c7",
         "test-tenant",
         bytes::Bytes::from(
@@ -535,7 +535,7 @@ async fn dpe_c7_int64_column_receives_noise() {
         .unwrap();
 
     let approved = Arc::new(
-        griot::physical::contract_approved_exec::ContractApprovedExec::new(bundle.clone(), inner)
+        peql::physical::contract_approved_exec::ContractApprovedExec::new(bundle.clone(), inner)
             .unwrap(),
     );
 
