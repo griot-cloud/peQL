@@ -28,7 +28,9 @@ flowchart TB
 Illustrative result for a non-owner query; noise varies each run.
 See [noise policy and privacy limits](docs/CONTRACT-FORMAT.md#row-filtering-and-differential-privacy).
 
+
 ## Quickstart
+Read the [Documentation](https://griot-cloud.github.io/peQL/)
 
 [Run the working example](docs/getting-started.md), or add peQL to your application.
 
