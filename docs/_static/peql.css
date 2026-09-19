@@ -75,6 +75,88 @@ body {
   line-height: 1.65;
 }
 
+.yue .query-diagram {
+  margin: 1.25rem 0 2rem;
+  --query-line: #8da6b9;
+}
+
+.query-inputs, .query-outputs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.yue .query-box {
+  min-width: 0;
+  padding: 1rem;
+  border: 1px solid var(--griot-border);
+  border-radius: .5rem;
+  background: var(--griot-surface);
+}
+
+.query-box strong { font-size: .9rem; }
+.query-box small { margin-left: .4rem; color: var(--griot-muted); font-weight: 400; }
+.yue .query-box pre {
+  margin: .7rem 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-size: .78rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.yue .query-box p { margin: .7rem 0 0; font-size: .9rem; color: var(--griot-muted); }
+
+.query-join {
+  position: relative;
+  height: 48px;
+  width: 50%;
+  margin: 0 auto;
+  background:
+    linear-gradient(var(--query-line), var(--query-line)) left top / 1px 24px no-repeat,
+    linear-gradient(var(--query-line), var(--query-line)) right top / 1px 24px no-repeat,
+    linear-gradient(var(--query-line), var(--query-line)) left 23px / 100% 1px no-repeat;
+}
+.query-join::after {
+  content: "↓";
+  position: absolute;
+  left: 50%;
+  top: 22px;
+  transform: translateX(-50%);
+  color: var(--query-line);
+  font-size: 24px;
+  line-height: 28px;
+}
+.query-engine {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: .2rem;
+  max-width: 360px;
+  margin: auto;
+  padding: .85rem 1rem;
+  border: 1px solid #154b75;
+  border-radius: .5rem;
+  background: #154b75;
+  color: white;
+  text-align: center;
+}
+.yue .query-engine strong { font-size: 1.3rem; color: white; }
+.query-engine span { font-size: .85rem; }
+.query-arrow { text-align: center; color: var(--query-line); font-size: 24px; line-height: 40px; }
+.yue .query-diagram figcaption {
+  margin-top: .85rem;
+  text-align: center;
+  font-size: .85rem;
+  color: var(--griot-muted);
+}
+@media (max-width: 520px) {
+  .query-inputs, .query-outputs { grid-template-columns: 1fr; gap: .6rem; }
+  .query-join { width: 1px; height: 40px; background-size: 1px 16px; }
+  .query-join::after { top: 12px; }
+}
+
 .sd-card {
   background: var(--griot-surface);
   border-color: var(--griot-border);

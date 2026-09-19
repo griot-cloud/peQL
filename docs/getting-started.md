@@ -1,4 +1,4 @@
-# Run your first query
+# Quickstart
 
 This tutorial uses the standalone JSON and Parquet path. It runs locally with
 Rust 1.88 or newer.

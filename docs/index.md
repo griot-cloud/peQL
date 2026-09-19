@@ -2,61 +2,75 @@
 
 # Documentation
 
-peQL is a policy enforcing query engine built on Apache DataFusion. Applications
-send SQL and caller context to the engine. For each referenced dataset, peQL
-reads a contract definition, determines the caller's access and transformations,
-and enforces them in the query plan. A contract defines the rules; peQL performs
-the checks and executes the transformations.
+peQL is a policy-enforcing query engine built on Apache DataFusion.
+Let people query your data while keeping control over what they can see.
+
+## The query path
+
+<figure class="query-diagram" aria-label="SQL and policy enter peQL. The engine compiles policy into query execution and returns permitted results.">
+  <div class="query-inputs">
+    <div class="query-box">
+      <strong>SQL</strong>
+      <pre>SELECT order_id, total
+FROM "sales/orders/v1";</pre>
+    </div>
+    <div class="query-box">
+      <strong>Policy <small>Rego excerpt</small></strong>
+      <pre>default allow := false
+allow if {
+  input.declared_purpose == "analytics"
+}</pre>
+    </div>
+  </div>
+  <div class="query-join" aria-hidden="true"></div>
+  <div class="query-engine"><strong>peQL</strong><span>Compiles policy into query execution</span></div>
+  <div class="query-arrow" aria-hidden="true">↓</div>
+  <div class="query-outputs">
+    <div class="query-box">
+      <strong>Analytics → results</strong>
+      <pre>order_id   total
+101        49.00
+102        85.00</pre>
+    </div>
+    <div class="query-box query-denied">
+      <strong>Other purposes → denied</strong>
+      <p>No results returned.</p>
+    </div>
+  </div>
+  <figcaption>Same SQL. The policy determines whether it can run.</figcaption>
+</figure>
 
 ::::{grid} 1 2 2 2
 :gutter: 3
 
-:::{grid-item-card} Run a query
+:::{grid-item-card} Quickstart
 :link: getting-started
 :link-type: doc
 
-Build the repository, run a working example, then query a Parquet file using
-your own JSON contract.
+Run your first query with a data contract.
 :::
 
 :::{grid-item-card} Use the APIs
 :link: USAGE
 :link-type: doc
 
-Query from Rust or Python, retrieve scan statistics, and use graph functions.
+Add peQL to a Rust or Python application.
 :::
 
-:::{grid-item-card} Understand execution
+:::{grid-item-card} How it works
 :link: concepts
 :link-type: doc
 
-Follow a dataset reference from SQL planning through contract resolution and
-the physical operators.
+See how contracts become enforced query plans.
 :::
 
 :::{grid-item-card} Contribute
 :link: contributing
 :link-type: doc
 
-Build the site, run the test suite, and locate the implementation for a change.
+Build the engine, run tests, and make a change.
 :::
 ::::
-
-## The query path
-
-```text
-SQL + caller
-    ↓
-Resolve dataset → evaluate contract definition → allow or deny
-    ↓ allow
-Open binding → scan → filter rows → mask columns → optional noise
-    ↓
-Apply exposed columns and query operators → Arrow results
-```
-
-For the high-level Rust API and Python binding, table references pass through
-this path. The lower-level `K04DEngine` has a different API and enforcement
-behavior; see {doc}`reference` before using it.
 
 ```{toctree}
 :maxdepth: 1
