@@ -80,7 +80,7 @@ body {
   --query-line: #8da6b9;
 }
 
-.query-inputs, .query-outputs {
+.query-inputs {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 1rem;
@@ -95,7 +95,6 @@ body {
 }
 
 .query-box strong { font-size: .9rem; }
-.query-box small { margin-left: .4rem; color: var(--griot-muted); font-weight: 400; }
 .yue .query-box pre {
   margin: .7rem 0 0;
   padding: 0;
@@ -133,7 +132,7 @@ body {
   flex-direction: column;
   align-items: center;
   gap: .2rem;
-  max-width: 360px;
+  width: 100%;
   margin: auto;
   padding: .85rem 1rem;
   border: 1px solid #154b75;
@@ -144,6 +143,44 @@ body {
 }
 .yue .query-engine strong { font-size: 1.3rem; color: white; }
 .query-engine span { font-size: .85rem; }
+.query-execution {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 2rem minmax(0, 1.4fr);
+  align-items: start;
+  width: 100%;
+  margin-top: 1rem;
+  text-align: left;
+}
+.query-source {
+  padding: .85rem;
+  border: 1px solid #6b91ae;
+  border-radius: .4rem;
+  background: #123d5e;
+}
+.yue .query-source strong { display: block; font-size: .9rem; }
+.query-source > span { color: #c2d8e8; }
+.yue .query-source pre {
+  margin: .65rem 0 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: white;
+  font-size: .85rem;
+  line-height: 1.6;
+}
+.query-data-arrow { padding-top: .4rem; text-align: center; font-size: 24px; }
+.query-step {
+  padding: .65rem .75rem;
+  border: 1px solid #6b91ae;
+  border-radius: .4rem;
+  background: #123d5e;
+  text-align: center;
+  font-size: .9rem;
+}
+.query-step-arrow { text-align: center; line-height: 1.5rem; color: #c2d8e8; }
+.query-noise { background: #e9f5fa; border-color: #e9f5fa; color: #123d5e; font-weight: 700; }
+.query-noise span { display: block; margin-top: .2rem; font-size: .75rem; font-weight: 400; }
+.yue .query-result { max-width: 260px; margin: 0 auto; text-align: center; }
 .query-arrow { text-align: center; color: var(--query-line); font-size: 24px; line-height: 40px; }
 .yue .query-diagram figcaption {
   margin-top: .85rem;
@@ -152,7 +189,9 @@ body {
   color: var(--griot-muted);
 }
 @media (max-width: 520px) {
-  .query-inputs, .query-outputs { grid-template-columns: 1fr; gap: .6rem; }
+  .query-inputs { grid-template-columns: 1fr; gap: .6rem; }
+  .query-execution { grid-template-columns: minmax(0, 1fr) 1.25rem minmax(0, 1.3fr); }
+  .query-source { padding: .65rem; }
   .query-join { width: 1px; height: 40px; background-size: 1px 16px; }
   .query-join::after { top: 12px; }
 }
