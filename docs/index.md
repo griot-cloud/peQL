@@ -2,12 +2,17 @@
 
 # Documentation
 
-peQL is a policy-enforcing query engine built on Apache DataFusion.
-Define your data policies. peQL enforces them whenever your data is queried.
+peQL is a query engine where every table is a data contract. Contracts are written in
+[parcel](https://griot-cloud.github.io/parcel/); peQL stores them, writes data under them, and
+answers SQL through them. Each caller gets exactly what the contract allows, enforced inside
+the query plan.
 
 ## The query path
 
-<figure class="query-diagram" aria-label="A salary query and a noise policy enter peQL. The engine reads payroll data, adds noise to salaries, then calculates and returns the average.">
+A partner asks for the average salary. The contract adds noise to each salary before anything
+is computed, because the caller is not the owner.
+
+<figure class="query-diagram" aria-label="A salary query and a parcel contract enter peQL. The engine reads payroll data through the contract's view, which adds noise to salaries, then computes and returns the average.">
   <div class="query-inputs">
     <div class="query-box">
       <strong>SQL</strong>
@@ -15,19 +20,19 @@ Define your data policies. peQL enforces them whenever your data is queried.
 FROM "hr/payroll";</pre>
     </div>
     <div class="query-box">
-      <strong>Policy</strong>
-      <pre>"dp_columns": {
-  "salary": {
-    "sensitivity": 1000,
-    "epsilon": 1
-  }
-}</pre>
+      <strong>Contract (parcel)</strong>
+      <pre>- op: shape
+  operator: noise
+  column: salary
+  params: {sensitivity: 1000,
+           epsilon: 1, at: row}
+  unless: ctx.tenant == 'hr'</pre>
     </div>
   </div>
   <div class="query-join" aria-hidden="true"></div>
   <div class="query-engine">
     <strong>peQL</strong>
-    <span>Compiles policy into query execution</span>
+    <span>Runs the contract's view inside the plan</span>
     <div class="query-execution">
       <div class="query-source">
         <strong>Source dataset</strong>
@@ -41,7 +46,7 @@ FROM "hr/payroll";</pre>
       <div class="query-steps">
         <div class="query-step">Read salaries</div>
         <div class="query-step-arrow" aria-hidden="true">↓</div>
-        <div class="query-step query-noise">Add DP noise<span>Apply the policy to each salary</span></div>
+        <div class="query-step query-noise">Add noise<span>The contract's projection, for this caller</span></div>
         <div class="query-step-arrow" aria-hidden="true">↓</div>
         <div class="query-step">Compute average</div>
       </div>
@@ -53,7 +58,7 @@ FROM "hr/payroll";</pre>
     <pre>avg_salary
 79,842.67</pre>
   </div>
-  <figcaption>The query asks for an average. The policy adds noise before it is calculated.<br>Illustrative result for a non-owner query; noise varies each run.</figcaption>
+  <figcaption>Illustrative result for a non-owner; noise varies each run, and each run spends privacy budget.</figcaption>
 </figure>
 
 ::::{grid} 1 2 2 2
@@ -63,28 +68,28 @@ FROM "hr/payroll";</pre>
 :link: getting-started
 :link-type: doc
 
-Run your first query with a data contract.
+Write data under a contract and query it as three callers.
 :::
 
-:::{grid-item-card} Use the APIs
+:::{grid-item-card} Use peQL
 :link: USAGE
 :link-type: doc
 
-Add peQL to a Rust or Python application.
+The command line, the Rust API, and Python.
 :::
 
 :::{grid-item-card} How it works
 :link: concepts
 :link-type: doc
 
-See how contracts become enforced query plans.
+Views, the gate, shapes, and the write path.
 :::
 
-:::{grid-item-card} Contribute
-:link: contributing
+:::{grid-item-card} parcel and peQL
+:link: parcel-and-peql
 :link-type: doc
 
-Build the engine, run tests, and make a change.
+What each project does, and the bundle that passes between them.
 :::
 ::::
 
@@ -102,6 +107,9 @@ getting-started
 :hidden:
 
 USAGE
+graphs
+platform
+migrating
 ```
 
 ```{toctree}
@@ -110,8 +118,6 @@ USAGE
 :hidden:
 
 reference
-CONTRACT-FORMAT
-GRAPH-QUERY
 ```
 
 ```{toctree}
@@ -121,6 +127,7 @@ GRAPH-QUERY
 
 concepts
 ARCHITECTURE
+parcel-and-peql
 ```
 
 ```{toctree}

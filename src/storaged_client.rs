@@ -38,7 +38,6 @@
 //! * INV-5 (No bypass from above trust line): this module makes no direct
 //!   filesystem access. All data comes through T04.
 
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use thiserror::Error;
@@ -87,6 +86,9 @@ pub enum StoragedError {
 struct ByteReadRequest<'a> {
     opcode: &'static str,
     asset_id: &'a str,
+    /// An object inside a multi-file asset (a Lance dataset); absent for a single-file asset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
     offset: u64,
     length: u64,
     tenant_id: &'a str,
@@ -110,8 +112,18 @@ struct ByteReadResponseHeader {
 struct AssetStatRequest<'a> {
     opcode: &'static str,
     asset_id: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path: Option<&'a str>,
     tenant_id: &'a str,
     principal_jwt: &'a str,
+}
+
+/// One object in a multi-file asset.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ObjectEntry {
+    /// Path relative to the asset root.
+    pub path: String,
+    pub size: u64,
 }
 
 /// X02 asset_stat response.
@@ -120,8 +132,10 @@ pub struct AssetStatResponse {
     /// Total byte size of the asset.
     pub size: u64,
     /// Content type (e.g., "application/vnd.apache.parquet", "application/x-lance").
+    #[serde(default)]
     pub content_type: String,
     /// Asset format version string.
+    #[serde(default)]
     pub format_version: String,
 }
 
@@ -177,11 +191,26 @@ impl StoragedClient {
         tenant_id: &str,
         principal_jwt: &str,
     ) -> Result<bytes::Bytes, StoragedError> {
+        self.read_object(asset_id, None, offset, length, tenant_id, principal_jwt)
+            .await
+    }
+
+    /// Read a byte range of one object inside an asset (`path`), or of the asset itself.
+    pub async fn read_object(
+        &self,
+        asset_id: &str,
+        path: Option<&str>,
+        offset: u64,
+        length: u64,
+        tenant_id: &str,
+        principal_jwt: &str,
+    ) -> Result<bytes::Bytes, StoragedError> {
         let mut stream = self.connect().await?;
 
         let request = ByteReadRequest {
             opcode: "0x30",
             asset_id,
+            path,
             offset,
             length,
             tenant_id,
@@ -263,11 +292,24 @@ impl StoragedClient {
         tenant_id: &str,
         principal_jwt: &str,
     ) -> Result<AssetStatResponse, StoragedError> {
+        self.stat_object(asset_id, None, tenant_id, principal_jwt)
+            .await
+    }
+
+    /// Stat one object inside an asset (`path`), or the asset itself.
+    pub async fn stat_object(
+        &self,
+        asset_id: &str,
+        path: Option<&str>,
+        tenant_id: &str,
+        principal_jwt: &str,
+    ) -> Result<AssetStatResponse, StoragedError> {
         let mut stream = self.connect().await?;
 
         let request = AssetStatRequest {
             opcode: "0x31",
             asset_id,
+            path,
             tenant_id,
             principal_jwt,
         };
@@ -293,39 +335,80 @@ impl StoragedClient {
         let mut resp_bytes = vec![0u8; resp_len];
         stream.read_exact(&mut resp_bytes).await?;
 
-        // Try parsing as an error first.
-        #[derive(Deserialize)]
-        struct MaybeError {
-            #[serde(default)]
-            error: Option<String>,
-            #[serde(default)]
-            error_code: Option<String>,
-            #[serde(flatten)]
-            stat: Option<AssetStatResponse>,
-        }
-
-        // We parse the response two ways to reuse code. Direct Deserialize works here.
+        // A stat response, or an error envelope `{error, error_code}`.
         let stat: AssetStatResponse = serde_json::from_slice(&resp_bytes).map_err(|e| {
             // Try to parse as error envelope.
-            if let Ok(maybe) = serde_json::from_slice::<serde_json::Value>(&resp_bytes) {
-                if let Some(err_msg) = maybe.get("error").and_then(|v| v.as_str()) {
-                    let code = maybe
-                        .get("error_code")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("UNKNOWN");
-                    if code == "ACCESS_DENIED" {
-                        return StoragedError::AccessDenied {
-                            asset_id: asset_id.to_string(),
-                            reason: err_msg.to_string(),
-                        };
-                    }
-                    return StoragedError::Protocol(format!("T04 stat error [{code}]: {err_msg}"));
+            if let Ok(maybe) = serde_json::from_slice::<serde_json::Value>(&resp_bytes)
+                && let Some(err_msg) = maybe.get("error").and_then(|v| v.as_str())
+            {
+                let code = maybe
+                    .get("error_code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("UNKNOWN");
+                if code == "ACCESS_DENIED" {
+                    return StoragedError::AccessDenied {
+                        asset_id: asset_id.to_string(),
+                        reason: err_msg.to_string(),
+                    };
                 }
+                return StoragedError::Protocol(format!("T04 stat error [{code}]: {err_msg}"));
             }
             StoragedError::Protocol(format!("stat response deserialization: {e}"))
         })?;
 
         Ok(stat)
+    }
+
+    /// List the objects of a multi-file asset under `prefix` (opcode `0x32`).
+    pub async fn list_objects(
+        &self,
+        asset_id: &str,
+        prefix: &str,
+        tenant_id: &str,
+        principal_jwt: &str,
+    ) -> Result<Vec<ObjectEntry>, StoragedError> {
+        let mut stream = self.connect().await?;
+        let request = serde_json::json!({
+            "opcode": "0x32",
+            "asset_id": asset_id,
+            "prefix": prefix,
+            "tenant_id": tenant_id,
+            "principal_jwt": principal_jwt,
+        });
+        let body = serde_json::to_vec(&request)
+            .map_err(|e| StoragedError::Protocol(format!("request serialization: {e}")))?;
+        stream.write_all(&(body.len() as u32).to_be_bytes()).await?;
+        stream.write_all(&body).await?;
+        stream.flush().await?;
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).await?;
+        let len = u32::from_be_bytes(len) as usize;
+        if len == 0 || len > 16 * 1024 * 1024 {
+            return Err(StoragedError::Protocol(format!(
+                "invalid list response length: {len}"
+            )));
+        }
+        let mut resp = vec![0u8; len];
+        stream.read_exact(&mut resp).await?;
+        let v: serde_json::Value = serde_json::from_slice(&resp)
+            .map_err(|e| StoragedError::Protocol(format!("list response: {e}")))?;
+        if let Some(msg) = v.get("error").and_then(|e| e.as_str()) {
+            let code = v
+                .get("error_code")
+                .and_then(|c| c.as_str())
+                .unwrap_or("UNKNOWN");
+            if code == "ACCESS_DENIED" {
+                return Err(StoragedError::AccessDenied {
+                    asset_id: asset_id.to_string(),
+                    reason: msg.to_string(),
+                });
+            }
+            return Err(StoragedError::Protocol(format!(
+                "T04 list error [{code}]: {msg}"
+            )));
+        }
+        serde_json::from_value(v.get("objects").cloned().unwrap_or_default())
+            .map_err(|e| StoragedError::Protocol(format!("list response: {e}")))
     }
 
     /// Open a Unix domain socket connection to T04.

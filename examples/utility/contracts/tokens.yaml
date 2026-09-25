@@ -1,0 +1,41 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/griot-cloud/parcel/main/schema/contract.schema.json
+# Prepaid token sales. The utility (tenant `kplc`) wrote its own meter logic in Rust,
+# compiled to WebAssembly (examples/udf-meter-serial), and calls it from this contract.
+contract: kplc/tokens
+version: 1
+owner: kplc
+
+binding:
+  parquet: data/tokens/
+
+expose:
+  - {name: token_id, type: int64}
+  - {name: meter, type: utf8}
+  - {name: amount_cents, type: int64}
+
+extensions:
+  row: {units: int64, county: utf8}
+
+enrich:
+  - {field: units, expr: "units(row.amount_cents, row.tariff_cents)"}
+  - {field: county, expr: "county(row.meter)"}
+
+rules:
+  - id: valid_meter
+    op: assert
+    expr: is_meter_serial(row.meter)
+    on_fail: drop
+
+  - id: bought_units
+    op: assert
+    expr: row.other.units > 0
+    on_fail: report
+
+  - id: own_county
+    op: admit
+    expr: row.other.county == ctx.tier || 'admin' in ctx.roles
+
+  - id: county_only
+    op: transform
+    column: meter
+    expr: "'admin' in ctx.roles ? row.meter : row.other.county"

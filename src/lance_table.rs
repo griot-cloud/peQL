@@ -1,460 +1,478 @@
-//! Lance dataset TableProvider — opens Lance files via the T04 storaged socket.
+//! Lance datasets as contract data (feature `lance`).
 //!
-//! This module provides `LanceTableProvider`, a DataFusion `TableProvider` that
-//! wraps a Lance dataset opened against a custom `ObjectStore` backend that
-//! routes all byte reads through the T04 storaged socket.
-//!
-//! # Why this approach
-//!
-//! Lance's `Dataset::open` accepts an `object_store::ObjectStore` implementation
-//! for all underlying I/O. By providing `StoragedObjectStore` (a custom `ObjectStore`
-//! that proxies reads through `StoragedClient`), we ensure:
-//!
-//! 1. No direct filesystem access from the engine pod.
-//! 2. T04 enforces contract constraints on every byte read (INV-2).
-//! 3. The lance dataset is opened against a URL in the `griotfs://` scheme,
-//!    routing through the custom store registration.
-//!
-//! # Limitations
-//!
-//! * Write path: not implemented. Lance write operations go through T04's write
-//!   opcodes, handled by the Type B transform worker, not the Type D query worker.
-//! * Metadata: the initial `stat` call uses `StoragedClient::stat_asset` to
-//!   determine the asset size before lance opens the dataset.
-//!
-//! # Semantic Law
-//!
-//! * INV-5: No direct filesystem or object-storage access.
-//! * INV-2: T04 enforces contract constraints per byte range.
+//! [`LanceTableProvider`] reads a Lance dataset from any URI Lance understands (a local
+//! directory, S3, ...) or, on the Griot platform, through the T04 storaged socket, where every
+//! object read carries its path and is checked by T04. Scans stream batch by batch; projections,
+//! limits and the filters Lance can evaluate are handed to Lance, and DataFusion re-checks the
+//! filters. Lance builds on an older Arrow than peQL, so batches cross by Arrow IPC.
 
-use crate::storaged_client::StoragedClient;
-use arrow::datatypes::SchemaRef;
-use async_trait::async_trait;
-use datafusion::catalog::Session;
-use datafusion::datasource::TableProvider;
-use datafusion::error::DataFusionError;
-use datafusion::execution::context::SessionState;
-use datafusion::physical_plan::ExecutionPlan;
-use datafusion::{datasource::TableType, logical_expr::Expr};
-use std::any::Any;
 use std::fmt;
 use std::ops::Range;
 use std::sync::Arc;
-use thiserror::Error;
-use tracing::debug;
 
-// ─── Errors ───────────────────────────────────────────────────────────────────
+use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::catalog::Session;
+use datafusion::catalog::TableProvider;
+use datafusion::datasource::TableType;
+use datafusion::error::{DataFusionError, Result as DFResult};
+use datafusion::execution::{SendableRecordBatchStream, TaskContext};
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::physical_plan::streaming::{PartitionStream, StreamingTableExec};
+use futures::{StreamExt, TryStreamExt};
+use lance::Dataset;
+use lance::deps::arrow_array::RecordBatch as LanceBatch;
+use object_store::path::Path as ObjectPath;
 
-/// Errors specific to Lance table registration.
-#[derive(Debug, Error)]
+use crate::storaged_client::StoragedClient;
+
+#[derive(Debug, thiserror::Error)]
 pub enum LanceTableError {
-    /// Storaged client error.
-    #[error("storaged error: {0}")]
+    #[error("storaged: {0}")]
     Storaged(#[from] crate::storaged_client::StoragedError),
-
-    /// Lance dataset open error.
-    #[error("lance dataset open error: {0}")]
-    LanceOpen(String),
-
-    /// The asset is not a Lance dataset (wrong content type).
-    #[error("asset '{asset_id}' is not a Lance dataset (content_type='{content_type}')")]
-    NotLance {
-        asset_id: String,
-        content_type: String,
-    },
+    #[error("lance: {0}")]
+    Lance(String),
+    #[error("arrow bridge: {0}")]
+    Bridge(String),
 }
 
-// ─── StoragedObjectStore ─────────────────────────────────────────────────────
+// ── Arrow bridge: Lance's Arrow and peQL's, by IPC ─────────────────────────────
 
-/// A custom `object_store::ObjectStore` backend that routes all byte reads
-/// through the T04 storaged socket.
-///
-/// Only `get_range` (positional byte read) is fully implemented. All write
-/// operations return `NotSupported` — writes go through Type B, not Type D.
-#[derive(Debug)]
-pub struct StoragedObjectStore {
-    client: StoragedClient,
-    asset_id: String,
-    tenant_id: String,
-    principal_jwt: String,
-    /// Total asset size, obtained via `stat_asset` at construction.
-    size: u64,
+fn to_peql(batch: &LanceBatch) -> Result<RecordBatch, LanceTableError> {
+    let mut buf = Vec::new();
+    {
+        let mut w = arrow_ipc_lance::writer::StreamWriter::try_new(&mut buf, &batch.schema())
+            .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
+        w.write(batch)
+            .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
+        w.finish()
+            .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
+    }
+    let mut r =
+        datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buf), None)
+            .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
+    r.next()
+        .ok_or_else(|| LanceTableError::Bridge("empty IPC stream".into()))?
+        .map_err(|e| LanceTableError::Bridge(e.to_string()))
 }
 
-impl StoragedObjectStore {
-    async fn new(
-        asset_id: &str,
-        tenant_id: &str,
-        principal_jwt: &str,
-        storaged_path: &str,
-    ) -> Result<Self, LanceTableError> {
-        let client = StoragedClient::new(storaged_path);
-        let stat = client
-            .stat_asset(asset_id, tenant_id, principal_jwt)
-            .await?;
-
-        Ok(Self {
-            client,
-            asset_id: asset_id.to_string(),
-            tenant_id: tenant_id.to_string(),
-            principal_jwt: principal_jwt.to_string(),
-            size: stat.size,
-        })
+fn schema_to_peql(
+    schema: &lance::deps::arrow_schema::Schema,
+) -> Result<SchemaRef, LanceTableError> {
+    let mut buf = Vec::new();
+    {
+        let mut w = arrow_ipc_lance::writer::StreamWriter::try_new(&mut buf, schema)
+            .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
+        w.finish()
+            .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
     }
+    let r = datafusion::arrow::ipc::reader::StreamReader::try_new(std::io::Cursor::new(buf), None)
+        .map_err(|e| LanceTableError::Bridge(e.to_string()))?;
+    Ok(r.schema())
 }
 
-impl fmt::Display for StoragedObjectStore {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "StoragedObjectStore(asset={})", self.asset_id)
-    }
-}
+// ── The table ───────────────────────────────────────────────────────────────────
 
-// Implement the object_store::ObjectStore trait for StoragedObjectStore.
-// Only `get_range` (positional byte read) and `head` (metadata) are needed
-// by lance for read-only queries.
-#[async_trait]
-impl object_store::ObjectStore for StoragedObjectStore {
-    async fn put(
-        &self,
-        _location: &object_store::path::Path,
-        _payload: object_store::PutPayload,
-    ) -> object_store::Result<object_store::PutResult> {
-        Err(object_store::Error::NotSupported {
-            source: "StoragedObjectStore is read-only".into(),
-        })
-    }
-
-    async fn put_multipart(
-        &self,
-        _location: &object_store::path::Path,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        Err(object_store::Error::NotSupported {
-            source: "StoragedObjectStore is read-only".into(),
-        })
-    }
-
-    async fn get(
-        &self,
-        location: &object_store::path::Path,
-    ) -> object_store::Result<object_store::GetResult> {
-        // Return all bytes as a stream.
-        let bytes = self
-            .client
-            .read_bytes(
-                &self.asset_id,
-                0,
-                self.size,
-                &self.tenant_id,
-                &self.principal_jwt,
-            )
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "StoragedObjectStore",
-                source: Box::new(e),
-            })?;
-
-        let meta = object_store::ObjectMeta {
-            location: location.clone(),
-            last_modified: chrono::Utc::now(),
-            size: bytes.len(),
-            e_tag: None,
-            version: None,
-        };
-
-        Ok(object_store::GetResult {
-            payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::once(
-                async move { Ok(bytes) },
-            ))),
-            meta,
-            range: 0..self.size as usize,
-            attributes: Default::default(),
-        })
-    }
-
-    async fn get_opts(
-        &self,
-        location: &object_store::path::Path,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        // Honour range if present.
-        let (offset, length) = if let Some(range) = options.range {
-            match range {
-                object_store::GetRange::Bounded(r) => (r.start as u64, (r.end - r.start) as u64),
-                object_store::GetRange::Offset(o) => (o as u64, self.size.saturating_sub(o as u64)),
-                object_store::GetRange::Suffix(s) => {
-                    let off = self.size.saturating_sub(s as u64);
-                    (off, s as u64)
-                }
-            }
-        } else {
-            (0, self.size)
-        };
-
-        let bytes = self
-            .client
-            .read_bytes(
-                &self.asset_id,
-                offset,
-                length,
-                &self.tenant_id,
-                &self.principal_jwt,
-            )
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "StoragedObjectStore",
-                source: Box::new(e),
-            })?;
-
-        let meta = object_store::ObjectMeta {
-            location: location.clone(),
-            last_modified: chrono::Utc::now(),
-            size: self.size as usize,
-            e_tag: None,
-            version: None,
-        };
-
-        Ok(object_store::GetResult {
-            payload: object_store::GetResultPayload::Stream(Box::pin(futures::stream::once(
-                async move { Ok(bytes) },
-            ))),
-            meta,
-            range: offset as usize..(offset + length) as usize,
-            attributes: Default::default(),
-        })
-    }
-
-    async fn get_range(
-        &self,
-        location: &object_store::path::Path,
-        range: Range<usize>,
-    ) -> object_store::Result<bytes::Bytes> {
-        let offset = range.start as u64;
-        let length = (range.end - range.start) as u64;
-
-        debug!(
-            asset_id = %self.asset_id,
-            offset,
-            length,
-            "StoragedObjectStore::get_range"
-        );
-
-        self.client
-            .read_bytes(
-                &self.asset_id,
-                offset,
-                length,
-                &self.tenant_id,
-                &self.principal_jwt,
-            )
-            .await
-            .map_err(|e| object_store::Error::Generic {
-                store: "StoragedObjectStore",
-                source: Box::new(e),
-            })
-    }
-
-    async fn head(
-        &self,
-        location: &object_store::path::Path,
-    ) -> object_store::Result<object_store::ObjectMeta> {
-        Ok(object_store::ObjectMeta {
-            location: location.clone(),
-            last_modified: chrono::Utc::now(),
-            size: self.size as usize,
-            e_tag: None,
-            version: None,
-        })
-    }
-
-    async fn delete(&self, _location: &object_store::path::Path) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "StoragedObjectStore is read-only".into(),
-        })
-    }
-
-    fn list(
-        &self,
-        _prefix: Option<&object_store::path::Path>,
-    ) -> futures::stream::BoxStream<'_, object_store::Result<object_store::ObjectMeta>> {
-        Box::pin(futures::stream::empty())
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        _prefix: Option<&object_store::path::Path>,
-    ) -> object_store::Result<object_store::ListResult> {
-        Ok(object_store::ListResult {
-            common_prefixes: vec![],
-            objects: vec![],
-        })
-    }
-
-    async fn copy(
-        &self,
-        _from: &object_store::path::Path,
-        _to: &object_store::path::Path,
-    ) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "StoragedObjectStore is read-only".into(),
-        })
-    }
-
-    async fn rename(
-        &self,
-        _from: &object_store::path::Path,
-        _to: &object_store::path::Path,
-    ) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "StoragedObjectStore is read-only".into(),
-        })
-    }
-
-    async fn copy_if_not_exists(
-        &self,
-        _from: &object_store::path::Path,
-        _to: &object_store::path::Path,
-    ) -> object_store::Result<()> {
-        Err(object_store::Error::NotSupported {
-            source: "StoragedObjectStore is read-only".into(),
-        })
-    }
-}
-
-// ─── LanceTableProvider ───────────────────────────────────────────────────────
-
-/// A DataFusion `TableProvider` backed by a Lance dataset opened via the T04
-/// storaged byte-read socket.
-///
-/// Construction: `LanceTableProvider::open(...)`.
-/// Usage: pass to `SessionContext::register_table`.
 pub struct LanceTableProvider {
-    dataset: Arc<lance::Dataset>,
+    dataset: Arc<Dataset>,
     schema: SchemaRef,
 }
 
+impl fmt::Debug for LanceTableProvider {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "LanceTableProvider({})", self.dataset.uri())
+    }
+}
+
 impl LanceTableProvider {
-    /// Open a Lance dataset from griotfs via the T04 storaged socket.
-    ///
-    /// # Arguments
-    ///
-    /// * `asset_id` — griotfs asset UUID for the Lance dataset.
-    /// * `tenant_id` — tenant context.
-    /// * `principal_jwt` — scoped JWT for the requesting principal.
-    /// * `storaged_path` — path to the T04 storaged socket.
+    /// A dataset at any URI Lance reads: `/data/users.lance`, `s3://bucket/users.lance`, ...
+    pub async fn open_uri(uri: &str) -> Result<Self, LanceTableError> {
+        let dataset = Dataset::open(uri)
+            .await
+            .map_err(|e| LanceTableError::Lance(e.to_string()))?;
+        Self::from_dataset(dataset)
+    }
+
+    /// A dataset served by T04: every object is read through the storaged socket, with its path.
     pub async fn open(
         asset_id: &str,
         tenant_id: &str,
         principal_jwt: &str,
-        storaged_path: &str,
+        storaged_socket: &str,
     ) -> Result<Self, LanceTableError> {
-        // Construct the storaged-backed object store.
-        let store = Arc::new(
-            StoragedObjectStore::new(asset_id, tenant_id, principal_jwt, storaged_path).await?,
-        );
-
-        // Build the griotfs:// URL for this asset.
-        let url = format!("griotfs://{asset_id}");
-
-        // Open the Lance dataset using the custom object store.
-        // We register the store with the lance runtime registry.
-        let store_url = url::Url::parse(&url)
-            .map_err(|e| LanceTableError::LanceOpen(format!("URL parse error for '{url}': {e}")))?;
-
-        let params = lance::dataset::ReadParams {
-            store_options: Some(object_store::ClientOptions::default()),
-            ..Default::default()
-        };
-
-        // Register the custom store with lance's object store registry.
+        let provider = Arc::new(StoragedProvider {
+            client: StoragedClient::new(storaged_socket),
+            tenant_id: tenant_id.to_owned(),
+            principal_jwt: principal_jwt.to_owned(),
+        });
         let registry = lance_io::object_store::ObjectStoreRegistry::default();
-        registry.put(&store_url, store.clone());
+        registry.insert(STORAGED_SCHEME, provider);
+        let session = Arc::new(lance::session::Session::new(
+            0,
+            64 * 1024 * 1024,
+            Arc::new(registry),
+        ));
+        let dataset = lance::dataset::builder::DatasetBuilder::from_uri(format!(
+            "{STORAGED_SCHEME}://{asset_id}/"
+        ))
+        .with_session(session)
+        .load()
+        .await
+        .map_err(|e| LanceTableError::Lance(e.to_string()))?;
+        Self::from_dataset(dataset)
+    }
 
-        let dataset = lance::Dataset::open_with_params(&url, &params)
-            .await
-            .map_err(|e| LanceTableError::LanceOpen(format!("lance::Dataset::open: {e}")))?;
-
-        let arrow_schema: SchemaRef = Arc::new(
-            dataset
-                .schema()
-                .to_arrow()
-                .map_err(|e| LanceTableError::LanceOpen(format!("lance schema to arrow: {e}")))?,
-        );
-
-        debug!(asset_id, schema = ?arrow_schema, "Lance dataset opened via storaged socket");
-
-        Ok(Self {
+    fn from_dataset(dataset: Dataset) -> Result<Self, LanceTableError> {
+        let arrow: lance::deps::arrow_schema::Schema = dataset.schema().into();
+        Ok(LanceTableProvider {
+            schema: schema_to_peql(&arrow)?,
             dataset: Arc::new(dataset),
-            schema: arrow_schema,
         })
     }
 }
 
 #[async_trait]
 impl TableProvider for LanceTableProvider {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         self.schema.clone()
     }
-
     fn table_type(&self) -> TableType {
         TableType::Base
     }
-
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DFResult<Vec<TableProviderFilterPushDown>> {
+        // Lance prunes with what it can evaluate; DataFusion re-checks every filter.
+        Ok(filters
+            .iter()
+            .map(|f| {
+                if filter_sql(f).is_some() {
+                    TableProviderFilterPushDown::Inexact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
+                }
+            })
+            .collect())
+    }
     async fn scan(
         &self,
         _state: &dyn Session,
         projection: Option<&Vec<usize>>,
         filters: &[Expr],
         limit: Option<usize>,
-    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        // Build a lance scanner.
-        let mut scanner = self.dataset.scan();
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let schema = match projection {
+            Some(p) => Arc::new(self.schema.project(p)?),
+            None => self.schema.clone(),
+        };
+        let columns: Vec<String> = schema.fields().iter().map(|f| f.name().clone()).collect();
+        let filter = filters
+            .iter()
+            .filter_map(filter_sql)
+            .map(|f| format!("({f})"))
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let partition = Arc::new(LanceScan {
+            dataset: self.dataset.clone(),
+            schema: schema.clone(),
+            columns,
+            filter: (!filter.is_empty()).then_some(filter),
+            limit,
+        });
+        Ok(Arc::new(StreamingTableExec::try_new(
+            schema,
+            vec![partition],
+            None,
+            vec![],
+            false,
+            limit,
+        )?))
+    }
+}
 
-        // Apply projection.
-        if let Some(proj) = projection {
-            let schema = self.schema.clone();
-            let cols: Vec<&str> = proj
-                .iter()
-                .filter_map(|&i| schema.field(i).name().parse::<&str>().ok())
-                .collect();
-            // Project by name list (lance API).
-            let col_names: Vec<&str> = proj
-                .iter()
-                .map(|&i| self.schema.field(i).name().as_str())
-                .collect();
-            scanner = scanner
-                .project(&col_names)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        }
+/// A filter as SQL Lance can evaluate, when it cannot fail and so means the same in both engines.
+fn filter_sql(e: &Expr) -> Option<String> {
+    if !crate::gate::cannot_fail(e) {
+        return None;
+    }
+    datafusion::sql::unparser::expr_to_sql(e)
+        .ok()
+        .map(|s| s.to_string())
+}
 
-        // Apply limit.
-        if let Some(n) = limit {
-            scanner = scanner
-                .limit(n as i64, None)
-                .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        }
+#[derive(Debug)]
+struct LanceScan {
+    dataset: Arc<Dataset>,
+    schema: SchemaRef,
+    columns: Vec<String>,
+    filter: Option<String>,
+    limit: Option<usize>,
+}
 
-        // Push down simple filters if possible (best-effort; full predicate pushdown
-        // is a future wave).
-        // For now, no filter pushdown — filters are applied by DataFusion post-scan.
+impl PartitionStream for LanceScan {
+    fn schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+    fn execute(&self, _ctx: Arc<TaskContext>) -> SendableRecordBatchStream {
+        let dataset = self.dataset.clone();
+        let columns = self.columns.clone();
+        let filter = self.filter.clone();
+        let limit = self.limit;
+        let lance_err = |e: lance::Error| DataFusionError::External(Box::new(e));
+        let opened = futures::stream::once(async move {
+            let mut scanner = dataset.scan();
+            scanner.project(&columns).map_err(lance_err)?;
+            if let Some(f) = &filter {
+                scanner.filter(f).map_err(lance_err)?;
+            }
+            if let Some(n) = limit {
+                scanner.limit(Some(n as i64), None).map_err(lance_err)?;
+            }
+            let stream = scanner.try_into_stream().await.map_err(lance_err)?;
+            Ok::<_, DataFusionError>(stream.map(move |b| {
+                let b = b.map_err(lance_err)?;
+                to_peql(&b).map_err(|e| DataFusionError::External(Box::new(e)))
+            }))
+        })
+        .try_flatten();
+        Box::pin(RecordBatchStreamAdapter::new(self.schema.clone(), opened))
+    }
+}
 
-        // Collect into Arrow RecordBatches and wrap in MemTable for simplicity.
-        // Production optimization: implement a proper streaming ExecutionPlan.
-        let batches: Vec<datafusion::arrow::record_batch::RecordBatch> = scanner
-            .try_into_stream()
+// ── storaged as an object store ────────────────────────────────────────────────
+
+const STORAGED_SCHEME: &str = "storaged";
+
+#[derive(Debug)]
+struct StoragedProvider {
+    client: StoragedClient,
+    tenant_id: String,
+    principal_jwt: String,
+}
+
+#[async_trait]
+impl lance_io::object_store::providers::ObjectStoreProvider for StoragedProvider {
+    async fn new_store(
+        &self,
+        base: url::Url,
+        params: &lance_io::object_store::ObjectStoreParams,
+    ) -> lance::Result<lance_io::object_store::ObjectStore> {
+        let asset_id = base.host_str().unwrap_or_default().to_owned();
+        let store = Arc::new(StoragedObjectStore {
+            client: self.client.clone(),
+            asset_id,
+            tenant_id: self.tenant_id.clone(),
+            principal_jwt: self.principal_jwt.clone(),
+        });
+        Ok(lance_io::object_store::ObjectStore::new(
+            store,
+            base,
+            params.block_size,
+            None,
+            false,
+            true,
+            8,
+            3,
+            None,
+        ))
+    }
+
+    fn extract_path(&self, url: &url::Url) -> lance::Result<ObjectPath> {
+        Ok(ObjectPath::from(url.path().trim_start_matches('/')))
+    }
+}
+
+/// Read-only access to the objects of one T04 asset, each by its path.
+#[derive(Debug)]
+struct StoragedObjectStore {
+    client: StoragedClient,
+    asset_id: String,
+    tenant_id: String,
+    principal_jwt: String,
+}
+
+impl fmt::Display for StoragedObjectStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "storaged://{}", self.asset_id)
+    }
+}
+
+fn os_err(e: impl std::error::Error + Send + Sync + 'static) -> object_store::Error {
+    object_store::Error::Generic {
+        store: "storaged",
+        source: Box::new(e),
+    }
+}
+
+fn read_only() -> object_store::Error {
+    object_store::Error::NotSupported {
+        source: "storaged assets are read-only".into(),
+    }
+}
+
+impl StoragedObjectStore {
+    async fn meta(&self, location: &ObjectPath) -> object_store::Result<object_store::ObjectMeta> {
+        let stat = self
+            .client
+            .stat_object(
+                &self.asset_id,
+                Some(location.as_ref()),
+                &self.tenant_id,
+                &self.principal_jwt,
+            )
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?
-            .collect::<Result<Vec<_>, _>>()
+            .map_err(os_err)?;
+        Ok(object_store::ObjectMeta {
+            location: location.clone(),
+            last_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            size: stat.size,
+            e_tag: None,
+            version: None,
+        })
+    }
+
+    async fn read(
+        &self,
+        location: &ObjectPath,
+        range: Range<u64>,
+    ) -> object_store::Result<bytes::Bytes> {
+        self.client
+            .read_object(
+                &self.asset_id,
+                Some(location.as_ref()),
+                range.start,
+                range.end - range.start,
+                &self.tenant_id,
+                &self.principal_jwt,
+            )
             .await
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
+            .map_err(os_err)
+    }
+}
 
-        let mem_table =
-            datafusion::datasource::MemTable::try_new(self.schema.clone(), vec![batches])?;
-        let plan = mem_table.scan(_state, projection, filters, limit).await?;
+#[async_trait]
+impl object_store::ObjectStore for StoragedObjectStore {
+    async fn put_opts(
+        &self,
+        _location: &ObjectPath,
+        _payload: object_store::PutPayload,
+        _opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        Err(read_only())
+    }
 
-        Ok(plan)
+    async fn put_multipart_opts(
+        &self,
+        _location: &ObjectPath,
+        _opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        Err(read_only())
+    }
+
+    async fn get_opts(
+        &self,
+        location: &ObjectPath,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        let meta = self.meta(location).await?;
+        let range = match options.range {
+            Some(object_store::GetRange::Bounded(r)) => r.start..r.end.min(meta.size),
+            Some(object_store::GetRange::Offset(o)) => o..meta.size,
+            Some(object_store::GetRange::Suffix(n)) => meta.size.saturating_sub(n)..meta.size,
+            None => 0..meta.size,
+        };
+        let bytes = if options.head {
+            bytes::Bytes::new()
+        } else {
+            self.read(location, range.clone()).await?
+        };
+        Ok(object_store::GetResult {
+            payload: object_store::GetResultPayload::Stream(
+                futures::stream::once(async move { Ok(bytes) }).boxed(),
+            ),
+            meta,
+            range,
+            attributes: Default::default(),
+            extensions: Default::default(),
+        })
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<'static, object_store::Result<ObjectPath>>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectPath>> {
+        locations.map(|_| Err(read_only())).boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        let client = self.client.clone();
+        let (asset, tenant, jwt) = (
+            self.asset_id.clone(),
+            self.tenant_id.clone(),
+            self.principal_jwt.clone(),
+        );
+        let prefix = prefix.map(|p| p.to_string()).unwrap_or_default();
+        futures::stream::once(async move {
+            let objects = client
+                .list_objects(&asset, &prefix, &tenant, &jwt)
+                .await
+                .map_err(os_err)?;
+            Ok::<_, object_store::Error>(futures::stream::iter(objects.into_iter().map(|o| {
+                Ok(object_store::ObjectMeta {
+                    location: ObjectPath::from(o.path),
+                    last_modified: chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+                    size: o.size,
+                    e_tag: None,
+                    version: None,
+                })
+            })))
+        })
+        .try_flatten()
+        .boxed()
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&ObjectPath>,
+    ) -> object_store::Result<object_store::ListResult> {
+        let all: Vec<object_store::ObjectMeta> = self.list(prefix).try_collect().await?;
+        let base = prefix.map(|p| format!("{p}/")).unwrap_or_default();
+        let mut objects = Vec::new();
+        let mut common_prefixes = std::collections::BTreeSet::new();
+        for m in all {
+            let rest = m
+                .location
+                .as_ref()
+                .strip_prefix(base.as_str())
+                .unwrap_or(m.location.as_ref())
+                .to_owned();
+            match rest.split_once('/') {
+                Some((dir, _)) => {
+                    common_prefixes.insert(ObjectPath::from(format!("{base}{dir}")));
+                }
+                None => objects.push(m),
+            }
+        }
+        Ok(object_store::ListResult {
+            common_prefixes: common_prefixes.into_iter().collect(),
+            objects,
+            extensions: Default::default(),
+        })
+    }
+
+    async fn copy_opts(
+        &self,
+        _from: &ObjectPath,
+        _to: &ObjectPath,
+        _options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(read_only())
     }
 }

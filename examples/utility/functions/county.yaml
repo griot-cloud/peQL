@@ -1,0 +1,5 @@
+name: county
+version: 1
+signatures: ["(string) -> string"]
+deterministic: true
+cost: cheap

@@ -1,117 +1,85 @@
-# Query from Rust and Python
+# Use peQL
 
-Use `peql::engine::Engine` for contract-resolving Rust queries. The Python
-binding wraps this API. `K04DEngine` is a separate lower-level Rust API;
-{doc}`reference` describes its behavior.
+peQL has three interfaces over the same engine: the `peql` command, the Rust crate, and a
+Python package. Contracts are parcel documents in all three.
 
-## Rust: load contracts from a directory
+## The command line
 
-Add the crate to your Cargo manifest:
+```text
+peql [--root DIR] <command>
+  register  CONTRACT [--schema SAMPLE]     a parcel bundle, or a YAML/JSON contract and a sample
+  write     CONTRACT --input FILE [--append]
+  validate  NAME
+  query     SQL --caller FILE [--format table|json|arrow|parquet] [--out FILE] [--envelope]
+  describe  NAME --caller FILE
+  list
+  publish   NAME --to TENANT|public [--revoke]
+  budget    NAME --limit EPSILON
+  function  register MODULE --manifest FILE --owner TENANT | list
+```
+
+A workspace is a directory: contracts, functions, budgets and the audit log live under
+`<root>/_peql/`, and relative bindings resolve under the root. Callers can be given as a YAML
+file or with `--tenant`, `--purpose`, `--role`, `--clearance`, `--classification` and `--now`.
+CSV inputs take `--type column=type` to override inferred types.
+
+## Rust
 
 ```toml
 [dependencies]
-peql = { git = "https://github.com/griot-cloud/peQL" }
+peql = { git = "https://github.com/griot-cloud/peql" }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 ```
 
-Then create an engine and supply caller context for each query:
-
 ```rust
-use peql::contract_source::Caller;
-use peql::engine::Engine;
+use peql::{Caller, Engine, WriteMode};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let engine = Engine::from_json_contracts_dir("./contracts")?;
-    let caller = Caller::new("user:bob", "analytics", "globex");
-    let batches = engine
-        .query(r#"SELECT email FROM "sales/orders/v1""#, caller)
+    let engine = Engine::open("./workspace")?;
+    engine.register_contract(&std::fs::read_to_string("orders.yaml")?, &schema)?;
+    engine.write("sales/orders", batches, WriteMode::Overwrite).await?;
+    engine.publish("sales/orders", "globex")?;
+
+    let caller = Caller::new("user:bob", "globex", "analytics");
+    let result = engine
+        .query(r#"SELECT region, COUNT(*) FROM "sales/orders" GROUP BY region"#, &caller)
         .await?;
-    println!("{batches:?}");
+    println!("{} rows; contracts {:?}", result.envelope.rows, result.envelope.contracts);
     Ok(())
 }
 ```
 
-`from_json_contracts_dir` loads the directory's `*.json` files at engine
-construction. `from_json_contracts` accepts JSON strings instead. A quoted
-dataset name is necessary when its name contains `/`.
+`Engine::open` persists everything under the root; `Engine::in_memory(base)` keeps contracts,
+budgets and the audit log in memory. Useful builders: `with_cache` (a result cache that never
+crosses callers, see {doc}`concepts`), `with_budgets`, `with_audit`, `with_store`,
+`with_bindings`. To serve a contract from data you already hold, call `bind_table` or
+`bind_batches` instead of `write`.
 
-## Rust: include scan statistics
-
-```rust
-let outcome = engine.query_with_stats(sql, caller).await?;
-let batches = outcome.batches;
-let bytes = outcome.stats.bytes_scanned;
-let rows = outcome.stats.rows_scanned;
-```
-
-The counters measure raw Arrow batches before row filtering, masking, and
-query `LIMIT`. `bytes_scanned` is Arrow in-memory batch size, not physical
-bytes read from Parquet or storage. A query that scans no table reports zero.
+Refusals are errors you can tell apart: `PeqlError::is_refusal()` is true for denials,
+unservable data, failed guarantees, spent budgets, refused statements, and contracts the caller
+cannot see.
 
 ## Python
 
-Build the binding locally from `bindings/python` with maturin, or install a
-wheel built by this repository's wheel workflow:
-
 ```bash
-cd bindings/python
-python -m pip install maturin
-maturin develop --release
+pip install maturin && cd bindings/python && maturin develop --release
 ```
 
 ```python
-import peql
+import peql, pyarrow as pa
 
-engine = peql.Engine.from_json_contracts_dir("./contracts")
+engine = peql.Engine.open("./workspace")
+engine.register(open("orders.yaml").read(), schema=orders.schema)
+engine.write("sales/orders", orders)
+engine.publish("sales/orders", "globex")
+
 table = engine.query(
-    'SELECT email FROM "sales/orders/v1"',
+    'SELECT region, COUNT(*) AS n FROM "sales/orders" GROUP BY region',
     peql.Caller("user:bob", "analytics", "globex"),
 )
-print(table)  # pyarrow.Table
+table, envelope = engine.query_with_envelope(sql, caller)
 ```
 
-The Python wrapper returns a `pyarrow.Table`. It currently exposes `query`,
-not Rust's `query_with_stats`.
-
-## Graphs
-
-Use a contract with `binding.graph_snapshot` pointing to a local snapshot
-directory, then call the SQL table functions:
-
-```sql
-SELECT name, kind
-FROM graph_neighbors(
-  'process-graphs/zijani-operations/v1',
-  'Collection quarantined; jericans to segregated disposal'
-)
-```
-
-Run `cargo run --example graph_query` for a working dataset and contract.
-{doc}`GRAPH-QUERY` lists each function's positional arguments and explains
-node and edge visibility.
-
-## Platform contract source
-
-Enable the `platform` Cargo feature to fetch T03 bundles over HTTP:
-
-```toml
-peql = { git = "https://github.com/griot-cloud/peQL", features = ["platform"] }
-```
-
-```rust
-use std::sync::Arc;
-use peql::engine::Engine;
-use peql::platform::PlatformBundleSource;
-
-let source = PlatformBundleSource::new("https://t03.internal")
-    .with_verifying_key(t03_public_key)
-    .with_auth("Authorization", "Bearer …");
-let engine = Engine::new(Arc::new(source), binding);
-```
-
-The embedding application supplies `binding: Arc<dyn BindingResolver>` for
-the physical data. `with_verifying_key` enables ECDSA P-256 verification;
-without a key, the source does not verify bundle signatures. The adapter
-derives a `ResolvedPolicy` from the bundle's SQL templates and Rego purpose
-gate. See {doc}`ARCHITECTURE` for the mapping's limits.
+`peql.Caller(id, purpose, tenant, tier=None, classification=None, roles=None,
+clearance=None)` keeps 0.3's argument order. A refusal raises `peql.Refused`.

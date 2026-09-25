@@ -1,4 +1,4 @@
 # Changelog
 
-The project history is maintained in
-[CHANGELOG.md](https://github.com/griot-cloud/peQL/blob/main/CHANGELOG.md).
+The project history is kept in
+[CHANGELOG.md](https://github.com/griot-cloud/peql/blob/main/CHANGELOG.md).

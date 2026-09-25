@@ -1,0 +1,5 @@
+name: is_meter_serial
+version: 1
+signatures: ["(string) -> bool"]
+deterministic: true
+cost: cheap

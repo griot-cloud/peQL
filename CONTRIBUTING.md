@@ -1,47 +1,42 @@
 # Contributing to peQL
 
-Thanks for your interest. peQL is a standalone snapshot of the query engine
-from the Griot Cloud platform (see [Provenance](README.md#provenance)).
+peQL is the runtime for [parcel](https://github.com/griot-cloud/parcel) contracts. A change to
+what a rule means belongs in parcel; a change to how contracts are stored, written, planned or
+served belongs here. See [parcel and peQL](docs/parcel-and-peql.md).
 
-## Development setup
+## Setup
 
-You only need a recent stable Rust toolchain (≥ 1.88). Everything else is
-vendored through cargo.
+Rust 1.94 or newer. The `lance` feature also needs `protoc`.
 
 ```bash
-git clone <this-repo> peql && cd peql
-cargo build
+git clone https://github.com/griot-cloud/peql && cd peql
 cargo test
 ```
 
-## Before you open a PR
+To work on parcel and peQL together, point peQL at a local parcel checkout without committing
+it, in `.cargo/config.toml`:
 
-Run the same gates CI runs (these must all pass):
+```toml
+[patch."https://github.com/griot-cloud/parcel"]
+parcel-core = { path = "../parcel/crates/parcel-core" }
+parcel-runtime = { path = "../parcel/crates/parcel-runtime" }
+```
+
+## Before you open a pull request
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test
-cargo build --release
+cargo clippy --all-targets --features platform -- -D warnings
+cargo test --features platform
+cargo build --bin peql && PEQL=target/debug/peql examples/run-all.sh
 ```
 
-- Keep the default feature set building **without `protoc`**. Anything that
-  needs `protoc` (e.g. the Lance columnar path) must stay behind the `lance`
-  feature.
-- Match the surrounding style: the engine source predates clippy's inline
-  format-args lint, which is allowed crate-wide — don't churn unrelated lines.
-- Add or update an example when you add user-visible behaviour, and make sure
-  `cargo run --example <name>` still works with no external services.
-
-## Scope
-
-This repo packages the engine for standalone use. Deeper changes that invert the
-engine's dependencies (so the upstream platform can consume this as a published
-library) are tracked separately and are out of scope here. Bug fixes,
-documentation, examples, and build/CI improvements are all welcome.
+- The default build needs no `protoc` and no platform service.
+- Enforcement changes need a test that shows a caller cannot see what the contract hides,
+  including through a query written to probe for it.
+- User-visible behaviour belongs in `docs/` and, if it changes a workflow, in `examples/`.
 
 ## Reporting issues
 
-Please include the command you ran, the full output, your `rustc --version`, and
-your OS. For enforcement bugs (masking/row-filter/DP), a minimal reproduction
-that constructs the engine in memory (as the examples do) is ideal.
+Include the command, the full output, `rustc --version`, and the contract. For an enforcement
+bug, a test that builds an `Engine::in_memory` and shows the leak is ideal.

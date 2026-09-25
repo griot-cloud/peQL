@@ -1,133 +1,76 @@
-"""Tests for the peQL Python wheel.
-
-Run (from `bindings/python`, after `maturin develop`):
-    pytest
-"""
-
-import json
+"""Tests for the peQL Python package. Run from `bindings/python` after `maturin develop`: pytest"""
 
 import pyarrow as pa
-import pyarrow.parquet as pq
 import pytest
 
 import peql
 
+CONTRACT = """
+contract: sales/orders
+version: 1
+owner: acme
+binding: {parquet: orders/}
+expose:
+  - {name: order_id, type: int64}
+  - {name: email, type: utf8}
+  - {name: region, type: utf8}
+rules:
+  - {id: analytics_only, op: decide, expr: "ctx.purpose == 'analytics'"}
+  - {id: eu_only, op: admit, expr: "row.region == 'EU' || ctx.tenant == 'acme'"}
+  - {id: mask_email, op: transform, column: email, expr: "ctx.tenant == 'acme' ? row.email : hash_sha256(row.email)"}
+"""
+
+ORDERS = pa.table(
+    {
+        "order_id": pa.array([1, 2, 3, 4, 5], pa.int64()),
+        "email": ["alice@acme.com", "bob@globex.com", "carol@acme.com", "dan@initech.com", "erin@acme.com"],
+        "region": ["EU", "US", "EU", "APAC", "US"],
+    }
+)
+
+SQL = 'SELECT order_id, email, region FROM "sales/orders" ORDER BY order_id'
+
 
 def _engine(tmp_path):
-    path = str(tmp_path / "orders.parquet")
-    pq.write_table(
-        pa.table(
-            {
-                "order_id": [1, 2, 3, 4, 5],
-                "email": [
-                    "alice@acme.com",
-                    "bob@globex.com",
-                    "carol@acme.com",
-                    "dan@initech.com",
-                    "erin@acme.com",
-                ],
-                "region": ["EU", "US", "EU", "APAC", "US"],
-            }
-        ),
-        path,
-    )
-    contract = json.dumps(
-        {
-            "contract_id": "sales_orders_v1",
-            "version": "1",
-            "dataset": "sales/orders/v1",
-            "binding": {"parquet": path},
-            "owner_tenant": "acme",
-            "purposes": ["analytics"],
-            # `columns` is the contract's read projection (upstream 2.0 change):
-            # declare everything we expose, not just the masked column.
-            "columns": [
-                {"name": "order_id", "type": "int"},
-                {"name": "email", "type": "text", "mask": "hash_sha256"},
-                {"name": "region", "type": "text"},
-            ],
-            "row_filter": "region = 'EU'",
-        }
-    )
-    return peql.Engine.from_json_contracts([contract])
-
-
-SQL = 'SELECT order_id, email, region FROM "sales/orders/v1" ORDER BY order_id'
+    eng = peql.Engine.open(tmp_path)
+    eng.register(CONTRACT, ORDERS)
+    report = eng.write("sales/orders", ORDERS)
+    assert report["rows_written"] == 5 and report["verdict"]["valid"]
+    eng.publish("sales/orders", "globex")
+    return eng
 
 
 def test_outsider_is_masked_and_filtered(tmp_path):
-    eng = _engine(tmp_path)
-    t = eng.query(SQL, peql.Caller("user:bob", "analytics", "globex"))
-    assert t.num_rows == 2  # EU-only
-    emails = t.column("email").to_pylist()
-    assert all("@" not in e and len(e) == 64 for e in emails)  # SHA-256 hex
+    t = _engine(tmp_path).query(SQL, peql.Caller("user:bob", "analytics", "globex"))
+    assert t.column("order_id").to_pylist() == [1, 3]
+    assert all(len(e) == 64 for e in t.column("email").to_pylist())
 
 
 def test_owner_sees_raw(tmp_path):
-    eng = _engine(tmp_path)
-    t = eng.query(SQL, peql.Caller("user:alice", "analytics", "acme"))
+    t = _engine(tmp_path).query(SQL, peql.Caller("user:alice", "analytics", "acme"))
     assert t.num_rows == 5
-    assert any("@" in e for e in t.column("email").to_pylist())
+    assert t.column("email").to_pylist()[0] == "alice@acme.com"
 
 
-def test_disallowed_purpose_is_denied(tmp_path):
+def test_disallowed_purpose_is_refused(tmp_path):
+    with pytest.raises(peql.Refused, match="analytics_only"):
+        _engine(tmp_path).query(SQL, peql.Caller("user:bob", "marketing", "globex"))
+
+
+def test_unpublished_tenants_cannot_see_it(tmp_path):
+    with pytest.raises(peql.Refused, match="no contract"):
+        _engine(tmp_path).query(SQL, peql.Caller("u", "analytics", "initech"))
+
+
+def test_envelope_and_describe(tmp_path):
     eng = _engine(tmp_path)
-    with pytest.raises(Exception) as exc:
-        eng.query(SQL, peql.Caller("u", "marketing", "globex"))
-    assert "denied" in str(exc.value)
-
-
-def test_returns_pyarrow_table(tmp_path):
-    eng = _engine(tmp_path)
-    t = eng.query(SQL, peql.Caller("u", "analytics", "acme"))
+    t, env = eng.query_with_envelope(SQL, peql.Caller("user:bob", "analytics", "globex"))
     assert isinstance(t, pa.Table)
-
-
-# ─── Graph functions (2.0, R10 parity) ────────────────────────────────────────
-
-GRAPH_REF = "process-graphs/zijani-operations/v1"
-
-
-def _graph_engine():
-    import os
-
-    fixture = os.path.abspath(
-        os.path.join(
-            os.path.dirname(__file__), "..", "..", "..", "fixtures", "graph",
-            "zijani-operations-v1",
-        )
-    )
-    contract = json.dumps(
-        {
-            "contract_id": "zijani_ops_graph",
-            "version": "1",
-            "dataset": GRAPH_REF,
-            "binding": {"graph_snapshot": fixture},
-            "owner_tenant": "zijani",
-            "purposes": ["process_analysis"],
-            "masks": {"owner": "redact"},
-        }
-    )
-    return peql.Engine.from_json_contracts([contract])
-
-
-def test_graph_nodes_scan_from_python():
-    eng = _graph_engine()
-    t = eng.query(
-        f"SELECT name, kind, data_refs FROM graph_nodes('{GRAPH_REF}')",
-        peql.Caller("user:ops", "process_analysis", "zijani"),
-    )
-    assert t.num_rows == 271
-    # list columns round-trip to pyarrow (R10).
-    assert pa.types.is_list(t.schema.field("data_refs").type)
-
-
-def test_graph_traversal_masked_for_outsider():
-    eng = _graph_engine()
-    t = eng.query(
-        f"SELECT name, owner, min_depth FROM graph_reachable('{GRAPH_REF}', "
-        "'Collection quarantined; jericans to segregated disposal', 'both', 3)",
-        peql.Caller("svc:x", "process_analysis", "globex"),
-    )
-    assert t.num_rows > 0
-    assert all(o == "***" for o in t.column("owner").to_pylist())
+    assert env["contracts"][0]["decisions"] == ["analytics_only"]
+    assert env["rows"] == 2
+    assert eng.describe("sales/orders", peql.Caller("u", "analytics", "acme")) == [
+        ("order_id", "Int64"),
+        ("email", "Utf8"),
+        ("region", "Utf8"),
+    ]
+    assert eng.validate("sales/orders")["valid"]

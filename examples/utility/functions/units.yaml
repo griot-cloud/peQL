@@ -1,0 +1,5 @@
+name: units
+version: 1
+signatures: ["(int, int) -> int"]
+deterministic: true
+cost: cheap

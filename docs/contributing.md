@@ -1,17 +1,18 @@
 # Contributing
 
-The contributor workflow and release hygiene live in the repository's
-[CONTRIBUTING.md](https://github.com/griot-cloud/peQL/blob/main/CONTRIBUTING.md).
+The contributor workflow is in the repository's
+[CONTRIBUTING.md](https://github.com/griot-cloud/peql/blob/main/CONTRIBUTING.md).
 
 Before opening a pull request, run:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets -- -D warnings
-cargo test
+cargo clippy --all-targets --features platform -- -D warnings
+cargo test --features platform
+examples/run-all.sh
 ```
 
-For documentation changes, also build the site locally:
+The `lance` feature needs `protoc`. For documentation changes, also build the site:
 
 ```bash
 python -m pip install -r docs/requirements.txt

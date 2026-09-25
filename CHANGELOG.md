@@ -3,6 +3,60 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [0.4.0]: the runtime for parcel contracts
+
+peQL now enforces contracts written in [parcel](https://github.com/griot-cloud/parcel) and has
+no policy language of its own. parcel compiles each contract; peQL stores, writes, validates and
+queries under it. Every 0.3 policy has a parcel equivalent ([migration guide](docs/migrating.md)).
+
+**Enforcement**
+- Contracts are views: a filter of `admit` rules and drop-level assertions, and a projection of
+  exposed columns and transforms, with the caller bound as literals. The optimiser pushes the
+  filter into the Parquet scan and prunes files and row groups. 0.3 read every file whole
+  before filtering.
+- A gate on every view. The engine refuses a plan in which contract data is read outside its
+  gate, and the gate stops caller predicates that could fail from running on hidden rows.
+- `decide`, `guarantee` (against manifests), `assert` (stored flags), and every shape:
+  `sample`, `noise` at rows or aggregates, and `suppress` in every aggregate.
+- Privacy budgets are charged once per query and only for queries that read the noised column.
+  They are enforced by default and persist across restarts.
+- The statement guard parses SQL instead of scanning keywords.
+
+**Lifecycle**
+- The write path (flags, clustering, partitions, bloom filters, contract hash in each file),
+  manifests, validation with a data hash, and re-validation of every contract over shared files.
+- A contract store with versions and publication to tenants or `public`. Contracts a caller may
+  not see are indistinguishable from absent ones.
+- Tenants' WebAssembly functions, stored by owner and callable only from their own contracts.
+- parcel bundles as the handoff: registered only when they recompile to the same hash.
+
+**Kept, rebuilt on the new engine**
+- `K04DEngine`: tenant-scoped and governed. In 0.3 it ran SQL over raw registered tables with no
+  enforcement.
+- The worker pool, now sharing one engine and able to sign envelopes through T05.
+- The result cache. Its key now covers the caller's bound context and the data, where 0.3's
+  `(tenant, sql)` key could serve one caller's rows to another in the same tenant.
+- Result formats (Arrow IPC, Parquet, JSON lines).
+- Scan statistics and attestation hashes, now in every query's envelope.
+- The platform adapter: signed parcel bundles from T03 in place of SQL templates and Rego.
+- Lance: now streamed, with projections and safe filters passed down. Reads through storaged
+  name each object, fixing 0.3's provider, which read the same bytes for every object and could
+  not open a Lance dataset.
+- Python bindings, with the same `Caller(id, purpose, tenant)` and new `write`, `validate`,
+  `describe`, `publish`.
+- A `peql` command line.
+
+**Removed**
+- The JSON contract format, `ResolvedPolicy`, the optimiser rules and the row-filter, masking,
+  contract-approved and Laplace-noise operators: parcel expresses these now.
+- Graph table functions: graphs are two contracts traversed with recursive SQL
+  ([docs](docs/graphs.md)).
+
+**Mask changes**: `redact` is a fixed `***` whatever the length, `partial` fully masks values of
+four characters or fewer, and the null mask gives a real null instead of an empty string.
+
+DataFusion 55, Arrow 59, Rust 2024 edition; license Apache-2.0.
+
 ## [0.3.0] — graph queries, peQL naming, and documentation
 
 This release follows `0.2.0`. The premature `v2.0.0` tag is withdrawn; the

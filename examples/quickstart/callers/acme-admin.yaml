@@ -1,0 +1,4 @@
+id: otieno
+tenant: acme
+purpose: reporting
+roles: [admin]

@@ -1,12 +1,10 @@
-# Python bindings for peQL (PyO3 + maturin).
-#
-# Builds a `pip install`-able wheel exposing the open-source engine to Python.
-# Self-contained workspace so it does not entangle the parent crate.
+# Python bindings for peQL (PyO3 + maturin). Its own workspace, so it does not entangle the
+# engine's build.
 
 [package]
 name = "peql-python"
-version = "0.3.0"
-edition = "2021"
+version = "0.4.0"
+edition = "2024"
 publish = false
 
 [workspace]
@@ -17,5 +15,14 @@ crate-type = ["cdylib"]
 
 [dependencies]
 peql = { path = "../.." }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", branch = "main" }
+datafusion = "55.1.0"
+serde_json = "1"
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

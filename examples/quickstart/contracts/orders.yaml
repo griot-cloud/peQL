@@ -1,0 +1,62 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/griot-cloud/parcel/main/schema/contract.schema.json
+# Orders shared between three tenants. Each tenant sees its own rows; admins see all.
+contract: sales/orders
+version: 1
+# acme owns the data and shares it with globex (peql publish).
+owner: acme
+
+binding:
+  parquet: data/orders/
+  partitioned_by: [region]
+
+expose:
+  - {name: order_id, type: int64}
+  - {name: customer_id, type: int64}
+  - {name: email, type: utf8}
+  - {name: region, type: utf8}
+  - {name: amount_cents, type: int64}
+
+rules:
+  - id: analytics_only
+    op: decide
+    expr: ctx.purpose in ['analytics', 'reporting']
+
+  - id: own_or_admin
+    op: admit
+    expr: row.tenant_id == ctx.tenant || 'admin' in ctx.roles
+
+  - id: pk_present
+    op: assert
+    expr: has(row.order_id)
+    on_fail: deny
+
+  - id: amount_consistent
+    op: assert
+    expr: row.amount_cents == row.unit_price_cents * row.qty
+    on_fail: drop
+
+  - id: msisdn_format
+    op: assert
+    expr: is_msisdn(row.msisdn)
+    on_fail: report
+
+  - id: mask_email
+    op: transform
+    column: email
+    expr: "ctx.tenant == 'acme' ? row.email : hash_sha256(row.email)"
+
+  - id: ids_present
+    op: guarantee
+    expr: dataset.customer_id.null_rate < 0.02
+    on_fail: deny
+
+  - id: fresh_enough
+    op: guarantee
+    expr: dataset.written_at > ctx.now - duration('72h')
+    on_fail: annotate
+
+  - id: small_cells
+    op: shape
+    operator: suppress
+    params: {k: 5}
+    unless: ctx.tenant == 'acme'

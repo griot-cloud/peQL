@@ -1,0 +1,66 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/griot-cloud/parcel/main/schema/contract.schema.json
+# The design doc's sales/orders example, adapted to parcel v0:
+# money is held as integer cents because v0 rules cannot read decimals.
+contract: sales/orders
+version: 3
+
+binding:
+  parquet: file:///data/orders/
+  partitioned_by: [region, dt]
+
+expose:
+  - {name: order_id, type: int64}
+  - {name: customer_id, type: int64}
+  - {name: email, type: utf8}
+  - {name: region, type: utf8}
+  - {name: amount_cents, type: int64}
+
+rules:
+  - id: analytics_only
+    op: decide
+    expr: ctx.purpose in ['analytics', 'reporting']
+
+  - id: own_or_admin
+    op: admit
+    expr: row.tenant_id == ctx.tenant || 'admin' in ctx.roles
+
+  - id: pk_present
+    op: assert
+    expr: has(row.order_id)
+    on_fail: deny
+
+  - id: amount_consistent
+    op: assert
+    expr: row.amount_cents == row.unit_price_cents * row.qty
+    on_fail: drop
+
+  - id: msisdn_format
+    op: assert
+    expr: row.msisdn.matches('^254[17][0-9]{8}$')
+    on_fail: report
+
+  - id: mask_email
+    op: transform
+    column: email
+    expr: "ctx.tenant == 'acme' ? row.email : hash_sha256(row.email)"
+
+  - id: ids_present
+    op: guarantee
+    expr: dataset.customer_id.null_rate < 0.02
+    on_fail: deny
+
+  - id: fresh_enough
+    op: guarantee
+    expr: dataset.written_at > ctx.now - duration('72h')
+    on_fail: annotate
+
+  - id: msisdns_mostly_valid
+    op: guarantee
+    expr: dataset.assertions.msisdn_format.pass_rate >= 0.95
+    on_fail: annotate
+
+  - id: small_cells
+    op: shape
+    operator: suppress
+    params: {k: 5}
+    unless: ctx.tenant == 'acme'

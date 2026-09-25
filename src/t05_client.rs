@@ -195,16 +195,16 @@ impl T05Client {
         stream.read_exact(&mut resp_bytes).await?;
 
         // Try to parse as success first, then fall back to error.
-        if let Ok(success) = serde_json::from_slice::<SignEnvelopeResponse>(&resp_bytes) {
-            if !success.jws.is_empty() {
-                debug!(
-                    kid = %success.kid,
-                    tenant_id,
-                    correlation_id,
-                    "T05 attestation envelope signed"
-                );
-                return Ok(success);
-            }
+        if let Ok(success) = serde_json::from_slice::<SignEnvelopeResponse>(&resp_bytes)
+            && !success.jws.is_empty()
+        {
+            debug!(
+                kid = %success.kid,
+                tenant_id,
+                correlation_id,
+                "T05 attestation envelope signed"
+            );
+            return Ok(success);
         }
 
         // Try parsing as error.
@@ -212,7 +212,10 @@ impl T05Client {
             .map_err(|e| T05Error::Protocol(format!("T05 response deserialization failed: {e}")))?;
 
         Err(T05Error::SigningRefused {
-            reason: error.error,
+            reason: match error.error_code {
+                Some(code) => format!("[{code}] {}", error.error),
+                None => error.error,
+            },
         })
     }
 

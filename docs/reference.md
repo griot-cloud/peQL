@@ -1,47 +1,49 @@
-# API and behavior reference
+# Reference
 
-The Rust crate is named `peql` and its current package version is `0.3.0`.
-The Python package and import name are `peql`.
+The Rust crate and the Python package are both named `peql`, version 0.4.0.
 
-## Query entry points
+## Engine
 
-| Entry point | Inputs | Output | Enforcement path |
-| --- | --- | --- | --- |
-| `peql::engine::Engine::query` | SQL and `Caller` | `Vec<RecordBatch>` | Resolves each dataset through `ContractSource`, then uses a governed provider. |
-| `Engine::query_with_stats` | SQL and `Caller` | `QueryOutcome { batches, stats }` | Same query path, plus pre-enforcement scan counters. |
-| Python `peql.Engine.query` | SQL and `Caller` | `pyarrow.Table` | Calls Rust `Engine::query` through PyO3 and Arrow IPC. |
-| `peql::K04DEngine::query` | SQL after bundle injection | `Vec<RecordBatch>` | Checks bundle presence and DDL, then runs against tables registered directly in its session. |
-
-`K04DEngine` does **not** resolve the injected bundle into a policy or install
-the high-level row filter, mask, and noise stack for directly registered
-tables. This matters when choosing a Rust integration path.
-
-## Core Rust types
-
-| Type or trait | Role |
+| Method | Does |
 | --- | --- |
-| `Caller` | Identity and purpose supplied by the embedding application. |
-| `ContractSource` | Resolves a dataset and caller into `ResolvedPolicy`. |
-| `BindingResolver` | Returns a raw `TableProvider` or graph snapshot directory. |
-| `ResolvedPolicy` | Allow/deny decision and requested transformations. |
-| `ContractTableProvider` | Builds governed physical scans. |
-| `QueryStats` | Raw rows and Arrow in-memory bytes scanned. |
+| `Engine::open(root)`, `Engine::in_memory(base)` | A workspace on disk, or in memory. |
+| `register_contract(source, &schema)` | Compile a parcel document against the data's schema and store it. |
+| `register_bundle(&bundle)` | Store a bundle after recompiling it to the same hash. |
+| `register_function(module, &manifest, owner)` | Verify and store a tenant's WebAssembly function. |
+| `publish(name, audience)`, `unpublish` | Share with a tenant, or `public`. |
+| `write(name, batches, mode)` | The write path; returns a `WriteReport` with the verdict. |
+| `bind_table(name, provider)`, `bind_batches(name, batches)` | Serve a contract from data you hold. |
+| `validate(name)`, `validate_with(name, plan)` | The verdict and data hash; `validate_with` runs a plan from a bundle. |
+| `query(sql, &caller)` | `QueryResult { batches, envelope }`. |
+| `explain(sql, &caller)` | The physical plan (operators only; callers cannot `EXPLAIN`). |
+| `describe(name, &caller)` | The schema a caller would see. |
+| `resolve`, `view` | The resolver and view builder, for embedding. |
+| `get`, `contracts`, `list_for(&caller)`, `manifest(name)` | Inspect the store. |
+
+## Errors
+
+`PeqlError`: `Compile`, `UnknownContract` (also for contracts the caller cannot see), `Denied`,
+`NotWritten`, `NotServable`, `GuaranteeFailed`, `BudgetExhausted`, `Refused` (a statement that
+is not a query), `Ungated`, `Invalid`, `DataFusion`, `Io`. `is_refusal()` separates policy
+outcomes from failures.
+
+## Envelope
+
+| Field | Holds |
+| --- | --- |
+| `contracts` | Per contract: name, version, contract and compilation hashes, decisions that ran, annotated guarantees, shapes applied, whether stored flags were read. |
+| `rows` | Rows returned. |
+| `suppress_k` | The suppression threshold applied. |
+| `budgets` | Budget left per budget charged. |
+| `scan` | Rows scanned and released, bytes read, files and row groups pruned. |
+| `attestation` | sha256 of the query and of the result (Arrow IPC), and the time. |
+| `audit_id`, `cached` | The audit record, and whether the answer came from the cache. |
 
 ## Cargo features
 
-| Feature | Default | Effect |
+| Feature | Default | Adds |
 | --- | --- | --- |
-| `platform` | Off | Enables HTTP T03 bundle source and ECDSA P-256 verification when configured with a key. |
-| `lance` | Off | Enables the storaged-backed Lance provider; building requires `protoc`. |
+| `platform` | off | Signed bundles from T03 over HTTP. |
+| `lance` | off | Lance datasets, directly or through storaged. Building needs `protoc`. |
 
-## Current boundaries
-
-- The standalone Parquet resolver loads a whole file into memory.
-- `Engine` uses a permissive tracker for `dp_columns`; it adds noise without
-  enforcing a cross-query privacy budget.
-- The standalone graph loader verifies digests and structure, but not a signed
-  certificate.
-- `AttestationExec` exists as a lower-level operator; `Engine::query` does
-  not automatically attach signed attestation envelopes.
-- Platform bundle mapping parses the SQL/Rego forms currently emitted by T03.
-  A configured verifying key is required for signature verification.
+The storaged and T05 socket clients build on every Unix target.

@@ -1,73 +1,83 @@
-# How policy enforcement works
+# How it works
 
-## Contract definition and engine behavior
+## Contracts are the only tables
 
-A JSON contract names one dataset and defines its binding, allowed purposes,
-exposed columns, and optional filters or masks. The contract is data. It does
-not execute a query or protect a table by itself.
+Every name in a `FROM` clause is a contract. The contract's binding (where its files live) never
+appears to a caller, in results or in errors. A contract the caller's tenant may not see
+behaves exactly like one that does not exist, so a caller cannot probe for names.
 
-The engine evaluates that definition against the supplied `Caller`. The
-resulting `ResolvedPolicy` contains an allow or deny decision plus the
-operations to apply. The engine denies the query during planning or builds a
-governed table provider. When DataFusion scans that provider, peQL executes
-the row filter, masks, and optional noise operator in the physical plan.
+A contract is visible to a caller when it has no owner, when the caller's tenant owns it, or
+when the owner published it to that tenant or to `public`.
 
-## Caller context
+## A query, step by step
 
-`Caller` contains an ID, tenant, purpose, tier, and classification. The JSON
-source currently uses the tenant and purpose to decide the view. An embedding
-application supplies these values; peQL does not authenticate a user or verify
-that a caller's claimed identity is genuine. The application must derive
-`Caller` from its trusted authentication context.
+1. **Guard.** The SQL is parsed. Anything but exactly one query is refused: DDL, DML, `COPY`,
+   `SET`, `EXPLAIN`, `INSTALL`, `LOAD`, `ATTACH`, a second statement. The planned query is checked
+   again. Comments and string literals cannot hide a statement, because the check reads the
+   parsed statement.
+2. **Resolve.** For each contract the query names, peQL runs its `decide` rules against the
+   caller (parcel-runtime's CEL interpreter). It then reads the dataset's manifest and runs
+   `guarantee` rules against the stored statistics; a failing `deny` guarantee refuses the query,
+   an `annotate` one is noted in the envelope. It also works out which shape rules apply.
+3. **Build the view.** The view is ordinary DataFusion: a scan of the binding, a filter made of
+   the contract's `admit` rules and drop-level `assert` flags, and a projection of the exposed
+   columns with their `transform` rules. Caller context is bound as literals, so a rule that
+   does not apply to this caller folds away. A `Gate` node goes on top.
+4. **Plan.** The caller's SQL is planned over the views. `suppress` and aggregate `noise` are
+   applied to the caller's aggregates (parcel_runtime::shape), and their budget charges are paid.
+5. **Execute.** The engine refuses any physical plan in which a scan of contract data is not
+   under that contract's gate. The rest is DataFusion.
+6. **Envelope and audit.** The caller gets the rows and an envelope: what each contract decided,
+   which shapes applied, budget left, what the scan read, and hashes of the query and the result.
+   One audit record is written, answered or refused.
 
-For JSON contracts, a non-empty `purposes` list rejects a purpose outside the
-list for both owners and non-owners. An owner tenant receives unmasked,
-unfiltered values, but still sees only columns exposed by `columns`.
+Everything a rule means was decided by parcel when the contract was compiled. peQL binds the
+caller, finds the data, and runs what parcel compiled.
 
-## Resolution and binding
+## The gate is a barrier
 
-Two traits keep policy evaluation separate from finding bytes:
+The optimiser pushes the contract's filter into the Parquet scan, so partitions and row groups
+the contract excludes are never read. A caller's own predicates are pushed too, but only when
+they cannot fail: comparisons, boolean logic, `IN` lists, `IS NULL`, `LIKE`. A predicate that can
+raise an error, such as `100 / (id - 3) > 0`, stays above the gate. Otherwise it could fail on a
+row the contract hides, and the error would reveal that the row exists.
 
-| Trait | Returns | Included implementation |
+Transforms are projections: a masked column the query does not read is never computed.
+
+## Stored flags, or live rules
+
+When peQL writes data under a contract, it stores a boolean column per assertion and a column
+for each row-only subtree parcel chose to precompute. Views read those columns instead of
+evaluating the rules, as long as every file was written under the current contract hash. Files
+written under another contract, or not by peQL at all, are read with every rule evaluated live.
+The results are the same either way.
+
+## Shapes
+
+| Shape | Where it runs | Effect |
 | --- | --- | --- |
-| `ContractSource` | `ResolvedPolicy` for a dataset and caller | `JsonContractSource` |
-| `BindingResolver` | Raw DataFusion `TableProvider` for a dataset | Local Parquet loader in `JsonContractSource` |
+| `sample` | in the view's filter | A stable fraction of rows keyed on a column; repeated queries see the same rows. |
+| `noise` at `row` | in the view's projection | Laplace noise on each value of the column. |
+| `noise` at `aggregate` | on the caller's aggregates | Noise on each aggregate over the column; the column cannot be read otherwise or grouped by. |
+| `suppress` | on the caller's aggregates | Groups under `k` rows are removed from every aggregate, including `UNION` branches and subqueries. A query without `GROUP BY` is one group. |
 
-The high-level `Engine` creates a fresh DataFusion session for each query. Its
-catalog resolves a table name lazily. It checks the policy decision before
-asking the binding resolver for the raw table. The standalone loader reads the
-entire Parquet file into a `MemTable`; it does not stream large files.
+Each `unless` is evaluated per caller. Noise charges its named budget once per query, and only
+when the query reads the noised column; a spent budget refuses the query. Budgets are kept per
+caller and survive restarts in a workspace.
 
-## What happens during a scan
+## The write path
 
-`ContractTableProvider` scans the raw table with all columns available. This
-allows a row filter to use a column omitted from the SQL `SELECT` list. The
-provider then builds this stack:
+`write` runs parcel's write plan: enrich (`row.other` fields, including tenant WebAssembly
+functions), compute flags and precomputed columns, cluster by the flags queries filter on,
+partition by the binding's partition columns, enable bloom filters where the contract compares
+columns with caller context, stamp the contract hash into each Parquet file, run the validation
+plan, and write the manifest. A deny-level assertion that fails marks the data as not servable
+until it is fixed.
 
-```text
-raw scan
-  → ScanMetricsExec
-  → ContractApprovedExec
-  → RowFilterExec
-  → MaskingExec
-  → LaplaceNoiseExec (if configured)
-  → contract column projection
-  → query projection and limit
-```
+## The result cache
 
-The provider reports the schema *after* masking and contract projection to
-DataFusion. String-producing masks on numeric or temporal fields therefore
-change those fields to Arrow `Utf8` in the query's planned schema.
-
-The high-level engine removes DataFusion's generic physical
-`ProjectionPushdown` rule for these scans because it can move a projection
-past a type-changing mask. The provider applies projections after enforcement.
-
-## Graph queries
-
-Graph table functions use the same caller-bound contract resolution. peQL
-loads and verifies a graph snapshot, evaluates node and edge predicates into
-visibility masks, then traverses only visible structure. A filtered node
-cannot appear in output or act as an intermediate hop. Output masking uses
-the physical masking operator. See {doc}`GRAPH-QUERY` for exact function
-signatures and limits.
+With `Engine::with_cache`, answers are cached under a key that covers the SQL and, for each
+contract, its compilation hash, the caller's bound context, the shapes that apply, and the data
+hash. Two callers share an answer only when the contracts would give them the same one; a write
+or a new contract version never serves a stale answer. A cached answer with noise is served as
+it was: seeing the same noisy answer twice spends no more privacy.

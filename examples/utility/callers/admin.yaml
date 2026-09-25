@@ -1,0 +1,4 @@
+id: ops
+tenant: kplc
+purpose: operations
+roles: [admin]

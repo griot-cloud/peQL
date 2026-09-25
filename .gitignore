@@ -22,3 +22,10 @@ bindings/python/dist/
 /.idea
 /.vscode
 *.swp
+
+# Example workspaces write their data and state here
+examples/*/_peql/
+examples/*/data/
+
+# Documentation build
+docs/_build/

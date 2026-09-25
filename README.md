@@ -1,91 +1,57 @@
 # peQL
 
-peQL is a policy-enforcing query engine built on Apache DataFusion.
-Define your data policies. peQL enforces them whenever your data is queried.
+**A query engine where every table is a data contract.**
 
-## The query path
+peQL stores data contracts written in [parcel](https://github.com/griot-cloud/parcel), writes
+data under them, and answers SQL through them. Every `FROM` names a contract, and the contract
+decides what each caller gets: which rows, which columns, masked or in clear, noised or exact,
+or nothing at all. Enforcement is part of the query plan, so the optimiser prunes with the
+contract's rules instead of working around them.
 
-A query asks for the average salary. The policy adds noise before it is calculated.
-
-```mermaid
-flowchart TB
-    sql["SQL<br/>SELECT AVG(salary) AS avg_salary<br/>FROM &quot;hr/payroll&quot;"]
-    policy["Policy<br/>dp_columns.salary<br/>sensitivity: 1000 · epsilon: 1"]
-    data["Source dataset · hr/payroll<br/>salary: 60,000 · 80,000 · 100,000"]
-    subgraph engine[peQL]
-        compile[Compile policy into query execution]
-        read[Read salaries]
-        noise[Add DP noise]
-        average[Compute average]
-        compile --> read --> noise --> average
-    end
-    sql --> compile
-    policy --> compile
-    data --> read
-    average --> result["Result<br/>avg_salary: 79,842.67"]
+```sh
+peql write contracts/orders.yaml --input orders.csv
+peql publish sales/orders --to globex
+peql query 'SELECT region, SUM(amount_cents) FROM "sales/orders" GROUP BY region' \
+  --caller callers/globex-analyst.yaml
 ```
 
-Illustrative result for a non-owner query; noise varies each run.
-See [noise policy and privacy limits](docs/CONTRACT-FORMAT.md#row-filtering-and-differential-privacy).
+## What a contract does in peQL
 
+| parcel rule | In peQL |
+| --- | --- |
+| `decide` | Refuses a caller before any file is opened. |
+| `admit` | A filter in the contract's view, pushed into the Parquet scan: excluded partitions and row groups are never read. |
+| `assert` | Evaluated at write into a stored flag; failing rows are dropped, reported, or make the data unservable. |
+| `transform` | A projection: masks, hashes and nulls per caller, never computed for columns a query does not read. |
+| `guarantee` | Checked against the dataset's manifest: refuses or annotates the query. |
+| `shape` | Sampling, noise on rows or on aggregates with privacy budgets, and small-group suppression. |
 
-## Quickstart
-Read the [Documentation](https://griot-cloud.github.io/peQL/)
-
-[Run the working example](docs/getting-started.md), or add peQL to your application.
-
-Rust 1.88 or newer is required.
-
-```toml
-[dependencies]
-peql = { git = "https://github.com/griot-cloud/peQL" }
-```
-
-For the standalone path, create an `Engine` from JSON contracts whose bindings
-point to local Parquet files:
-
-```rust
-use peql::contract_source::Caller;
-use peql::engine::Engine;
-
-let engine = Engine::from_json_contracts_dir("./contracts")?;
-let rows = engine
-    .query(
-        r#"SELECT AVG(salary) AS avg_salary FROM "hr/payroll""#,
-        Caller::new("user:bob", "analytics", "globex"),
-    )
-    .await?;
-```
-
-Python bindings expose the same query path. Build a wheel from
-`bindings/python` or use one produced by this repository's wheel workflow:
-
-```python
-import peql
-
-engine = peql.Engine.from_json_contracts_dir("./contracts")
-table = engine.query(
-    'SELECT AVG(salary) AS avg_salary FROM "hr/payroll"',
-    peql.Caller("user:bob", "analytics", "globex"),
-)
-```
-
-Use Rust `Engine` or Python `peql.Engine` for queries governed by contracts.
-For lower-level Rust integration through `K04DEngine`, see the
-[API reference](docs/reference.md) for differences in enforcement.
+Every query returns an envelope (which rules applied, what was read, hashes of the question and
+the answer) and leaves an audit record. A plan in which contract data is read outside its view is
+refused before it runs.
 
 ## Documentation
 
-- [Quickstart](docs/getting-started.md) — run your first query.
-- [Use the APIs](docs/USAGE.md) — integrate with Rust or Python.
-- [How it works](docs/concepts.md) — understand policy enforcement.
-- [Contribute](CONTRIBUTING.md) — build the engine, run tests, and make a change.
+- [Quickstart](docs/getting-started.md): write and query under a contract as three callers.
+- [Use peQL](docs/USAGE.md): the command line, Rust, and Python.
+- [How it works](docs/concepts.md): views, the gate, shapes, the write path.
+- [parcel and peQL](docs/parcel-and-peql.md): who does what, and the bundle between them.
+- [Migrating from 0.3](docs/migrating.md).
+
+## Install
+
+```sh
+cargo install --git https://github.com/griot-cloud/peql peql
+```
+
+As a library, `peql = { git = "https://github.com/griot-cloud/peql" }`. The Python package is
+in `bindings/python`. Rust 1.94 or newer.
 
 ## Status
 
-peQL is currently version **0.3.0**. The new `peql` Rust and Python names are a
-breaking change for downstream users of the predecessor API.
+Version 0.4.0: peQL is now the runtime for parcel contracts. See the
+[changelog](CHANGELOG.md) for what changed from 0.3.
 
 ## License
 
-License to be determined.
+Apache-2.0; see [LICENSE](LICENSE).

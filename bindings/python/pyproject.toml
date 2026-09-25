@@ -4,16 +4,16 @@ build-backend = "maturin"
 
 [project]
 name = "peql"
-version = "0.3.0"
-description = "peQL — a contract-resolving, privacy-enforcing SQL engine"
+version = "0.4.0"
+description = "peQL: a query engine where every table is a parcel data contract"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { text = "TBD" }
+license = { text = "Apache-2.0" }
 keywords = ["sql", "datafusion", "data-contract", "privacy", "governance", "arrow"]
 dependencies = ["pyarrow>=14"]
 
 [project.urls]
-Source = "https://github.com/griot-cloud/peQL"
+Source = "https://github.com/griot-cloud/peql"
 
 [tool.maturin]
 module-name = "peql._native"

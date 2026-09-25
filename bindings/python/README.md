@@ -1,27 +1,29 @@
 # peQL (Python)
 
-A contract-resolving, privacy-enforcing SQL engine — point SQL at a *contract*,
-get *governed* rows. Python bindings for the [peQL](../../README.md) engine.
+Query data through [parcel](https://github.com/griot-cloud/parcel) contracts: every table is a
+contract, and each caller gets what the contract allows. Python bindings for the
+[peQL](../../README.md) engine.
 
 ```bash
-pip install peql
+pip install maturin && maturin develop --release   # from bindings/python
 ```
 
 ```python
 import peql
+import pyarrow as pa
 
-engine = peql.Engine.from_json_contracts_dir("./contracts")
+engine = peql.Engine.open("./workspace")
+engine.register(open("orders.yaml").read(), schema=orders.schema)  # a parcel contract
+engine.write("sales/orders", orders)                               # a pyarrow Table
+engine.publish("sales/orders", "globex")
 
 table = engine.query(
-    'SELECT email, region FROM "sales/orders/v1"',
-    peql.Caller("user:bob", purpose="analytics", tenant="globex"),
+    'SELECT region, COUNT(*) AS n FROM "sales/orders" GROUP BY region',
+    peql.Caller("user:bob", "analytics", "globex"),
 )
-print(table.to_pandas())   # email is SHA-256 hashed for the outside tenant
+table, envelope = engine.query_with_envelope(sql, caller)   # what the contract did
 ```
 
-The owning tenant sees raw rows; everyone else gets the contract's masking and
-row filtering, enforced inside the query plan. Results come back as a
-`pyarrow.Table`. See the main project's `docs/CONTRACT-FORMAT.md` for the JSON
-contract format.
-
-No Rust toolchain is required to use the published wheel.
+A query the contract refuses raises `peql.Refused`. `engine.validate(name)` returns the
+verdict; `engine.describe(name, caller)` the columns a caller would see;
+`engine.register_bundle(json)` registers a bundle from `parcel compile -o`.
