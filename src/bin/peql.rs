@@ -193,6 +193,12 @@ impl CallerArgs {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Rust ignores SIGPIPE, so a closed stdout (`peql query ... | head -1`) makes every print
+    // panic. Restore the default: stop quietly, as other command-line tools do.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let cli = Cli::parse();
     match run(cli).await {
         Ok(code) => code,

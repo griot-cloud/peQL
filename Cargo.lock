@@ -4967,7 +4967,7 @@ dependencies = [
 [[package]]
 name = "parcel-core"
 version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?branch=main#d11a6f75803fb75289c2339cbeb7c58e8965fede"
+source = "git+https://github.com/griot-cloud/parcel?branch=main#0bfc30970226656c6d656e227e3048250992059b"
 dependencies = [
  "cel",
  "chrono",
@@ -4990,7 +4990,7 @@ dependencies = [
 [[package]]
 name = "parcel-runtime"
 version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?branch=main#d11a6f75803fb75289c2339cbeb7c58e8965fede"
+source = "git+https://github.com/griot-cloud/parcel?branch=main#0bfc30970226656c6d656e227e3048250992059b"
 dependencies = [
  "cel",
  "chrono",
@@ -5011,7 +5011,7 @@ dependencies = [
 [[package]]
 name = "parcel-udf"
 version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?branch=main#d11a6f75803fb75289c2339cbeb7c58e8965fede"
+source = "git+https://github.com/griot-cloud/parcel?branch=main#0bfc30970226656c6d656e227e3048250992059b"
 
 [[package]]
 name = "parking"
@@ -5124,6 +5124,7 @@ dependencies = [
  "hex",
  "lance",
  "lance-io",
+ "libc",
  "lru",
  "object_store 0.14.2",
  "p256",
