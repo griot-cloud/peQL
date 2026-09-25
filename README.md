@@ -40,12 +40,22 @@ refused before it runs.
 
 ## Install
 
+Linux and macOS:
+
 ```sh
-cargo install --git https://github.com/griot-cloud/peql peql
+curl -LsSf https://github.com/griot-cloud/peql/releases/latest/download/install.sh | sh
 ```
 
-As a library, `peql = { git = "https://github.com/griot-cloud/peql" }`. The Python package is
-in `bindings/python`. Rust 1.94 or newer.
+Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/griot-cloud/peql/releases/latest/download/install.ps1 | iex"
+```
+
+Each [release](https://github.com/griot-cloud/peql/releases) carries the `peql` binary for
+Linux (x86_64, arm64), macOS (Apple silicon, Intel) and Windows (x64), each with its sha256.
+Python: `pip install peql`. As a Rust library,
+`peql = { git = "https://github.com/griot-cloud/peql" }` (Rust 1.94 or newer).
 
 ## Status
 

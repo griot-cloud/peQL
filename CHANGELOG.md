@@ -44,7 +44,9 @@ queries under it. Every 0.3 policy has a parcel equivalent ([migration guide](do
   not open a Lance dataset.
 - Python bindings, with the same `Caller(id, purpose, tenant)` and new `write`, `validate`,
   `describe`, `publish`.
-- A `peql` command line.
+- A `peql` command line, released as binaries for Linux (x86_64, arm64), macOS (arm64, x86_64)
+  and Windows (x64) with `install.sh` and `install.ps1` installers, and Python wheels for the
+  same platforms.
 
 **Removed**
 - The JSON contract format, `ResolvedPolicy`, the optimiser rules and the row-filter, masking,

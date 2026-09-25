@@ -1,14 +1,29 @@
 # Quickstart
 
 This walks through the quickstart workspace in the repository: a contract for orders shared
-between tenants, one data file, and three callers. It needs Rust 1.94 or newer.
+between tenants, one data file, and three callers.
 
 ## 1. Install
 
+On Linux or macOS:
+
 ```bash
-cargo install --git https://github.com/griot-cloud/peql peql
-cargo install --git https://github.com/griot-cloud/parcel parcel-cli   # optional: authoring and checks
+curl -LsSf https://github.com/griot-cloud/peql/releases/latest/download/install.sh | sh
+curl -LsSf https://github.com/griot-cloud/parcel/releases/latest/download/install.sh | sh   # optional: authoring and checks
 ```
+
+On Windows, in PowerShell:
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/griot-cloud/peql/releases/latest/download/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://github.com/griot-cloud/parcel/releases/latest/download/install.ps1 | iex"
+```
+
+The installers check the download's sha256; `PEQL_VERSION` picks a release and
+`PEQL_INSTALL_DIR` the destination. Every [release](https://github.com/griot-cloud/peql/releases)
+carries the binaries for Linux (x86_64, arm64), macOS (Apple silicon, Intel) and Windows (x64).
+To build from source instead (Rust 1.94 or newer):
+`cargo install --git https://github.com/griot-cloud/peql peql`.
 
 Then, from a clone of the repository:
 

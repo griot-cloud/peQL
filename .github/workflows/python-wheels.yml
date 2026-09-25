@@ -1,79 +1,259 @@
-name: python-wheels
+name: release
 
-# Build and publish pip-installable wheels. Release tags publish through PyPI
-# Trusted Publishing; manual runs build and test artifacts only.
+# The release path, after griot-cloud/moruna. Nobody creates a tag: a version in
+# Cargo.toml that has no tag yet, landed on main with CI green, is the release. The `peql`
+# binary and the Python wheels are built and run on every platform we ship, the wheels go
+# to PyPI through Trusted Publishing, and only then is v<version> tagged, with the binaries,
+# their checksums and the installers attached. A tag always marks something that shipped;
+# pushing one by hand triggers nothing.
+#
+# peQL's main takes direct pushes as well as pull requests, so unlike moruna the release
+# waits for the CI workflow to pass on the pushed commit rather than trusting the PR run.
+# This file keeps its name because PyPI's trusted publisher for `peql` is bound to it.
+#
+# A manual run builds and smoke-tests the distributions and publishes nothing.
 on:
-  push:
-    tags: ["v*"]
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
   workflow_dispatch:
 
-defaults:
-  run:
-    working-directory: bindings/python
+permissions:
+  contents: read
+
+concurrency:
+  # A superseded release is a half-published one: never cancel.
+  group: release
+  cancel-in-progress: false
+
+env:
+  # The commit CI tested, or the dispatched ref.
+  SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+  CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
-  wheels:
-    name: wheels (${{ matrix.os }})
+  version:
+    name: a version to release
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.check.outputs.release }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+          # The tags, because their absence is the question this job answers.
+          fetch-depth: 0
+      - id: check
+        name: Is the version in Cargo.toml already released?
+        run: |
+          read_version() { awk -v s="$2" '$0 == s {f=1; next} /^\[/{f=0} f && /^version = /{gsub(/"/,"",$3); print $3; exit}' "$1"; }
+          version="$(read_version Cargo.toml '[package]')"
+          if [ -z "$version" ]; then
+            echo "no version under [package] in Cargo.toml" >&2
+            exit 1
+          fi
+          # The wheel is built from bindings/python; every version it carries must agree.
+          py="$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' bindings/python/python/peql/__init__.py)"
+          for pair in \
+            "bindings/python/Cargo.toml=$(read_version bindings/python/Cargo.toml '[package]')" \
+            "bindings/python/pyproject.toml=$(read_version bindings/python/pyproject.toml '[project]')" \
+            "peql.__version__=$py"; do
+            if [ "${pair#*=}" != "$version" ]; then
+              echo "${pair%%=*} says '${pair#*=}', Cargo.toml says $version" >&2
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" != "workflow_run" ]; then
+            echo "manual run: build and test only"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          elif git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "v$version is tagged already, so this commit is not a release"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "v$version has no tag, so this commit releases it"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  binaries:
+    name: peql (${{ matrix.target }})
+    needs: version
+    if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
     strategy:
-      fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        include:
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, native: true }
+          - { os: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, native: true }
+          - { os: macos-14, target: aarch64-apple-darwin, native: true }
+          - { os: macos-14, target: x86_64-apple-darwin, native: false }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, native: true }
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build
+        run: cargo build --release --locked --bin peql --target ${{ matrix.target }}
+      - name: The binary runs before it is published
+        if: matrix.native
+        run: |
+          exe="$PWD/target/${{ matrix.target }}/release/peql"
+          "$exe" --version
+          if [ "$RUNNER_OS" != Windows ]; then PEQL="$exe" examples/run-all.sh; fi
+      - name: Package
+        run: |
+          name=peql-${{ matrix.target }}
+          mkdir -p "dist/$name"
+          cp LICENSE README.md "dist/$name/"
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp target/${{ matrix.target }}/release/peql.exe "dist/$name/"
+            (cd dist && 7z a -tzip "$name.zip" "$name" >/dev/null && sha256sum "$name.zip" > "$name.zip.sha256")
+          else
+            cp target/${{ matrix.target }}/release/peql "dist/$name/"
+            (cd dist && tar -czf "$name.tar.gz" "$name" && shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256")
+          fi
+          rm -rf "dist/$name"
+          ls -la dist
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: bin-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  wheels:
+    name: wheel (${{ matrix.os }} ${{ matrix.target }})
+    needs: version
+    if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64, native: true }
+          - { os: ubuntu-latest, target: aarch64, native: false }
+          - { os: macos-14, target: aarch64, native: true }
+          - { os: macos-14, target: x86_64, native: false }
+          - { os: windows-latest, target: x64, native: true }
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
-
-      - name: Build wheels (abi3 — one wheel per platform covers Python ≥ 3.9)
+      - name: Build the wheel (abi3, one per platform covers Python >= 3.9)
         uses: PyO3/maturin-action@v1
         with:
           working-directory: bindings/python
+          target: ${{ matrix.target }}
           command: build
-          args: --release --out dist
+          args: --release --locked --out dist
           manylinux: auto
-
-      - name: Smoke-test the wheel
+      - name: The wheel installs and runs before it is published
+        if: matrix.native
         shell: bash
+        working-directory: bindings/python
         run: |
           python -m pip install --upgrade pip pyarrow pytest
           python -m pip install --no-index --find-links dist peql
-          python -m pytest -q
-
-      - uses: actions/upload-artifact@v4
+          python -c "import peql; print('peql', peql.__version__)"
+          # From outside the tree, so the source package cannot shadow the installed wheel.
+          cp -R tests "$RUNNER_TEMP/peql-tests"
+          cd "$RUNNER_TEMP" && python -m pytest -q peql-tests
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: wheels-${{ matrix.os }}
+          name: dist-${{ matrix.os }}-${{ matrix.target }}
           path: bindings/python/dist/*.whl
+          if-no-files-found: error
 
   sdist:
     name: sdist
+    needs: version
+    if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
       - uses: PyO3/maturin-action@v1
         with:
           working-directory: bindings/python
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: sdist
+          name: dist-sdist
           path: bindings/python/dist/*.tar.gz
+          if-no-files-found: error
 
-  publish:
-    name: publish to PyPI
-    needs: [wheels, sdist]
-    if: startsWith(github.ref, 'refs/tags/v')
+  release:
+    name: publish to PyPI and tag
+    needs: [version, binaries, wheels, sdist]
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
       url: https://pypi.org/p/peql
     permissions:
+      # Trusted Publishing's OpenID Connect token (no PyPI token in this repository),
+      # and write access for the tag below.
       id-token: write
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          path: dist
+          ref: ${{ env.SHA }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: dist-*
           merge-multiple: true
-      - name: Publish tested distributions
-        uses: pypa/gh-action-pypi-publish@release/v1
+          path: dist
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: bin-*
+          merge-multiple: true
+          path: bin
+      - name: Everything that was built is here
+        run: ls -la dist bin
+      - name: Publish
+        uses: pypa/gh-action-pypi-publish@ed0c53931b1dc9bd32cbe73a98c7f6766f8a527e # v1.14.0
+        with:
+          packages-dir: dist
+          skip-existing: true
+      - name: Tag what was published, with the binaries and installers attached
+        # After the upload, never before: a tag made first survives a failed publish
+        # and names a release that does not exist.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          # Headings read "## [0.4.0]: title" or "## 0.4.0"; take that section's body.
+          notes="$(awk -v v="$VERSION" '/^## /{ if (f) exit; h=$2; gsub(/[\[\]:]/,"",h); if (h == v) {f=1; next} } f' CHANGELOG.md)"
+          install="$(cat <<EOF
+
+
+          ## Install
+
+          Linux and macOS: \`curl -LsSf https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.sh | sh\`
+
+          Windows: \`powershell -ExecutionPolicy ByPass -c "irm https://github.com/$GITHUB_REPOSITORY/releases/latest/download/install.ps1 | iex"\`
+
+          Python: \`pip install peql\`. Or download the archive for your platform below and check it against its \`.sha256\`.
+          EOF
+          )"
+          gh release create "v$VERSION" \
+            --target "$SHA" \
+            --title "$VERSION" \
+            --notes "${notes:-See CHANGELOG.md}$install" \
+            bin/* install.sh install.ps1
