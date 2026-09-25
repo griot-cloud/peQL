@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
 
 jobs:
   engine:
@@ -14,6 +15,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Access to parcel (only needed while griot-cloud/parcel is private)
+        env:
+          TOKEN: ${{ secrets.PARCEL_READ_TOKEN }}
+        if: env.TOKEN != ''
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/griot-cloud/parcel".insteadOf "https://github.com/griot-cloud/parcel"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -32,6 +38,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Access to parcel (only needed while griot-cloud/parcel is private)
+        env:
+          TOKEN: ${{ secrets.PARCEL_READ_TOKEN }}
+        if: env.TOKEN != ''
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/griot-cloud/parcel".insteadOf "https://github.com/griot-cloud/parcel"
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -49,6 +60,11 @@ jobs:
         working-directory: bindings/python
     steps:
       - uses: actions/checkout@v4
+      - name: Access to parcel (only needed while griot-cloud/parcel is private)
+        env:
+          TOKEN: ${{ secrets.PARCEL_READ_TOKEN }}
+        if: env.TOKEN != ''
+        run: git config --global url."https://x-access-token:${TOKEN}@github.com/griot-cloud/parcel".insteadOf "https://github.com/griot-cloud/parcel"
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-python@v5
         with:
