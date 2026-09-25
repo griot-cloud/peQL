@@ -467,7 +467,7 @@ impl Engine {
                 .bloom_filter_enabled = Some(true);
         }
         df.write_parquet(
-            &format!("{}/", root.canonicalize()?.display()),
+            &crate::binding::local_url(&root, true)?,
             options,
             Some(parquet),
         )

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Run every example workspace from a clean state. Exits non-zero on the first failure.
 #   PEQL=path/to/peql examples/run-all.sh
+# Set PARCEL=path/to/parcel to also run the parcel handoff. It is opt-in rather than found on
+# PATH, because other programs are called `parcel` too (the JavaScript bundler, for one).
 set -euo pipefail
 P=${PEQL:-peql}
 here=$(cd "$(dirname "$0")" && pwd)
@@ -34,18 +36,18 @@ done
 "$P" query 'SELECT meter AS county, COUNT(*) AS tokens FROM "kplc/tokens" GROUP BY meter ORDER BY county' --caller callers/kisumu-analyst.yaml
 
 echo "== handoff: parcel compiles, peql runs"
-if command -v "${PARCEL:-parcel}" >/dev/null 2>&1; then
+if [ -n "${PARCEL:-}" ]; then
   cd "$here/quickstart"
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
-  "${PARCEL:-parcel}" check contracts/orders.yaml --data incoming/orders.csv --type msisdn=utf8 --json > "$work/check.json"
-  "${PARCEL:-parcel}" compile contracts/orders.yaml --schema incoming/orders.csv --type msisdn=utf8 -o "$work/orders.parcel.json" > /dev/null
+  "$PARCEL" check contracts/orders.yaml --data incoming/orders.csv --type msisdn=utf8 --json > "$work/check.json"
+  "$PARCEL" compile contracts/orders.yaml --schema incoming/orders.csv --type msisdn=utf8 -o "$work/orders.parcel.json" > /dev/null
   "$P" --root "$work" register "$work/orders.parcel.json"
   mkdir -p "$work/data" && cp -r data/orders "$work/data/"
   "$P" --root "$work" publish sales/orders --to globex
   "$P" --root "$work" query 'SELECT COUNT(*) AS n FROM "sales/orders"' --caller callers/globex-analyst.yaml
 else
-  echo "(parcel not on PATH; skipped)"
+  echo "(PARCEL not set; skipped)"
 fi
 
 echo "== all examples passed"

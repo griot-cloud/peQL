@@ -94,6 +94,24 @@ pub fn file_schema(contract: &CompiledContract, stored: bool) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+/// `path`, canonical, as the string DataFusion parses into a listing URL; `dir` marks a
+/// directory with a trailing separator. On Windows `canonicalize` returns the verbatim form
+/// (`\\?\D:\data`), which DataFusion does not read as a local path, so the prefix is removed.
+pub fn local_url(path: &Path, dir: bool) -> Result<String> {
+    let canonical = path.canonicalize()?;
+    let mut s = canonical.display().to_string();
+    if cfg!(windows)
+        && let Some(rest) = s.strip_prefix(r"\\?\")
+        && !rest.starts_with(r"UNC\")
+    {
+        s = rest.to_string();
+    }
+    if dir && !s.ends_with(std::path::MAIN_SEPARATOR) {
+        s.push(std::path::MAIN_SEPARATOR);
+    }
+    Ok(s)
+}
+
 /// A listing table over every Parquet file under `root`. A single-file binding
 /// (`binding: {parquet: data/orders.parquet}`) reads that file with the raw row schema.
 pub fn listing_table(
@@ -103,14 +121,14 @@ pub fn listing_table(
 ) -> Result<Arc<dyn TableProvider>> {
     let format = Arc::new(ParquetFormat::default().with_enable_pruning(true));
     if root.is_file() {
-        let url = ListingTableUrl::parse(root.canonicalize()?.display().to_string())?;
+        let url = ListingTableUrl::parse(local_url(root, false)?)?;
         let config = ListingTableConfig::new(url)
             .with_listing_options(ListingOptions::new(format).with_file_extension(".parquet"))
             .with_schema(contract.row_schema.clone());
         return Ok(Arc::new(ListingTable::try_new(config)?));
     }
     std::fs::create_dir_all(root)?;
-    let url = ListingTableUrl::parse(format!("{}/", root.canonicalize()?.display()))?;
+    let url = ListingTableUrl::parse(local_url(root, true)?)?;
     let partition_cols: Vec<(String, DataType)> = contract
         .binding
         .partitioned_by

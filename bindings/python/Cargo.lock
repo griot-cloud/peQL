@@ -2792,6 +2792,7 @@ dependencies = [
  "datafusion",
  "futures",
  "hex",
+ "libc",
  "lru",
  "parcel-core",
  "parcel-runtime",
