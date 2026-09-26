@@ -2,7 +2,7 @@
 
 peQL is the runtime for [parcel](https://github.com/griot-cloud/parcel) contracts. A change to
 what a rule means belongs in parcel; a change to how contracts are stored, written, planned or
-served belongs here. See [parcel and peQL](docs/parcel-and-peql.md).
+served belongs here. See [How it works](docs/execution.md#what-parcel-does).
 
 ## Setup
 
@@ -28,7 +28,8 @@ parcel-runtime = { path = "../parcel/crates/parcel-runtime" }
 cargo fmt --all --check
 cargo clippy --all-targets --features platform -- -D warnings
 cargo test --features platform
-cargo build --bin peql && PEQL=target/debug/peql examples/run-all.sh
+cargo build --bin peql
+PEQL="$PWD/target/debug/peql" examples/run-all.sh
 ```
 
 - The default build needs no `protoc` and no platform service.

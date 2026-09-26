@@ -1,83 +1,85 @@
-# How it works
+# Concepts
 
-## Contracts are the only tables
+peQL allows you to define a **data contract** that comprises the data quality rules and access policies for a dataset. The contract says where the data lives, which columns can be queried, and which rules peQL must apply.
 
-Every name in a `FROM` clause is a contract. The contract's binding (where its files live) never
-appears to a caller, in results or in errors. A contract the caller's tenant may not see
-behaves exactly like one that does not exist, so a caller cannot probe for names.
+## What is a data contract?
 
-A contract is visible to a caller when it has no owner, when the caller's tenant owns it, or
-when the owner published it to that tenant or to `public`.
+Acme wants to share order data with its suppliers. Its staff need to see all orders, while each supplier should see only orders assigned to them. Orders with zero or negative amounts should be excluded from everyone's results.
 
-## A query, step by step
+This contract expresses those requirements:
 
-1. **Guard.** The SQL is parsed. Anything but exactly one query is refused: DDL, DML, `COPY`,
-   `SET`, `EXPLAIN`, `INSTALL`, `LOAD`, `ATTACH`, a second statement. The planned query is checked
-   again. Comments and string literals cannot hide a statement, because the check reads the
-   parsed statement.
-2. **Resolve.** For each contract the query names, peQL runs its `decide` rules against the
-   caller (parcel-runtime's CEL interpreter). It then reads the dataset's manifest and runs
-   `guarantee` rules against the stored statistics; a failing `deny` guarantee refuses the query,
-   an `annotate` one is noted in the envelope. It also works out which shape rules apply.
-3. **Build the view.** The view is ordinary DataFusion: a scan of the binding, a filter made of
-   the contract's `admit` rules and drop-level `assert` flags, and a projection of the exposed
-   columns with their `transform` rules. Caller context is bound as literals, so a rule that
-   does not apply to this caller folds away. A `Gate` node goes on top.
-4. **Plan.** The caller's SQL is planned over the views. `suppress` and aggregate `noise` are
-   applied to the caller's aggregates (parcel_runtime::shape), and their budget charges are paid.
-5. **Execute.** The engine refuses any physical plan in which a scan of contract data is not
-   under that contract's gate. The rest is DataFusion.
-6. **Envelope and audit.** The caller gets the rows and an envelope: what each contract decided,
-   which shapes applied, budget left, what the scan read, and hashes of the query and the result.
-   One audit record is written, answered or refused.
+```yaml
+contract: purchasing/orders
+version: 1
+owner: acme
+binding:
+  parquet: data/orders/
+expose:
+  - {name: order_id, type: int64}
+  - {name: amount, type: int64}
+rules:
+  - id: supplier_orders
+    op: admit
+    expr: ctx.tenant == 'acme' || row.supplier_id == ctx.tenant
 
-Everything a rule means was decided by parcel when the contract was compiled. peQL binds the
-caller, finds the data, and runs what parcel compiled.
+  - id: positive_amount
+    op: assert
+    expr: row.amount > 0
+    on_fail: drop
+```
 
-## The gate is a barrier
+The underlying data has `order_id`, `supplier_id` and `amount` columns. The first rule lets Acme see all orders and suppliers see their assigned orders. The second excludes non-positive amounts from both groups. Queries can return only `order_id` and `amount`; `supplier_id` is used by the rule but is not exposed to SQL.
 
-The optimiser pushes the contract's filter into the Parquet scan, so partitions and row groups
-the contract excludes are never read. A caller's own predicates are pushed too, but only when
-they cannot fail: comparisons, boolean logic, `IN` lists, `IS NULL`, `LIKE`. A predicate that can
-raise an error, such as `100 / (id - 3) > 0`, stays above the gate. Otherwise it could fail on a
-row the contract hides, and the error would reveal that the row exists.
+Contracts are written in **parcel**, which uses YAML or JSON for the document and CEL expressions for its rules. For contract structure, rule types, expressions and namespaces, see the [parcel documentation](https://griot-cloud.github.io/parcel/). peQL uses parcel's libraries, so a separate parcel installation is not required.
 
-Transforms are projections: a masked column the query does not read is never computed.
+## Workspaces and registration
 
-## Stored flags, or live rules
+A **workspace** is the directory peQL operates in. It contains registered contracts and engine state under `_peql/`. Relative data paths, such as `data/orders/`, are resolved from that directory. The CLI uses your current directory unless you select another with `--root`.
 
-When peQL writes data under a contract, it stores a boolean column per assertion and a column
-for each row-only subtree parcel chose to precompute. Views read those columns instead of
-evaluating the rules, as long as every file was written under the current contract hash. Files
-written under another contract, or not by peQL at all, are read with every rule evaluated live.
-The results are the same either way.
+**Registration** makes a contract available to the engine. peQL checks its rules against the data's column names and types and stores the compiled result. You can register a contract document or a compiled parcel bundle. Registration alone does not copy or write the dataset.
 
-## Shapes
+The contract's name is what queries use in SQL. Its data can come from local Parquet or, in a Rust application, a table supplied by the application.
 
-| Shape | Where it runs | Effect |
-| --- | --- | --- |
-| `sample` | in the view's filter | A stable fraction of rows keyed on a column; repeated queries see the same rows. |
-| `noise` at `row` | in the view's projection | Laplace noise on each value of the column. |
-| `noise` at `aggregate` | on the caller's aggregates | Noise on each aggregate over the column; the column cannot be read otherwise or grouped by. |
-| `suppress` | on the caller's aggregates | Groups under `k` rows are removed from every aggregate, including `UNION` branches and subqueries. A query without `GROUP BY` is one group. |
+## Callers and sharing
 
-Each `unless` is evaluated per caller. Noise charges its named budget once per query, and only
-when the query reads the noised column; a spent budget refuses the query. Budgets are kept per
-caller and survive restarts in a workspace.
+A **caller** is the user, agent or service making a query. peQL receives its identity and attributes, such as tenant, roles and purpose, alongside the SQL. Your application authenticates the caller and supplies those values.
 
-## The write path
+A **tenant** identifies an organisation or group. In this example, `acme` is the company and `globex` is one of its suppliers.
 
-`write` runs parcel's write plan: enrich (`row.other` fields, including tenant WebAssembly
-functions), compute flags and precomputed columns, cluster by the flags queries filter on,
-partition by the binding's partition columns, enable bloom filters where the contract compares
-columns with caller context, stamp the contract hash into each Parquet file, run the validation
-plan, and write the manifest. A deny-level assertion that fails marks the data as not servable
-until it is fixed.
+An owned contract must be shared with another tenant before that tenant can discover it. Once the example contract is registered, an operator can share it with Globex:
 
-## The result cache
+```text
+peql publish purchasing/orders --to globex
+```
 
-With `Engine::with_cache`, answers are cached under a key that covers the SQL and, for each
-contract, its compilation hash, the caller's bound context, the shapes that apply, and the data
-hash. Two callers share an answer only when the contracts would give them the same one; a write
-or a new contract version never serves a stale answer. A cached answer with noise is served as
-it was: seeing the same noisy answer twice spends no more privacy.
+Sharing makes the contract visible; its rules still control the results. Acme's access to all orders comes from the explicit rule in this example, not automatically from owning the contract.
+
+## Queries
+
+Once data is available, Globex can query it:
+
+```bash
+peql query 'SELECT order_id, amount FROM "purchasing/orders"' --id supplier-analyst --tenant globex
+```
+
+The SQL has no supplier filter or amount check. peQL applies both from the contract. Running the same SQL as `acme` returns positive-amount orders across suppliers.
+
+Queries can select, join and aggregate the columns exposed by registered contracts. The rules still apply when the SQL changes. If a caller or dataset fails a rule that requires refusal, peQL returns an error instead of rows.
+
+## Writes and validation
+
+**Writing** saves data under a contract. The CLI reads CSV or Parquet and writes Parquet files. peQL also computes reusable rule calculations and validates the stored dataset.
+
+**Validation** produces a verdict: which checks failed, how many rows failed, and whether the dataset can be queried. In the example, an invalid amount excludes that row from results without deleting it from storage. A contract can instead require a failure to block queries to the entire dataset.
+
+A write can store data that fails validation. Inspect the write report to see whether it can be queried. peQL saves validation results and dataset statistics in a **manifest**, which later queries use to check dataset requirements.
+
+You can also register a contract over existing Parquet without rewriting it. See {doc}`USAGE` for that workflow and how to keep validation results current.
+
+## Results and audit records
+
+A successful query returns rows. It also produces an **envelope** describing the contracts applied, row counts, scan statistics and any privacy budget charged. The CLI shows it with `--envelope`; Python and Rust applications can read it alongside the data.
+
+The **audit log** records query attempts, including refusals and failures. Persistent workspaces store it in `_peql/audit.jsonl`.
+
+Continue to the {doc}`quickstart` for a complete working example, or {doc}`execution` for how peQL applies rules during execution.
