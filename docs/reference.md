@@ -1,65 +1,140 @@
 # Reference
 
-The Rust crate and the Python package are both named `peql`, version 0.4.0.
+Use this page to look up commands, caller fields, result metadata and common failures. For complete examples, see {doc}`quickstart`, {doc}`python` and {doc}`rust`.
 
-## Engine
+## Commands
 
-| Method | Does |
+```text
+peql [--root DIR] COMMAND
+```
+
+`--root` selects the workspace and defaults to the current directory. Use `peql COMMAND --help` for all options on a command.
+
+| Command | Purpose |
 | --- | --- |
-| `Engine::open(root)`, `Engine::in_memory(base)` | A workspace on disk, or in memory. |
-| `register_contract(source, &schema)` | Compile a parcel document against the data's schema and store it. |
-| `register_bundle(&bundle)` | Store a bundle after recompiling it to the same hash. |
-| `register_function(module, &manifest, owner)` | Verify and store a tenant's WebAssembly function. |
-| `publish(name, audience)`, `unpublish` | Share with a tenant, or `public`. |
-| `write(name, batches, mode)` | The write path; returns a `WriteReport` with the verdict. |
-| `bind_table(name, provider)`, `bind_batches(name, batches)` | Serve a contract from data you hold. |
-| `validate(name)`, `validate_with(name, plan)` | The verdict and data hash; `validate_with` runs a plan from a bundle. |
-| `query(sql, &caller)` | `QueryResult { schema, batches, envelope, signature }`; `signature` is the signer's JWS when the engine has one. |
-| `check(sql, &caller)` | Every check `query` makes, without reading a row: the answer's schema and the resolutions, or the refusal. |
-| `authorize_write(name, &caller)` | Whether a caller may write: the contract's owner tenant may. |
-| `explain(sql, &caller)` | The physical plan (operators only; callers cannot `EXPLAIN`). |
-| `describe(name, &caller)` | The schema a caller would see. |
-| `resolve`, `view`, `session` | The resolver, and the gated plan an out-of-core executor reads: plan `view` in `session()` and refuse the physical plan unless `gate::ensure_gated` accepts it. Shapes apply to queries over a view, not to the view. |
-| `with_bindings`, `with_signer`, `with_cache`, `with_store`, `with_budgets`, `with_audit` | Replace a part: where bindings resolve, who signs envelopes, and so on. |
-| `get`, `contracts`, `list_for(&caller)`, `manifest(name)` | Inspect the store. |
+| `register FILE --schema SAMPLE` | Register a YAML/JSON contract against a CSV or Parquet sample. |
+| `register BUNDLE` | Register a parcel bundle; no schema argument needed. |
+| `write NAME_OR_FILE --input FILE` | Write CSV/Parquet under a contract; replaces existing data by default. |
+| `validate NAME` | Print the validation verdict as JSON. |
+| `query SQL` | Execute one read-only SQL query. |
+| `describe NAME` | Show the columns exposed to a caller. |
+| `list` | Show registered contracts, publication and data status for the operator. |
+| `publish NAME --to TENANT` | Share contract visibility; use `public` for every tenant. |
+| `budget NAME --limit EPSILON` | Set a named privacy budget's limit per caller. |
+| `function register MODULE --manifest FILE --owner TENANT` | Register a parcel WebAssembly function. |
+| `function list` | List registered functions. |
 
-## Errors
+### Write and registration options
 
-`PeqlError`: `Compile`, `UnknownContract` (also for contracts the caller cannot see), `Denied`,
-`NotWritten`, `NotServable`, `GuaranteeFailed`, `BudgetExhausted`, `Refused` (a statement that
-is not a query), `Ungated`, `Signing` (a signer is configured and did not sign), `Invalid`,
-`DataFusion`, `Io`. `is_refusal()` separates policy
-outcomes from failures.
+- `--append` on `write` adds records instead of replacing data.
+- `--type COLUMN=TYPE` on `register` or `write` overrides CSV type inference. Repeat it for multiple columns.
+- `--revoke` on `publish` withdraws the specified audience.
 
-## Envelope
+### Query options
 
-| Field | Holds |
+| Option | Effect |
 | --- | --- |
-| `caller` | Who asked: id, tenant, purpose. |
-| `contracts` | Per contract: name, version, contract and compilation hashes, decisions that ran, annotated guarantees, shapes applied, whether stored flags were read. |
-| `rows` | Rows returned. |
-| `suppress_k` | The suppression threshold applied. |
-| `charges` | Epsilon charged, per budget. |
-| `budgets` | Budget left per budget charged. |
-| `scan` | Rows scanned and released, bytes read, files and row groups pruned. |
-| `attestation` | sha256 of the query and of the result (Arrow IPC), and the time. |
-| `audit_id`, `cached` | The audit record, and whether the answer came from the cache. |
+| `--format table` | Human-readable table; the default. |
+| `--format json` | One JSON object per row. |
+| `--format arrow` | Arrow IPC file. |
+| `--format parquet` | Parquet file. |
+| `--out PATH` | Write results to a file instead of standard output. |
+| `--envelope` | Print query metadata as JSON to standard error. |
+| `--explain` | Show the physical plan without executing it; intended for operators. |
 
-## Bindings
+SQL `EXPLAIN` is refused through the ordinary query interface. `--explain` is a separate operator action and can expose implementation details.
 
-| Resolver | Reads and writes |
+### Caller options
+
+`query` and `describe` accept `--caller FILE` for a YAML caller document. Explicit flags override file values.
+
+| Flag | Context supplied |
 | --- | --- |
-| `LocalParquet { base }` | Directories on the local filesystem; relative bindings resolve under `base`. The default. |
-| `ObjectStoreParquet::new("s3://bucket/prefix/", store)` | A prefix in an object store. Bindings that are URLs must name that bucket; relative ones resolve under the prefix. Manifests are kept at `<binding>/_peql/manifests/`. `s3_from_env` builds the S3 store from `AWS_*` variables (feature `s3`). |
+| `--id` | Caller ID. |
+| `--tenant` | Organisation or tenant name. |
+| `--purpose` | Purpose of the query. |
+| `--role` | Role; repeat for several roles. Supplied roles replace the file's role list. |
+| `--clearance` | Integer clearance level. |
+| `--tier` | Tier name. |
+| `--classification` | Classification name. |
+| `--now` | Query time in RFC 3339 format; defaults to the current time. |
 
-## Cargo features
+Without a caller file or overrides, the CLI uses ID `cli`, an empty tenant and an empty purpose. Contracts that require specific values may refuse that caller.
 
-| Feature | Default | Adds |
-| --- | --- | --- |
-| `flight` | off | Flight SQL over tonic on a listener you supply ({doc}`platform`). |
-| `signed-bundle` | off | Verification of bundles signed with ECDSA P-256 by their issuer. |
-| `s3` | off | The S3 store for `ObjectStoreParquet`. Other `object_store` stores work without it. |
-| `lance` | off | Lance datasets from a path or URI. Building needs `protoc`. |
+### Exit codes
 
-`SocketSigner`, the envelope signer over a Unix socket, TCP or any stream you connect, is always
-built.
+| Code | Meaning |
+| --- | --- |
+| `0` | The command succeeded; writes and validation passed deny-level checks. |
+| `1` | Query or describe refusal, or a write/validation verdict marking data unservable. |
+| `2` | Other errors, such as invalid arguments, compilation, missing data or execution failures. |
+
+## SQL behaviour
+
+peQL uses DataFusion SQL and accepts one query at a time. Select from a registered contract by name, quoting names containing `/`, for example `"sales/orders"`.
+
+Joins, aggregates and subqueries operate over the exposed contract views. DDL, DML, `COPY`, `SET`, SQL `EXPLAIN` and multiple statements are refused. Catalog/schema-qualified table references are not contract names; use the whole contract name as one quoted identifier.
+
+## Validation and write reports
+
+A write report contains `rows_written`, `files` and `verdict`. `files` counts the dataset's files after the write, including earlier files when appending.
+
+The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`, `stats` and `data_hash`. `failures` maps assertion IDs to failing-row counts. `valid` can be true when drop-level or report-only checks fail.
+
+## Query envelope
+
+| Field | Meaning |
+| --- | --- |
+| `caller` | The caller's id, tenant and purpose, as the engine was told them. |
+| `contracts` | Names, versions, hashes, decision rules, annotations, active result rules and use of stored calculations. |
+| `rows` | Number of returned rows. |
+| `suppress_k` | Active minimum group size, if any. |
+| `charges` | Epsilon this query charged, per budget. |
+| `budgets` | Remaining amounts for budgets charged by this query. An empty map is not a full ledger balance. |
+| `scan` | Scan/release row counts, scanned Arrow bytes, file bytes read and pruning counters. |
+| `attestation` | Query and result SHA-256 hashes plus a timestamp; not a signature. With a signer configured, `QueryResult::signature` carries the signed envelope. |
+| `audit_id` | Identifier of the corresponding audit entry. |
+| `cached` | Whether stored result batches were returned. |
+
+## Common errors
+
+| Error | What to check |
+| --- | --- |
+| `Compile` | Contract syntax, expressions, column names and types. |
+| `UnknownContract` | Registration and publication to the caller's tenant. An invisible contract has the same error as an absent one. |
+| `Denied` | The named caller-level rule and supplied context. |
+| `NotWritten` | Whether the contract has data and a validation manifest. |
+| `NotServable` | The dataset's deny-level failures; correct and rewrite the data. |
+| `GuaranteeFailed` | The named dataset requirement, such as freshness or a missing-value limit. |
+| `BudgetExhausted` | Spending and the limit for that caller's named budget. |
+| `Refused` | Whether the SQL is a single supported read-only query. |
+| `Invalid`, `DataFusion`, `Io` | The accompanying message: input, planning, execution or storage failed. |
+| `Signing` | The configured envelope signer: it refused or did not answer, so the query returns nothing. |
+| `Ungated` | A contract scan is missing its required execution gate; report this as an engine/integration issue. |
+
+In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotServable`, `GuaranteeFailed`, `BudgetExhausted` and `Refused`. `NotWritten` is a separate failure. Python maps the refusal group to `peql.Refused`.
+
+## Workspace files
+
+| Location | Contents |
+| --- | --- |
+| `<root>/_peql/contracts/` | Versioned parcel bundles and publication records. |
+| `<root>/_peql/functions/` | Registered WebAssembly modules and metadata. |
+| `<root>/_peql/budgets.json` | Budget limits and spending. |
+| `<root>/_peql/audit.jsonl` | Query-attempt records, one JSON object per line. |
+| `<binding>/_peql/manifests/` | Per-contract dataset manifests beside the bound data. |
+
+Keep the workspace state and dataset files together when moving or backing up a workspace. Single-file Parquet bindings can be read; peQL's write path requires a directory binding.
+
+## Build features
+
+The default Rust build has no optional features enabled. `flight` adds the Flight SQL service, `signed-bundle` verification of signed bundles, and `s3` the S3 store for object-store bindings. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build.
+
+See {doc}`platform` for integration behaviour.
+
+```{toctree}
+:hidden:
+
+contributing
+changelog
+```

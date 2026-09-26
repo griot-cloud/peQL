@@ -1,140 +1,40 @@
+---
+layout: landing
+content_max_width: 68rem
+---
+
+<div class="peql-home">
+
 <div class="peql-hero-logo" role="img" aria-label="peQL logo"></div>
 
-# Documentation
+# peQL
 
-peQL is a query engine where every table is a data contract. Contracts are written in
-[parcel](https://griot-cloud.github.io/parcel/); peQL stores them, writes data under them, and
-answers SQL through them. Each caller gets exactly what the contract allows, enforced inside
-the query plan.
+<p class="home-lead">Policy Enforcing Query Engine (peQL) is a SQL query engine that lets you define different data rules and data access policies for users, agents and services, and enforces those rules whenever they query your data.</p>
 
-## The query path
+<section class="home-usecases" aria-labelledby="usecases-title">
+  <h2 id="usecases-title" class="home-section-title">Use cases</h2>
+  <div class="home-usecase"><h3>Share data with customers and partners</h3><p>Let each customer query their own records from a shared dataset. Mask personal details for partners while allowing authorised staff to see them.</p></div>
+  <div class="home-usecase"><h3>Set limits on what agents can query</h3><p>Give an agent access to the rows and columns its task requires. peQL applies those limits to the SQL it submits.</p></div>
+  <div class="home-usecase"><h3>Keep failed quality checks out of reports</h3><p>Exclude rows that fail required checks, or refuse queries when a dataset fails a quality or freshness requirement.</p></div>
+  <div class="home-usecase"><h3>Share statistics with privacy rules</h3><p>Suppress results for small groups, add noise to aggregates and limit repeated queries with a privacy budget.</p></div>
+</section>
 
-A partner asks for the average salary. The contract adds noise to each salary before anything
-is computed, because the caller is not the owner.
-
-<figure class="query-diagram" aria-label="A salary query and a parcel contract enter peQL. The engine reads payroll data through the contract's view, which adds noise to salaries, then computes and returns the average.">
-  <div class="query-inputs">
-    <div class="query-box">
-      <strong>SQL</strong>
-      <pre>SELECT AVG(salary) AS avg_salary
-FROM "hr/payroll";</pre>
-    </div>
-    <div class="query-box">
-      <strong>Contract (parcel)</strong>
-      <pre>- op: shape
-  operator: noise
-  column: salary
-  params: {sensitivity: 1000,
-           epsilon: 1, at: row}
-  unless: ctx.tenant == 'hr'</pre>
-    </div>
-  </div>
-  <div class="query-join" aria-hidden="true"></div>
-  <div class="query-engine">
-    <strong>peQL</strong>
-    <span>Runs the contract's view inside the plan</span>
-    <div class="query-execution">
-      <div class="query-source">
-        <strong>Source dataset</strong>
-        <span>hr/payroll</span>
-        <pre>salary
- 60,000
- 80,000
-100,000</pre>
-      </div>
-      <div class="query-data-arrow" aria-hidden="true">→</div>
-      <div class="query-steps">
-        <div class="query-step">Read salaries</div>
-        <div class="query-step-arrow" aria-hidden="true">↓</div>
-        <div class="query-step query-noise">Add noise<span>The contract's projection, for this caller</span></div>
-        <div class="query-step-arrow" aria-hidden="true">↓</div>
-        <div class="query-step">Compute average</div>
-      </div>
-    </div>
-  </div>
-  <div class="query-arrow" aria-hidden="true">↓</div>
-  <div class="query-box query-result">
-    <strong>Result</strong>
-    <pre>avg_salary
-79,842.67</pre>
-  </div>
-  <figcaption>Illustrative result for a non-owner; noise varies each run, and each run spends privacy budget.</figcaption>
-</figure>
-
-::::{grid} 1 2 2 2
-:gutter: 3
-
-:::{grid-item-card} Quickstart
-:link: getting-started
-:link-type: doc
-
-Write data under a contract and query it as three callers.
-:::
-
-:::{grid-item-card} Use peQL
-:link: USAGE
-:link-type: doc
-
-The command line, the Rust API, and Python.
-:::
-
-:::{grid-item-card} How it works
-:link: concepts
-:link-type: doc
-
-Views, the gate, shapes, and the write path.
-:::
-
-:::{grid-item-card} parcel and peQL
-:link: parcel-and-peql
-:link-type: doc
-
-What each project does, and the bundle that passes between them.
-:::
-::::
+<h2 class="home-section-title">Documentation</h2>
+<nav class="home-cards" aria-label="Documentation sections">
+  <a class="home-card" href="getting-started.html"><span class="card-number">01</span><h3>Getting started</h3><p>Learn the concepts, then run your first queries.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
+  <a class="home-card" href="USAGE.html"><span class="card-number">02</span><h3>Using peQL</h3><p>Work with the command line, or use peQL in Python and Rust.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
+  <a class="home-card" href="execution.html"><span class="card-number">03</span><h3>How it works</h3><p>Understand validation, caller rules and query execution.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
+  <a class="home-card" href="reference.html"><span class="card-number">04</span><h3>Reference</h3><p>Look up commands, result fields and common errors.</p><span class="card-arrow" aria-hidden="true">↗</span></a>
+</nav>
+<a class="home-next" href="getting-started.html"><span><small>Start here</small>Getting started</span><span aria-hidden="true">→</span></a>
+</div>
 
 ```{toctree}
-:maxdepth: 1
-:caption: Learn
+:maxdepth: 2
 :hidden:
 
 getting-started
-```
-
-```{toctree}
-:maxdepth: 2
-:caption: How-to
-:hidden:
-
 USAGE
-graphs
-platform
-migrating
-```
-
-```{toctree}
-:maxdepth: 2
-:caption: Reference
-:hidden:
-
+execution
 reference
-```
-
-```{toctree}
-:maxdepth: 2
-:caption: Explanation
-:hidden:
-
-concepts
-ARCHITECTURE
-parcel-and-peql
-```
-
-```{toctree}
-:maxdepth: 1
-:caption: Contribute
-:hidden:
-
-contributing
-changelog
 ```

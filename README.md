@@ -1,67 +1,28 @@
-# peQL
+<p><img src="docs/_static/peql-logo.jpeg" alt="peQL" width="300"></p>
 
-**A query engine where every table is a data contract.**
+Policy Enforcing Query Engine (peQL) is a SQL query engine that lets you define different data rules and data access policies for users, agents and services, and enforces those rules whenever they query your data.
 
-peQL stores data contracts written in [parcel](https://github.com/griot-cloud/parcel), writes
-data under them, and answers SQL through them. Every `FROM` names a contract, and the contract
-decides what each caller gets: which rows, which columns, masked or in clear, noised or exact,
-or nothing at all. Enforcement is part of the query plan, so the optimiser prunes with the
-contract's rules instead of working around them.
+## Use cases
 
-```sh
-peql write contracts/orders.yaml --input orders.csv
-peql publish sales/orders --to globex
-peql query 'SELECT region, SUM(amount_cents) FROM "sales/orders" GROUP BY region' \
-  --caller callers/globex-analyst.yaml
-```
+**Share data with customers and partners.** Let each customer query their own records from a shared dataset. Mask personal details for partners while allowing authorised staff to see them.
 
-## What a contract does in peQL
+**Set limits on what agents can query.** Give an agent access to the rows and columns its task requires. peQL applies those limits to the SQL it submits.
 
-| parcel rule | In peQL |
-| --- | --- |
-| `decide` | Refuses a caller before any file is opened. |
-| `admit` | A filter in the contract's view, pushed into the Parquet scan: excluded partitions and row groups are never read. |
-| `assert` | Evaluated at write into a stored flag; failing rows are dropped, reported, or make the data unservable. |
-| `transform` | A projection: masks, hashes and nulls per caller, never computed for columns a query does not read. |
-| `guarantee` | Checked against the dataset's manifest: refuses or annotates the query. |
-| `shape` | Sampling, noise on rows or on aggregates with privacy budgets, and small-group suppression. |
+**Keep failed quality checks out of reports.** Exclude rows that fail required checks, or refuse queries when a dataset fails a quality or freshness requirement.
 
-Every query returns an envelope (which rules applied, what was read, hashes of the question and
-the answer) and leaves an audit record. A plan in which contract data is read outside its view is
-refused before it runs.
+**Share statistics with privacy rules.** Suppress results for small groups, add noise to aggregates and limit repeated queries with a privacy budget.
 
 ## Documentation
 
-- [Quickstart](docs/getting-started.md): write and query under a contract as three callers.
-- [Use peQL](docs/USAGE.md): the command line, Rust, and Python.
-- [How it works](docs/concepts.md): views, the gate, shapes, the write path.
-- [parcel and peQL](docs/parcel-and-peql.md): who does what, and the bundle between them.
-- [Migrating from 0.3](docs/migrating.md).
+| | |
+| --- | --- |
+| **[Getting started](docs/getting-started.md)**<br>Learn the concepts, then run your first queries. | **[Using peQL](docs/USAGE.md)**<br>Work with the command line, or use peQL in Python and Rust. |
+| **[How it works](docs/execution.md)**<br>Understand validation, caller rules and query execution. | **[Reference](docs/reference.md)**<br>Look up commands, result fields and common errors. |
 
-## Install
+Read the [documentation website](https://griot-cloud.github.io/peQL/), or browse the pages above on GitHub.
 
-Linux and macOS:
+[Getting started →](docs/getting-started.md)
 
-```sh
-curl -LsSf https://github.com/griot-cloud/peql/releases/latest/download/install.sh | sh
-```
+---
 
-Windows (PowerShell):
-
-```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://github.com/griot-cloud/peql/releases/latest/download/install.ps1 | iex"
-```
-
-Each [release](https://github.com/griot-cloud/peql/releases) carries the `peql` binary for
-Linux (x86_64, arm64), macOS (Apple silicon, Intel) and Windows (x64), each with its sha256.
-Python: `pip install peql`. As a Rust library,
-`peql = { git = "https://github.com/griot-cloud/peql" }` (Rust 1.94 or newer).
-
-## Status
-
-Version 0.4.0: peQL is now the runtime for parcel contracts. See the
-[changelog](CHANGELOG.md) for what changed from 0.3.
-
-## License
-
-Apache-2.0; see [LICENSE](LICENSE).
+[Contributing](CONTRIBUTING.md) · [Changelog](CHANGELOG.md) · [Apache-2.0 license](LICENSE)

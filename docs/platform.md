@@ -1,80 +1,38 @@
-# Serving peQL
+# Optional integrations
 
-peQL embeds in one process that owns the data: it opens the workspace, and everything reaches the
-data through it. These parts let that process serve callers, prove its answers, and keep its data
-in an object store.
+The standard engine works with local Parquet and needs no platform services. Rust applications can add the integrations below when their deployment needs them.
 
-## Flight SQL (feature `flight`)
+## Signed contract bundles
 
-`peql::flight::FlightSql` is a Flight SQL service over tonic. You supply the listener:
-`serve_unix` and `serve_tcp` take one, and `serve` takes any stream of connections tonic can
-accept (a vsock, for example). `into_service` gives the tonic service for a server of your own.
+Enable the `signed-bundle` Cargo feature to accept bundles signed with ECDSA P-256 by their issuer. peQL only verifies; signing belongs to the issuer. `SignedBundle::register(&engine, &key)` checks the signature and then registers the bundle, which recompiles it to its compilation hash. `signing_payload()` returns the exact bytes the issuer signs.
 
-```rust
-let engine = Arc::new(peql::Engine::open("/data")?);
-let listener = tokio::net::UnixListener::bind("/run/peql.sock")?;
-peql::flight::serve_unix(peql::flight::FlightSql::new(engine), listener).await?;
-```
+## Custom functions
 
-| Flight SQL | peQL |
-| --- | --- |
-| `GetFlightInfo`, `CreatePreparedStatement` | `Engine::check`: the statement guard, visibility, `decide` and `guarantee`. A refusal is returned here, before any scan, and audited. |
-| `DoGet` | `Engine::query`. The first message's `app_metadata` is JSON: `{"envelope": …, "signature": …}`. |
-| `DoPut` (bulk ingest) | `Engine::write` under the contract named by `table`, by the contract's owner. `replace` overwrites, `append` appends; `fail if exists` is refused, since a contract exists before its data. |
-
-Every request names its caller in the `x-peql-caller` header: a `Caller` as base64 JSON
-(`peql::flight::caller_header` makes one). The header is believed, so the listener must be
-reachable only by whoever authenticated the caller. `FlightSql::for_caller(engine, caller)`
-answers every request for one caller fixed when the service is built, and ignores the header.
-
-A ticket is the SQL. `DoGet` checks everything again for its own caller, so a ticket grants
-nothing by itself. Errors keep peQL's words: `PermissionDenied` for a refusal, `NotFound` for a
-contract that does not exist or is not visible, `ResourceExhausted` for a spent budget.
-
-## Signed envelopes
-
-`Engine::with_signer` signs every answer's envelope through an `EnvelopeSigner`; the JWS comes
-back as `QueryResult::signature`. With a signer configured, an envelope that cannot be signed
-fails the query: no answer leaves without its certificate.
-
-`peql::SocketSigner` is a signer at the other end of a socket (`unix(path)`, `tcp(addr)`, or
-`with_connector` for any stream). One connection per envelope, one line each way:
+Parcel supports WebAssembly functions used by contract expressions. Register a module and its function manifest for an owner before compiling contracts that use it:
 
 ```text
-engine → signer   the envelope as JSON, then '\n'
-signer → engine   {"jws": "<compact JWS>"}  or  {"error": "<why>"}, then '\n'
+peql function register module.wasm --manifest function.yaml --owner acme
+peql function list
 ```
 
-The envelope names the caller as the engine was told it. A signer that authenticated the caller
-itself should bind what it knows rather than the envelope's claim.
+The file names above refer to your compiled module and parcel function manifest. peQL verifies the module through parcel-runtime and stores it for that owner. Contracts record the function versions and hashes they use.
 
-## Signed bundles (feature `signed-bundle`)
+Function authoring, the WebAssembly interface and manifest fields belong to parcel. See its [function guide](https://griot-cloud.github.io/parcel/functions.html).
 
-A `SignedBundle` is a parcel bundle with its issuer's ECDSA P-256 signature. peQL verifies;
-signing is the issuer's. `SignedBundle::register(&engine, &key)` checks the signature and then
-registers the bundle, which recompiles it to its compilation hash. The signature proves who
-issued the bundle; the recompilation proves what it contains. `signing_payload()` is the exact
-byte string the issuer signs: a digest of the bundle's format, name, version, hashes and function
-modules, with the key generation and the signing time.
+## Other data sources
 
-## Bindings in an object store
+Rust applications can bind a DataFusion `TableProvider` to a registered contract with `Engine::bind_table`. This lets the application supply data while retaining the contract query path.
 
-`ObjectStoreParquet` serves bindings from a prefix of an object store the way `LocalParquet`
-serves directories: a streaming listing table with hive partitions and pruning, written by the
-same write path, with manifests beside the data.
+`ObjectStoreParquet` serves bindings from a prefix of an object store (`s3://bucket/prefix/`) the way the default resolver serves local directories: streamed listing tables, the same write path, and manifests beside the data. Install it with `Engine::with_bindings`. The `s3` feature adds `ObjectStoreParquet::s3_from_env`; any `object_store` store works with `ObjectStoreParquet::new`.
 
-```rust
-let bindings = peql::ObjectStoreParquet::s3_from_env("s3://lake/tenant-a/")?; // feature `s3`
-let engine = peql::Engine::open("/var/lib/peql")?.with_bindings(Arc::new(bindings));
-```
+The optional `lance` feature adds a Lance table provider on Unix. `LanceTableProvider::open_uri` opens a dataset by path or object-store URI. Building this feature requires `protoc`.
 
-A binding such as `s3://lake/tenant-a/orders/` must name the resolver's bucket; a relative one
-(`orders/`) resolves under its prefix. Any `object_store` store works with
-`ObjectStoreParquet::new(base, store)`.
+## Flight SQL
 
-## Lance datasets (feature `lance`)
+The `flight` feature adds `peql::flight::FlightSql`, a Flight SQL service over tonic on a listener the application supplies (`serve_unix`, `serve_tcp`, or `serve` for any connection stream). `GetFlightInfo` and `CreatePreparedStatement` run `Engine::check`, so a refusal returns before any scan; `DoGet` runs `Engine::query` and puts `{"envelope", "signature"}` JSON in the first message's app metadata; `DoPut` bulk ingest runs `Engine::write` for the contract's owner.
 
-`LanceTableProvider::open_uri` reads a Lance dataset from a path or object-store URI; serve it
-under a contract with `bind_table`. Scans stream; projections, limits and filters that cannot
-fail are passed to Lance, and DataFusion re-checks the filters. Lance uses an older Arrow than
-peQL, so batches cross by Arrow IPC.
+Each request names its caller in the `x-peql-caller` header (a `Caller` as base64 JSON; `caller_header` builds it). The header is trusted, so only whoever authenticated the caller may reach the listener. `FlightSql::for_caller` fixes one caller instead.
+
+## Result signing
+
+`Engine::with_signer` signs every query's envelope with an `EnvelopeSigner`; the result is `QueryResult::signature`. If signing fails, the query fails. `SocketSigner` reaches a signer over a Unix socket, TCP or any connected stream: one connection per envelope, the envelope as one JSON line out, and `{"jws": ...}` or `{"error": ...}` as one line back.
