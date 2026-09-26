@@ -1,9 +1,13 @@
-//! Shape operators: noise with privacy budgets, and deterministic sampling.
+//! Shape operators: noise with privacy budgets, and deterministic sampling. Every test runs
+//! through `Engine::query` and through `Engine::plan`.
+
+mod paths;
 
 use std::sync::Arc;
 
 use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use paths::{Answer, BOTH, answer};
 use peql::{Caller, Engine, PeqlError as EngineError, WriteMode};
 
 const HR: &str = r#"
@@ -77,7 +81,7 @@ async fn engine(dir: &std::path::Path) -> Engine {
     e
 }
 
-fn f64_at(r: &peql::QueryResult, col: usize) -> Vec<f64> {
+fn f64_at(r: &Answer, col: usize) -> Vec<f64> {
     let mut out = Vec::new();
     for b in &r.batches {
         let c = datafusion::arrow::compute::cast(b.column(col), &DataType::Float64).unwrap();
@@ -89,83 +93,97 @@ fn f64_at(r: &peql::QueryResult, col: usize) -> Vec<f64> {
 
 #[tokio::test]
 async fn noise_perturbs_aggregates_and_spends_budget() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path()).await;
-    engine.budgets().set_limit("hr_budget", 1.0).unwrap();
-    let sql = r#"SELECT dept, SUM(salary) AS total FROM "hr/salaries" GROUP BY dept ORDER BY dept"#;
+    for path in BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        engine.budgets().set_limit("hr_budget", 1.0).unwrap();
+        let sql =
+            r#"SELECT dept, SUM(salary) AS total FROM "hr/salaries" GROUP BY dept ORDER BY dept"#;
 
-    let exact = engine
-        .query(sql, &Caller::new("o", "acme", "analytics"))
-        .await
-        .unwrap();
-    let exact = f64_at(&exact, 1);
-
-    let globex = Caller::new("w", "globex", "analytics");
-    let noisy = engine.query(sql, &globex).await.unwrap();
-    assert_eq!(noisy.envelope.budgets["hr_budget"], 0.5);
-    let noisy = f64_at(&noisy, 1);
-    let scale = 1000.0 / 0.5;
-    assert_ne!(exact, noisy, "noise was applied");
-    for (e, n) in exact.iter().zip(&noisy) {
-        assert!(
-            (e - n).abs() < 40.0 * scale,
-            "noise within Laplace tail bounds: {e} vs {n}"
-        );
-    }
-
-    // Second query spends the rest; the third is refused.
-    engine.query(sql, &globex).await.unwrap();
-    let refused = engine.query(sql, &globex).await;
-    assert!(
-        matches!(refused, Err(EngineError::BudgetExhausted { .. })),
-        "{:?}",
-        refused.err()
-    );
-    // Budgets are per caller.
-    assert!(
-        engine
-            .query(sql, &Caller::new("k", "globex", "analytics"))
+        let exact = answer(&engine, sql, &Caller::new("o", "acme", "analytics"), path)
             .await
-            .is_ok()
-    );
+            .unwrap();
+        let exact = f64_at(&exact, 1);
 
-    // Aggregates that do not read the column spend nothing and are exact.
-    let counts = engine
-        .query(
+        let globex = Caller::new("w", "globex", "analytics");
+        let noisy = answer(&engine, sql, &globex, path).await.unwrap();
+        assert_eq!(noisy.budgets["hr_budget"], 0.5, "{path:?}");
+        assert_eq!(noisy.charges["hr_budget"], 0.5, "{path:?}");
+        let noisy = f64_at(&noisy, 1);
+        let scale = 1000.0 / 0.5;
+        assert_ne!(exact, noisy, "noise was applied ({path:?})");
+        for (e, n) in exact.iter().zip(&noisy) {
+            assert!(
+                (e - n).abs() < 40.0 * scale,
+                "noise within Laplace tail bounds: {e} vs {n} ({path:?})"
+            );
+        }
+
+        // Second query spends the rest; the third is refused.
+        answer(&engine, sql, &globex, path).await.unwrap();
+        let refused = answer(&engine, sql, &globex, path).await;
+        assert!(
+            matches!(refused, Err(EngineError::BudgetExhausted { .. })),
+            "{path:?}: {:?}",
+            refused.err().map(|e| e.to_string())
+        );
+        // Budgets are per caller.
+        assert!(
+            answer(&engine, sql, &Caller::new("k", "globex", "analytics"), path)
+                .await
+                .is_ok()
+        );
+
+        // Aggregates that do not read the column spend nothing and are exact.
+        let counts = answer(
+            &engine,
             r#"SELECT dept, COUNT(*) FROM "hr/salaries" GROUP BY dept"#,
             &Caller::new("z", "globex", "analytics"),
+            path,
         )
         .await
         .unwrap();
-    assert!(counts.envelope.budgets.is_empty());
-    assert_eq!(f64_at(&counts, 1).iter().sum::<f64>(), N as f64);
+        assert!(counts.budgets.is_empty(), "{path:?}");
+        assert_eq!(f64_at(&counts, 1).iter().sum::<f64>(), N as f64);
+    }
 }
 
 #[tokio::test]
 async fn noised_columns_only_leave_through_aggregates() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path()).await;
-    let globex = Caller::new("w", "globex", "analytics");
-    let raw = engine
-        .query(r#"SELECT salary FROM "hr/salaries" LIMIT 3"#, &globex)
-        .await;
-    assert!(raw.is_err());
-    let keyed = engine
-        .query(
-            r#"SELECT salary, COUNT(*) FROM "hr/salaries" GROUP BY salary"#,
+    for path in BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = engine(dir.path()).await;
+        let globex = Caller::new("w", "globex", "analytics");
+        let raw = answer(
+            &engine,
+            r#"SELECT salary FROM "hr/salaries" LIMIT 3"#,
             &globex,
+            path,
         )
         .await;
-    assert!(keyed.is_err());
-    // Rows without the noised column are fine.
-    let ok = engine
-        .query(
+        assert!(raw.is_err(), "{path:?}");
+        let keyed = answer(
+            &engine,
+            r#"SELECT salary, COUNT(*) FROM "hr/salaries" GROUP BY salary"#,
+            &globex,
+            path,
+        )
+        .await;
+        assert!(keyed.is_err(), "{path:?}");
+        // The whole contract as a view reads the noised column other than through an
+        // aggregate, so it is refused as the same `SELECT *` is.
+        assert!(engine.view("hr/salaries", &globex).await.is_err());
+        // Rows without the noised column are fine.
+        let ok = answer(
+            &engine,
             r#"SELECT employee_id, dept FROM "hr/salaries" LIMIT 3"#,
             &globex,
+            path,
         )
         .await
         .unwrap();
-    assert_eq!(ok.envelope.rows, 3);
+        assert_eq!(ok.rows, 3, "{path:?}");
+    }
 }
 
 #[tokio::test]
@@ -174,11 +192,24 @@ async fn sampling_is_deterministic_and_proportional() {
     let engine = engine(dir.path()).await;
     let globex = Caller::new("w", "globex", "analytics");
     let sql = r#"SELECT employee_id FROM "hr/preview" ORDER BY employee_id"#;
-    let a = engine.query(sql, &globex).await.unwrap();
-    let b = engine.query(sql, &globex).await.unwrap();
-    let ids = |r: &peql::QueryResult| f64_at(r, 0);
-    assert_eq!(ids(&a), ids(&b), "the same caller sees the same sample");
-    let n = a.envelope.rows as f64;
+    let ids = |r: &Answer| f64_at(r, 0);
+    let a = answer(&engine, sql, &globex, paths::Path::Query)
+        .await
+        .unwrap();
+    for path in BOTH {
+        let b = answer(&engine, sql, &globex, path).await.unwrap();
+        assert_eq!(
+            ids(&a),
+            ids(&b),
+            "the same caller sees the same sample ({path:?})"
+        );
+    }
+    // The contract as a view is the same sample.
+    let view = paths::run(engine.view("hr/preview", &globex).await.unwrap()).await;
+    let mut viewed = f64_at(&view, 0);
+    viewed.sort_by(f64::total_cmp);
+    assert_eq!(ids(&a), viewed);
+    let n = a.rows as f64;
     assert!(
         (n - 0.3 * N as f64).abs() < 90.0,
         "sample of {n} rows from {N} at 0.3"
@@ -189,12 +220,10 @@ async fn sampling_is_deterministic_and_proportional() {
     assert_eq!(preview.contract, "hr/preview");
     assert_ne!(preview.contract_hash, salaries.contract_hash);
     assert_eq!(preview.data_hash, salaries.data_hash);
-    let full = engine
-        .query(sql, &Caller::new("o", "acme", "analytics"))
-        .await
-        .unwrap();
-    assert_eq!(
-        full.envelope.rows, N as usize,
-        "acme is exempt from sampling"
-    );
+    for path in BOTH {
+        let full = answer(&engine, sql, &Caller::new("o", "acme", "analytics"), path)
+            .await
+            .unwrap();
+        assert_eq!(full.rows, N as usize, "acme is exempt from sampling");
+    }
 }

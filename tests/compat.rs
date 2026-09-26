@@ -3,6 +3,8 @@
 //! row values with budget exhaustion, and deny without an existence oracle. Plus what 0.4
 //! adds around them: pushdown, the gate barrier, publication, auditing and the bundle handoff.
 
+mod paths;
+
 use std::sync::Arc;
 
 use datafusion::arrow::array::*;
@@ -154,57 +156,61 @@ fn sha(s: &str) -> String {
 
 #[tokio::test]
 async fn outsiders_see_filtered_masked_noised_rows() {
-    let dir = tempfile::tempdir().unwrap();
-    let e = engine(dir.path(), Arc::default()).await;
-    let sql = r#"SELECT order_id, email, phone, name, notes, region, amount, salary FROM "sales/orders" ORDER BY order_id"#;
-    let res = e.query(sql, &globex()).await.unwrap();
-    let got = rows(&res.batches);
-    let eu: Vec<i64> = (1..=30).filter(|i| region_of(*i) == "EU").collect();
-    assert_eq!(got.len(), eu.len(), "only EU rows");
-    let mut noised = 0;
-    for (r, id) in got.iter().zip(&eu) {
-        assert_eq!(r["order_id"], id.to_string());
-        assert_eq!(r["region"], "EU");
-        assert_eq!(r["email"], sha(&format!("user{id}@x.io")), "hash_sha256");
-        assert_eq!(
-            r["phone"],
-            format!("***56{id:02}"),
-            "partial keeps the last four"
-        );
-        assert_eq!(r["name"], "***", "redact is a fixed token");
-        assert_eq!(r["notes"], "NULL", "the null mask is a real null");
-        assert_eq!(
-            r["amount"],
-            sha(&(id * 100).to_string()),
-            "a number hashed as text"
-        );
-        if r["salary"] != format!("{}", 50_000.0 + *id as f64) {
-            noised += 1;
+    for path in paths::BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), Arc::default()).await;
+        let sql = r#"SELECT order_id, email, phone, name, notes, region, amount, salary FROM "sales/orders" ORDER BY order_id"#;
+        let res = paths::answer(&e, sql, &globex(), path).await.unwrap();
+        let got = rows(&res.batches);
+        let eu: Vec<i64> = (1..=30).filter(|i| region_of(*i) == "EU").collect();
+        assert_eq!(got.len(), eu.len(), "only EU rows");
+        let mut noised = 0;
+        for (r, id) in got.iter().zip(&eu) {
+            assert_eq!(r["order_id"], id.to_string());
+            assert_eq!(r["region"], "EU");
+            assert_eq!(r["email"], sha(&format!("user{id}@x.io")), "hash_sha256");
+            assert_eq!(
+                r["phone"],
+                format!("***56{id:02}"),
+                "partial keeps the last four"
+            );
+            assert_eq!(r["name"], "***", "redact is a fixed token");
+            assert_eq!(r["notes"], "NULL", "the null mask is a real null");
+            assert_eq!(
+                r["amount"],
+                sha(&(id * 100).to_string()),
+                "a number hashed as text"
+            );
+            if r["salary"] != format!("{}", 50_000.0 + *id as f64) {
+                noised += 1;
+            }
         }
+        assert!(noised >= eu.len() - 1, "salary is noised row by row");
+        assert!(res.budgets.contains_key("salary"));
     }
-    assert!(noised >= eu.len() - 1, "salary is noised row by row");
-    assert!(res.envelope.budgets.contains_key("salary"));
 }
 
 #[tokio::test]
 async fn the_owner_sees_raw_values_and_every_row() {
-    let dir = tempfile::tempdir().unwrap();
-    let e = engine(dir.path(), Arc::default()).await;
-    let sql = r#"SELECT order_id, email, phone, name, notes, amount, salary FROM "sales/orders" ORDER BY order_id"#;
-    let res = e.query(sql, &acme()).await.unwrap();
-    let got = rows(&res.batches);
-    assert_eq!(got.len(), 30);
-    let r = &got[4];
-    assert_eq!(r["email"], "user5@x.io");
-    assert_eq!(r["phone"], "0712345605");
-    assert_eq!(r["name"], "Person 5");
-    assert_eq!(r["notes"], "note 5");
-    assert_eq!(r["amount"], "500");
-    assert_eq!(r["salary"], "50005.0");
-    assert!(
-        res.envelope.budgets.is_empty(),
-        "exempt from noise, so nothing is charged"
-    );
+    for path in paths::BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), Arc::default()).await;
+        let sql = r#"SELECT order_id, email, phone, name, notes, amount, salary FROM "sales/orders" ORDER BY order_id"#;
+        let res = paths::answer(&e, sql, &acme(), path).await.unwrap();
+        let got = rows(&res.batches);
+        assert_eq!(got.len(), 30);
+        let r = &got[4];
+        assert_eq!(r["email"], "user5@x.io");
+        assert_eq!(r["phone"], "0712345605");
+        assert_eq!(r["name"], "Person 5");
+        assert_eq!(r["notes"], "note 5");
+        assert_eq!(r["amount"], "500");
+        assert_eq!(r["salary"], "50005.0");
+        assert!(
+            res.budgets.is_empty(),
+            "exempt from noise, so nothing is charged"
+        );
+    }
 }
 
 #[tokio::test]
@@ -256,29 +262,42 @@ async fn hidden_columns_disallowed_purposes_and_unpublished_tenants() {
 
 #[tokio::test]
 async fn budgets_run_out_and_only_readers_pay() {
-    let dir = tempfile::tempdir().unwrap();
-    let e = engine(dir.path(), Arc::default()).await;
-    e.budgets().set_limit("salary", 2.0).unwrap();
-    let with_salary = r#"SELECT AVG(salary) FROM "sales/orders""#;
-    e.query(with_salary, &globex()).await.unwrap();
-    e.query(with_salary, &globex()).await.unwrap();
-    let third = e.query(with_salary, &globex()).await;
-    assert!(
-        matches!(third, Err(PeqlError::BudgetExhausted { .. })),
-        "{:?}",
-        third.err()
-    );
-    // A query that does not read salary costs nothing and still runs.
-    e.query(r#"SELECT COUNT(*) FROM "sales/orders""#, &globex())
+    for path in paths::BOTH {
+        let dir = tempfile::tempdir().unwrap();
+        let e = engine(dir.path(), Arc::default()).await;
+        e.budgets().set_limit("salary", 2.0).unwrap();
+        let with_salary = r#"SELECT AVG(salary) FROM "sales/orders""#;
+        paths::answer(&e, with_salary, &globex(), path)
+            .await
+            .unwrap();
+        paths::answer(&e, with_salary, &globex(), path)
+            .await
+            .unwrap();
+        let third = paths::answer(&e, with_salary, &globex(), path).await;
+        assert!(
+            matches!(third, Err(PeqlError::BudgetExhausted { .. })),
+            "{path:?}: {:?}",
+            third.err().map(|e| e.to_string())
+        );
+        // A query that does not read salary costs nothing and still runs.
+        paths::answer(
+            &e,
+            r#"SELECT COUNT(*) FROM "sales/orders""#,
+            &globex(),
+            path,
+        )
         .await
         .unwrap();
-    // Budgets are per caller.
-    e.query(
-        with_salary,
-        &Caller::new("user:carol", "globex", "analytics"),
-    )
-    .await
-    .unwrap();
+        // Budgets are per caller.
+        paths::answer(
+            &e,
+            with_salary,
+            &Caller::new("user:carol", "globex", "analytics"),
+            path,
+        )
+        .await
+        .unwrap();
+    }
 }
 
 #[tokio::test]
