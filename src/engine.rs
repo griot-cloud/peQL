@@ -425,6 +425,18 @@ impl Engine {
         }
     }
 
+    /// Where a contract's files are, as its binding resolves them; `None` for a contract served
+    /// from a table. Two contracts bound to the same files have one location whatever their
+    /// names, so this is what an executor compares to tell whether a write lands where a read
+    /// reads.
+    pub fn location(&self, name: &str) -> Result<Option<Location>> {
+        let reg = self.get(name)?;
+        match self.bound(&reg)? {
+            Bound::Table(_) => Ok(None),
+            Bound::Files(location) => Ok(Some(location)),
+        }
+    }
+
     /// A contract registered over files written elsewhere has no manifest yet: make one. For
     /// files in an object store, read the manifest again, since another engine may write there.
     pub async fn ensure_manifest(&self, name: &str) -> Result<()> {
