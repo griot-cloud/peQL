@@ -23,7 +23,7 @@ Function authoring, the WebAssembly interface and manifest fields belong to parc
 
 Rust applications can bind a DataFusion `TableProvider` to a registered contract with `Engine::bind_table`. This lets the application supply data while retaining the contract query path.
 
-`ObjectStoreParquet` serves bindings from a prefix of an object store (`s3://bucket/prefix/`) the way the default resolver serves local directories: streamed listing tables, the same write path, and manifests beside the data. Install it with `Engine::with_bindings`. The `s3` feature adds `ObjectStoreParquet::s3_from_env`; any `object_store` store works with `ObjectStoreParquet::new`.
+`ObjectStoreParquet` serves bindings from a prefix of an object store (`s3://bucket/prefix/`) the way the default resolver serves local directories: streamed listing tables, the same write path, and manifests beside the data. Install it with `Engine::with_bindings`. Pass the store in: `ObjectStoreParquet::new("s3://bucket/prefix/", store)` takes any `object_store` store, configured by the application; the `s3` feature adds the S3 store.
 
 The optional `lance` feature adds a Lance table provider on Unix. `LanceTableProvider::open_uri` opens a dataset by path or object-store URI. Building this feature requires `protoc`.
 

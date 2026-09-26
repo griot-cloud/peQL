@@ -13,7 +13,13 @@
 //! use object_store::aws::AmazonS3Builder;
 //! use peql::object_binding::ObjectStoreParquet;
 //!
-//! let store = AmazonS3Builder::from_env().with_bucket_name("lake").build().unwrap();
+//! let store = AmazonS3Builder::new()
+//!     .with_bucket_name("lake")
+//!     .with_region("eu-west-1")
+//!     .with_access_key_id("…")
+//!     .with_secret_access_key("…")
+//!     .build()
+//!     .unwrap();
 //! let bindings = ObjectStoreParquet::new("s3://lake/tenant-a/", Arc::new(store))?;
 //! let engine = peql::Engine::open("/var/lib/peql")?.with_bindings(Arc::new(bindings));
 //! # Ok(()) }
@@ -62,23 +68,6 @@ impl ObjectStoreParquet {
             store,
             prefix: ObjectPath::from(prefix),
         })
-    }
-
-    /// An S3 bucket with credentials, region and endpoint from the environment
-    /// (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `AWS_ENDPOINT`,
-    /// `AWS_ALLOW_HTTP` for an endpoint such as MinIO).
-    #[cfg(feature = "s3")]
-    pub fn s3_from_env(base: &str) -> Result<ObjectStoreParquet> {
-        let bucket = base
-            .strip_prefix("s3://")
-            .and_then(|r| r.split('/').next())
-            .filter(|b| !b.is_empty())
-            .ok_or_else(|| PeqlError::Invalid(format!("`{base}` is not an s3:// URL")))?;
-        let store = object_store::aws::AmazonS3Builder::from_env()
-            .with_bucket_name(bucket)
-            .build()
-            .map_err(|e| PeqlError::Invalid(format!("S3 store for `{bucket}`: {e}")))?;
-        ObjectStoreParquet::new(base, Arc::new(store))
     }
 
     pub fn store(&self) -> &Arc<dyn ObjectStore> {

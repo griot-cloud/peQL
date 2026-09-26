@@ -1,9 +1,5 @@
 //! Bindings in an object store: written, listed, streamed and re-read through `object_store`.
-//!
-//! The in-memory store runs everywhere and takes the same code path as S3. With the `s3`
-//! feature and `PEQL_TEST_S3_ENDPOINT` set (e.g. a local MinIO at `http://127.0.0.1:9000`,
-//! with `PEQL_TEST_S3_BUCKET`, `PEQL_TEST_S3_ACCESS_KEY`, `PEQL_TEST_S3_SECRET_KEY`), the same
-//! scenario runs against that endpoint.
+//! The in-memory store takes the same code path as S3: the engine sees only `ObjectStore`.
 
 mod support;
 
@@ -149,24 +145,23 @@ async fn bindings_resolve_inside_the_store_or_not_at_all() {
     assert!(ObjectStoreParquet::new("lake/tenant-a", Arc::new(InMemory::new())).is_err());
 }
 
+/// An S3 store configured in code, as an embedding passes one in: the resolver takes it and
+/// registers it with every session under its bucket. Nothing is contacted until a scan runs.
 #[cfg(feature = "s3")]
-#[tokio::test]
-async fn an_s3_binding_against_a_live_endpoint() {
-    let Ok(endpoint) = std::env::var("PEQL_TEST_S3_ENDPOINT") else {
-        eprintln!("PEQL_TEST_S3_ENDPOINT is not set: the live S3 test does not run");
-        return;
-    };
-    let var = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_owned());
-    let bucket = var("PEQL_TEST_S3_BUCKET", "peql");
+#[test]
+fn an_s3_store_is_passed_in_not_read_from_the_environment() {
+    use peql::BindingResolver;
     let store = object_store::aws::AmazonS3Builder::new()
-        .with_endpoint(&endpoint)
+        .with_endpoint("http://127.0.0.1:9")
         .with_allow_http(true)
-        .with_region(var("PEQL_TEST_S3_REGION", "us-east-1"))
-        .with_bucket_name(&bucket)
-        .with_access_key_id(var("PEQL_TEST_S3_ACCESS_KEY", "minioadmin"))
-        .with_secret_access_key(var("PEQL_TEST_S3_SECRET_KEY", "minioadmin"))
+        .with_region("us-east-1")
+        .with_bucket_name("lake")
+        .with_access_key_id("test")
+        .with_secret_access_key("test")
         .build()
         .unwrap();
-    let prefix = format!("peql-test-{}/", uuid::Uuid::new_v4());
-    scenario(&format!("s3://{bucket}/{prefix}"), Arc::new(store), &prefix).await;
+    let r = ObjectStoreParquet::new("s3://lake/tenant-a/", Arc::new(store)).unwrap();
+    let stores = r.object_stores();
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].0.as_str(), "s3://lake/");
 }

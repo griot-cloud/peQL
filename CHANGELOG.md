@@ -16,8 +16,8 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
 - `SocketSigner`: an `EnvelopeSigner` at the other end of a socket, one line of JSON each way.
   `Engine::with_signer` signs every envelope; a query whose envelope cannot be signed fails.
 - `ObjectStoreParquet`: bindings in an object store (`s3://bucket/prefix/`), streamed, written
-  and validated like local directories, with manifests beside the data. Feature `s3` adds the S3
-  store.
+  and validated like local directories, with manifests beside the data. The store is passed in;
+  feature `s3` adds the S3 store.
 - `Engine::check` (every check without a read; refusals audited), `Engine::authorize_write`,
   `Engine::session`; `Engine::view` is documented as the gated plan an out-of-core executor reads.
 - The envelope names its caller and the epsilon charged; `QueryResult` carries the answer's
