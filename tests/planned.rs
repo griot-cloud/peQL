@@ -542,3 +542,17 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
     e.bind_batches("demo/pay", vec![pay()]).await.unwrap();
     assert!(e.begin_write("demo/pay", WriteMode::Append).await.is_err());
 }
+
+/// Two contracts bound to the same files have one location, whatever their names; a contract
+/// bound to a table has none.
+#[tokio::test]
+async fn contracts_over_the_same_files_share_a_location() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path(), Arc::new(MemoryAudit::default())).await;
+    let key = |name: &str| e.location(name).unwrap().expect("files").key().unwrap();
+    assert_eq!(key("demo/pay"), key("demo/totals"));
+    assert_ne!(key("demo/pay"), key("demo/cells"));
+    assert!(e.location("demo/nothing").is_err());
+    e.bind_batches("demo/pay", vec![pay()]).await.unwrap();
+    assert!(e.location("demo/pay").unwrap().is_none());
+}

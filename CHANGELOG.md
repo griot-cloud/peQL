@@ -19,7 +19,10 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
   and validated like local directories, with manifests beside the data. The store is passed in;
   feature `s3` adds the S3 store.
 - `Engine::check` (every check without a read; refusals audited), `Engine::authorize_write`,
-  `Engine::session`; `Engine::view` is documented as the gated plan an out-of-core executor reads.
+  `Engine::session`; `Engine::view` and `Engine::plan` return the plan an out-of-core executor
+  reads: gated, every shape in it, its budgets charged once at planning.
+- `Engine::location`: where a contract's files are, so an executor can tell two contracts bound
+  to the same files apart from two names.
 - The envelope names its caller and the epsilon charged; `QueryResult` carries the answer's
   schema and the signature.
 
