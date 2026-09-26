@@ -556,3 +556,26 @@ async fn contracts_over_the_same_files_share_a_location() {
     e.bind_batches("demo/pay", vec![pay()]).await.unwrap();
     assert!(e.location("demo/pay").unwrap().is_none());
 }
+
+/// A plan for a given number of partitions has at most that many, and the same answer.
+#[tokio::test]
+async fn a_plan_for_fewer_partitions_answers_the_same() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path(), Arc::default()).await;
+    let one = e.view_for("demo/cells", &owner(), Some(1)).await.unwrap();
+    let mut widest = 0;
+    let _ = datafusion::common::tree_node::TreeNode::apply(&one.plan, |node| {
+        widest = widest.max(node.properties().partitioning.partition_count());
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    });
+    assert_eq!(widest, 1, "no stage runs more than one partition");
+    let default = e.view("demo/cells", &owner()).await.unwrap();
+    assert_eq!(
+        keyed_rows(&run(one).await.batches, &[]),
+        keyed_rows(&run(default).await.batches, &[])
+    );
+    let sql = r#"SELECT dept, SUM(amount) AS s FROM "demo/cells" GROUP BY dept ORDER BY dept"#;
+    let two = run(e.plan_for(sql, &owner(), Some(2)).await.unwrap()).await;
+    let any = run(e.plan(sql, &owner()).await.unwrap()).await;
+    assert_eq!(two.batches, any.batches);
+}

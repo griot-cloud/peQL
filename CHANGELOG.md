@@ -23,6 +23,8 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
   reads: gated, every shape in it, its budgets charged once at planning.
 - `Engine::location`: where a contract's files are, so an executor can tell two contracts bound
   to the same files apart from two names.
+- `Engine::plan_for` and `Engine::view_for`: the same plan for a given number of partitions, so
+  an executor running it inside a memory budget plans for the parallelism the budget holds.
 - The envelope names its caller and the epsilon charged; `QueryResult` carries the answer's
   schema and the signature.
 
