@@ -18,8 +18,8 @@ It holds the contract document and the documents it inherits from, the data's sc
 tenant functions it is pinned to, the three compiled artifacts, and the compilation hash.
 
 peQL accepts a bundle only after recompiling it and getting the same hash, so it runs exactly
-what parcel compiled or nothing. On the Griot platform, bundles also carry the contract
-authority's signature ({doc}`platform`).
+what parcel compiled or nothing. Bundles can also carry their issuer's
+signature ({doc}`platform`).
 
 Both projects build on the same DataFusion version, and move to a new one together, parcel
 first.

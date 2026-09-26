@@ -7,8 +7,8 @@ Before opening a pull request, run:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets --features platform -- -D warnings
-cargo test --features platform
+cargo clippy --all-targets --features flight,signed-bundle,s3 -- -D warnings
+cargo test --features flight,signed-bundle,s3
 examples/run-all.sh
 ```
 
