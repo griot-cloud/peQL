@@ -1,49 +1,46 @@
-# The Griot platform
+# Optional integrations
 
-## Signed bundles from the contract authority (feature `platform`)
+The standard engine works with local Parquet and needs no platform services. Rust applications can add the integrations below when their deployment needs them.
 
-On the platform, contracts come from T03 as parcel bundles signed with ECDSA P-256.
+## Signed contract bundles
 
-```rust
-let source = peql::platform::PlatformBundleSource::new("https://t03.internal")
-    .with_verifying_key(key)
-    .with_auth("Authorization", format!("Bearer {token}"));
-source.register(&engine, "demo/users").await?;
+Enable the `platform` Cargo feature to fetch bundles from an HTTP contract service. `PlatformBundleSource` requests:
+
+```text
+GET /v1/contracts/{contract-name}/bundle
 ```
 
-`GET {base}/v1/contracts/{name}/bundle` returns a `SignedBundle`: the bundle, a DER signature,
-and metadata (the bundle's digest, when it was signed, the key generation). The digest covers
-the bundle's format, name, version, contract and compilation hashes, and every function module
-it carries. The signature proves who issued the bundle; recompiling it to its compilation hash
-proves what it contains. `SignedBundle::sign` is what the authority runs.
+Configure the source with an authentication header if required. Supplying an ECDSA P-256 verifying key with `with_verifying_key` enables signature verification; without that key, the source relies on its transport and does not verify the signature.
 
-## The tenant engine and the worker pool
+Calling `source.register(&engine, name).await` fetches the bundle, checks that it names the requested contract, and registers it with the engine. Registration verifies the parcel bundle independently of the optional signature check.
 
-`K04DEngine` serves one tenant. `inject_contract_bundle` registers a bundle for that tenant (a
-bundle for another tenant is refused). `register_memory_table`, `register_parquet_table` and
-`register_lance_table` bind data to a registered contract; there are no raw tables. `query` takes
-the caller and returns the rows and the envelope, and refuses results larger than
-`max_result_rows`.
+In Griot deployments, this contract service is called **T03**. No T03 service is included in peQL.
 
-`LongRunningPoolManager` runs queries on a bounded set of workers that share one engine, with a
-queue per worker, tenant affinity, and a drain on shutdown. With a signer, each result's envelope
-is signed; `T05Client` signs over the T05 notary socket.
+## Custom functions
 
-## Lance datasets (feature `lance`)
+Parcel supports WebAssembly functions used by contract expressions. Register a module and its function manifest for an owner before compiling contracts that use it:
 
-`LanceTableProvider::open_uri` reads a Lance dataset from a path or object-store URI;
-`LanceTableProvider::open` reads one through the T04 storaged socket. Either is served under a
-contract with `bind_table` (or `K04DEngine::register_lance_table`). Scans stream; projections,
-limits and filters that cannot fail are passed to Lance, and DataFusion re-checks the filters.
-Lance uses an older Arrow than peQL, so batches cross by Arrow IPC.
+```text
+peql function register module.wasm --manifest function.yaml --owner acme
+peql function list
+```
 
-A Lance dataset is a directory of objects, so reads through storaged name the object:
+The file names above refer to your compiled module and parcel function manifest. peQL verifies the module through parcel-runtime and stores it for that owner. Contracts record the function versions and hashes they use.
 
-| Opcode | Request adds | Response |
-| --- | --- | --- |
-| `0x30` read | `path` (optional; absent reads the asset itself) | as before |
-| `0x31` stat | `path` (optional) | `size` (`content_type`, `format_version` optional) |
-| `0x32` list | `prefix` | `{"objects": [{"path", "size"}]}` |
+Function authoring, the WebAssembly interface and manifest fields belong to parcel. See its [function guide](https://griot-cloud.github.io/parcel/functions.html).
 
-`0x32` and the `path` field are additions T04 serves for Lance assets; single-file assets are read
-exactly as in 0.3.
+## Other data sources
+
+Rust applications can bind a DataFusion `TableProvider` to a registered contract with `Engine::bind_table`. This lets the application supply data while retaining the contract query path.
+
+The optional `lance` feature adds a Lance table provider on Unix. `LanceTableProvider::open_uri` opens a dataset by path or object-store URI. `open` reads through Griot's storage service, **T04**, over its Unix socket. Building this feature requires `protoc`.
+
+## Query workers and result signing
+
+`LongRunningPoolManager` runs queued queries on workers sharing an engine. `PoolConfig` controls worker count, queue depth and shutdown drain time. A full queue or a shutting-down pool returns an error to the submitting application.
+
+An optional `EnvelopeSigner` signs result envelopes. `T05Client` implements signing through Griot's notary service, **T05**, on Unix. A signer failure is returned as a pool error.
+
+`K04DEngine` is the Griot integration wrapper for registered bundles and bound data. It checks a bundle handle's tenant against its configured tenant and applies a maximum result-row count after execution. It does not authenticate callers or check that every supplied caller's tenant matches the configured tenant; that remains the host application's responsibility.
+
+These components are library integrations. They do not provide a standalone HTTP query server.
