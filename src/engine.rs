@@ -30,10 +30,12 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::audit::{AuditLog, AuditRecord, JsonlAudit, MemoryAudit, Outcome};
-use crate::binding::{self, BindingResolver, CONTRACT_HASH_KEY, CONTRACT_NAME_KEY, LocalParquet};
+use crate::binding::{
+    self, BindingResolver, CONTRACT_HASH_KEY, CONTRACT_NAME_KEY, LocalParquet, Location,
+};
 use crate::budget::BudgetStore;
 use crate::cache::{CacheKey, QueryCache};
-use crate::envelope::{Attestation, Envelope, Resolution, ScanStats};
+use crate::envelope::{Asker, Attestation, Envelope, EnvelopeSigner, Resolution, ScanStats};
 use crate::error::{PeqlError, Result};
 use crate::functions::FunctionStore;
 use crate::gate::{BoundTable, Gate, GateBarrier, GatedQueryPlanner, ensure_gated};
@@ -70,13 +72,25 @@ pub enum WriteMode {
 }
 
 pub struct QueryResult {
+    /// The schema of the answer, which holds even when there are no batches.
+    pub schema: SchemaRef,
     pub batches: Vec<RecordBatch>,
     pub envelope: Envelope,
+    /// The envelope signed by the engine's [`EnvelopeSigner`], a compact JWS, when it has one.
+    pub signature: Option<String>,
 }
 
-/// Where a contract's data comes from when it is not its binding's files.
+/// What a query would return and which contracts would govern it, found without running it.
+#[derive(Clone, Debug)]
+pub struct Checked {
+    /// The schema of the answer.
+    pub schema: SchemaRef,
+    pub contracts: Vec<Resolution>,
+}
+
+/// Where a contract's data comes from: its binding's files, or a table bound in their place.
 enum Bound {
-    Files(PathBuf),
+    Files(Location),
     Table(Arc<dyn TableProvider>),
 }
 
@@ -94,6 +108,9 @@ pub struct Engine {
     /// Documents a contract may inherit from that are not registered themselves.
     documents: RwLock<BTreeMap<String, ContractDoc>>,
     use_stored: RwLock<bool>,
+    /// Manifests of contracts whose files are in an object store, as last read or written.
+    object_manifests: RwLock<HashMap<String, Manifest>>,
+    signer: Option<Arc<dyn EnvelopeSigner>>,
 }
 
 impl Engine {
@@ -115,6 +132,8 @@ impl Engine {
             table_manifests: RwLock::default(),
             documents: RwLock::default(),
             use_stored: RwLock::new(true),
+            object_manifests: RwLock::default(),
+            signer: None,
         })
     }
 
@@ -131,6 +150,8 @@ impl Engine {
             table_manifests: RwLock::default(),
             documents: RwLock::default(),
             use_stored: RwLock::new(true),
+            object_manifests: RwLock::default(),
+            signer: None,
         }
     }
 
@@ -148,6 +169,13 @@ impl Engine {
     }
     pub fn with_audit(mut self, audit: Arc<dyn AuditLog>) -> Engine {
         self.audit = audit;
+        self
+    }
+
+    /// Sign every answer's envelope. A query whose envelope cannot be signed fails: with a
+    /// signer configured, no answer leaves without its certificate.
+    pub fn with_signer(mut self, signer: Arc<dyn EnvelopeSigner>) -> Engine {
+        self.signer = Some(signer);
         self
     }
 
@@ -337,7 +365,7 @@ impl Engine {
             return Ok(Bound::Table(t.clone()));
         }
         self.bindings
-            .root(&reg.compilation.contract)
+            .location(&reg.compilation.contract)
             .map(Bound::Files)
             .ok_or_else(|| {
                 PeqlError::Invalid(format!("`{}` has no binding peQL can read", reg.name()))
@@ -365,21 +393,42 @@ impl Engine {
                 .expect("lock")
                 .get(name)
                 .cloned()),
-            Bound::Files(root) => Ok(Manifest::load(&root, name)?),
+            Bound::Files(Location::Local(root)) => Ok(Manifest::load(&root, name)?),
+            Bound::Files(Location::Object(_)) => Ok(self
+                .object_manifests
+                .read()
+                .expect("lock")
+                .get(name)
+                .cloned()),
         }
     }
 
-    /// A contract registered over files written elsewhere has no manifest yet: make one.
+    /// A contract registered over files written elsewhere has no manifest yet: make one. For
+    /// files in an object store, read the manifest again, since another engine may write there.
     pub async fn ensure_manifest(&self, name: &str) -> Result<()> {
         let reg = self.get(name)?;
-        let Bound::Files(root) = self.bound(&reg)? else {
-            return Ok(());
-        };
-        if Manifest::load(&root, name)?.is_some() || binding::list_files(&root)?.is_empty() {
-            return Ok(());
+        match self.bound(&reg)? {
+            Bound::Table(_) => Ok(()),
+            Bound::Files(Location::Local(root)) => {
+                if Manifest::load(&root, name)?.is_some() || binding::list_files(&root)?.is_empty()
+                {
+                    return Ok(());
+                }
+                self.refresh(name, Utc::now()).await?;
+                Ok(())
+            }
+            Bound::Files(Location::Object(o)) => {
+                if let Some(m) = o.load_manifest(name).await? {
+                    self.object_manifests
+                        .write()
+                        .expect("lock")
+                        .insert(name.to_owned(), m);
+                } else if !o.list_files().await?.is_empty() {
+                    self.refresh(name, Utc::now()).await?;
+                }
+                Ok(())
+            }
         }
-        self.refresh(name, Utc::now()).await?;
-        Ok(())
     }
 
     // ── write and validate ──────────────────────────────────────────────────
@@ -395,17 +444,19 @@ impl Engine {
         let reg = self.get(name)?;
         let c = &reg.compilation;
         let cc = &c.contract;
-        let Bound::Files(root) = self.bound(&reg)? else {
+        let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!(
                 "`{name}` is bound to a table; only file bindings are written"
             )));
         };
-        if root.extension().is_some_and(|e| e == "parquet") {
+        if location.is_single_file() {
             return Err(PeqlError::Invalid(format!(
                 "`{name}` binds a single file; bind a directory to write to it"
             )));
         }
-        std::fs::create_dir_all(&root)?;
+        if let Location::Local(root) = &location {
+            std::fs::create_dir_all(root)?;
+        }
         let batches = batches
             .into_iter()
             .map(|b| conform(b, &cc.row_schema))
@@ -436,8 +487,13 @@ impl Engine {
             .await?;
 
         if mode == WriteMode::Overwrite {
-            for f in binding::list_files(&root)? {
-                std::fs::remove_file(f)?;
+            match &location {
+                Location::Local(root) => {
+                    for f in binding::list_files(root)? {
+                        std::fs::remove_file(f)?;
+                    }
+                }
+                Location::Object(o) => o.remove_files().await?,
             }
         }
         let layout = &c.write.layout;
@@ -466,22 +522,21 @@ impl Engine {
                 .or_default()
                 .bloom_filter_enabled = Some(true);
         }
-        df.write_parquet(
-            &crate::binding::local_url(&root, true)?,
-            options,
-            Some(parquet),
-        )
-        .await?;
+        let url = match &location {
+            Location::Local(root) => binding::local_url(root, true)?,
+            Location::Object(o) => o.url(true),
+        };
+        df.write_parquet(&url, options, Some(parquet)).await?;
 
         // The data changed: refresh every contract bound to it, the writer's last.
         let written_at = Utc::now();
-        let key = root.canonicalize()?;
+        let key = location.key()?;
         for other in self.store.list() {
             if other.name() == name {
                 continue;
             }
             if let Ok(Bound::Files(r)) = self.bound(&other)
-                && r.canonicalize().ok() == Some(key.clone())
+                && r.key().ok().as_ref() == Some(&key)
             {
                 self.refresh(other.name(), written_at).await?;
             }
@@ -498,15 +553,21 @@ impl Engine {
     async fn refresh(&self, name: &str, written_at: DateTime<Utc>) -> Result<(Verdict, Manifest)> {
         let reg = self.get(name)?;
         let cc = &reg.compilation.contract;
-        let Bound::Files(root) = self.bound(&reg)? else {
+        let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!("`{name}` has no files")));
         };
         let verdict = self.validate(name).await?;
         let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
-        let files = binding::list_files(&root)?
-            .iter()
-            .map(|f| binding::file_entry(&root, f, &flag_columns))
-            .collect::<Result<Vec<_>>>()?;
+        let files = match &location {
+            Location::Local(root) => binding::list_files(root)?
+                .iter()
+                .map(|f| binding::file_entry(root, f, &flag_columns))
+                .collect::<Result<Vec<_>>>()?,
+            Location::Object(o) => {
+                o.file_entries(&o.list_files().await?, &flag_columns)
+                    .await?
+            }
+        };
         let manifest = Manifest {
             contract: cc.name.clone(),
             contract_hash: cc.contract_hash.clone(),
@@ -520,7 +581,16 @@ impl Engine {
             row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
             files,
         };
-        manifest.save(&root)?;
+        match &location {
+            Location::Local(root) => manifest.save(root)?,
+            Location::Object(o) => {
+                o.save_manifest(&manifest).await?;
+                self.object_manifests
+                    .write()
+                    .expect("lock")
+                    .insert(name.to_owned(), manifest.clone());
+            }
+        }
         Ok((verdict, manifest))
     }
 
@@ -535,9 +605,14 @@ impl Engine {
     pub async fn validate_with(&self, name: &str, plan: LogicalPlan) -> Result<Verdict> {
         let reg = self.get(name)?;
         let provider = self.raw_provider(&reg).await?;
-        let verdict = parcel_runtime::plan::validate(&reg.compilation, plan, provider).await?;
+        let verdict =
+            parcel_runtime::plan::validate_in(&self.session(), &reg.compilation, plan, provider)
+                .await?;
         let data_hash = match self.bound(&reg)? {
-            Bound::Files(root) => binding::data_hash(&root, &binding::list_files(&root)?)?,
+            Bound::Files(Location::Local(root)) => {
+                binding::data_hash(&root, &binding::list_files(&root)?)?
+            }
+            Bound::Files(Location::Object(o)) => o.data_hash(&o.list_files().await?).await?,
             Bound::Table(t) => {
                 let batches = self.session().read_table(t)?.collect().await?;
                 parcel_core::hash::sha256_hex(&crate::envelope::ipc_bytes(&batches))
@@ -618,6 +693,15 @@ impl Engine {
 
     /// The plan that stands in for a contract, for one caller (peQL design 4.5): scan, filter
     /// on admits and drop-level flags, project the exposed columns, bind `ctx`, gate.
+    ///
+    /// This is the gated plan an out-of-core executor consumes as its source (Moruna's
+    /// `PlanSource`): take `resolution` from [`Engine::resolve`] for the same caller (it
+    /// carries the `decide` and `guarantee` outcome and whether stored flags are read), plan
+    /// the result in [`Engine::session`] so the gate becomes a `GateExec`, and refuse the
+    /// physical plan unless [`crate::gate::ensure_gated`] accepts it. The plan is the
+    /// contract's rows for this caller and nothing more: `suppress` and aggregate `noise`
+    /// apply to a query over the view ([`Engine::query`]), so a consumer that aggregates the
+    /// view itself must not release what those shapes would have changed.
     pub async fn view(
         &self,
         name: &str,
@@ -693,8 +777,9 @@ impl Engine {
 
     // ── query ───────────────────────────────────────────────────────────────
 
-    /// A session with parcel's functions, gates, and the gate barrier.
-    fn session(&self) -> SessionContext {
+    /// A session with parcel's functions, gates, the gate barrier, and the object stores the
+    /// bindings read: where a [`Engine::view`] plan is planned and run.
+    pub fn session(&self) -> SessionContext {
         let config = SessionConfig::new()
             .with_information_schema(false)
             .set_bool("datafusion.execution.parquet.pushdown_filters", true)
@@ -709,6 +794,9 @@ impl Engine {
         ctx.add_optimizer_rule(Arc::new(GateBarrier));
         for udf in parcel_core::udfs::parcel_udfs() {
             ctx.register_udf(udf);
+        }
+        for (url, store) in self.bindings.object_stores() {
+            ctx.register_object_store(url.as_ref(), store);
         }
         ctx
     }
@@ -791,6 +879,53 @@ impl Engine {
             .to_string())
     }
 
+    /// Everything [`Engine::query`] checks before it reads a row, and the schema it would
+    /// answer with: the statement guard, visibility, `decide`, `guarantee`, the plan guard.
+    /// A refusal here is the refusal the query would meet.
+    /// Refusals are audited as a query's are; a check that passes is not, since the query
+    /// that follows is.
+    pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
+        let started = Instant::now();
+        match self.prepare(sql, caller).await {
+            Ok(p) => Ok(Checked {
+                schema: Arc::new(p.plan.schema().as_arrow().clone()),
+                contracts: p.resolutions,
+            }),
+            Err(e) => {
+                if e.is_refusal() {
+                    self.audit.record(&AuditRecord {
+                        id: Uuid::new_v4(),
+                        at: Utc::now(),
+                        caller_id: caller.id.clone(),
+                        tenant: caller.tenant.clone(),
+                        purpose: caller.purpose.clone(),
+                        sql_sha256: parcel_core::hash::sha256_hex(sql.as_bytes()),
+                        contracts: Vec::new(),
+                        outcome: Outcome::Refused(e.to_string()),
+                        rows: 0,
+                        elapsed_ms: started.elapsed().as_millis() as u64,
+                        charges: Vec::new(),
+                    })?;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether `caller` may write under `name`: the contract's owner tenant may, and so may
+    /// anyone for a contract with no owner. Nothing else about a write depends on the caller,
+    /// so an embedding that accepts writes from callers checks this before [`Engine::write`].
+    pub fn authorize_write(&self, name: &str, caller: &Caller) -> Result<()> {
+        let reg = self.visible(name, caller)?;
+        match reg.owner() {
+            Some(owner) if owner != caller.tenant => Err(PeqlError::Denied {
+                contract: name.to_owned(),
+                rule: "writes are the owner's".into(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
     /// Run SQL in which every table is a contract.
     pub async fn query(&self, sql: &str, caller: &Caller) -> Result<QueryResult> {
         let started = Instant::now();
@@ -838,16 +973,31 @@ impl Engine {
         if let Some(batches) = self.cache.as_ref().and_then(|c| c.get(&p.cache_key)) {
             let rows = batches.iter().map(|b| b.num_rows()).sum();
             let envelope = Envelope {
+                caller: Asker::of(caller),
                 contracts: p.resolutions,
                 rows,
                 suppress_k: p.suppress_k,
+                charges: BTreeMap::new(),
                 budgets: BTreeMap::new(),
                 scan: ScanStats::default(),
                 attestation: Attestation::of(sql, &batches),
                 audit_id,
                 cached: true,
             };
-            return Ok((QueryResult { batches, envelope }, Vec::new()));
+            let signature = self.sign(&envelope).await?;
+            let schema = match batches.first() {
+                Some(b) => b.schema(),
+                None => Arc::new(p.plan.schema().as_arrow().clone()),
+            };
+            return Ok((
+                QueryResult {
+                    schema,
+                    batches,
+                    envelope,
+                    signature,
+                },
+                Vec::new(),
+            ));
         }
         let physical = self.physical(&p).await?;
         let budgets = if p.charges.is_empty() {
@@ -865,17 +1015,39 @@ impl Engine {
         if let Some(c) = &self.cache {
             c.put(p.cache_key.clone(), batches.clone());
         }
+        let mut charges = BTreeMap::new();
+        for (budget, epsilon) in &p.charges {
+            *charges.entry(budget.clone()).or_insert(0.0) += epsilon;
+        }
         let envelope = Envelope {
+            caller: Asker::of(caller),
             contracts: p.resolutions,
             rows,
             suppress_k: p.suppress_k,
+            charges,
             budgets,
             scan: ScanStats::from_plan(physical.as_ref()),
             attestation: Attestation::of(sql, &batches),
             audit_id,
             cached: false,
         };
-        Ok((QueryResult { batches, envelope }, p.charges))
+        let signature = self.sign(&envelope).await?;
+        Ok((
+            QueryResult {
+                schema: physical.schema(),
+                batches,
+                envelope,
+                signature,
+            },
+            p.charges,
+        ))
+    }
+
+    async fn sign(&self, envelope: &Envelope) -> Result<Option<String>> {
+        match &self.signer {
+            Some(s) => s.sign(envelope).await.map(Some).map_err(PeqlError::Signing),
+            None => Ok(None),
+        }
     }
 }
 
