@@ -19,7 +19,7 @@ Policy Enforcing Query Engine (peQL) is a SQL query engine that lets you define 
 | **[Getting started](docs/getting-started.md)**<br>Learn the concepts, then run your first queries. | **[Using peQL](docs/USAGE.md)**<br>Work with the command line, or use peQL in Python and Rust. |
 | **[How it works](docs/execution.md)**<br>Understand validation, caller rules and query execution. | **[Reference](docs/reference.md)**<br>Look up commands, result fields and common errors. |
 
-Read the [documentation website](https://griot-cloud.github.io/peql/), or browse the pages above on GitHub.
+Read the [documentation website](https://griot-cloud.github.io/peQL/), or browse the pages above on GitHub.
 
 [Getting started →](docs/getting-started.md)
 
