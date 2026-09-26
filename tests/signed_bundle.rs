@@ -69,6 +69,37 @@ fn signatures_verify_and_tampering_is_caught() {
     assert!(signed.verify(other.verifying_key()).is_err());
 }
 
+/// The signed bytes start with the purpose, and a bundle signed under the retired
+/// `t03:parcel-bundle-signing-payload:v1` domain (or with no purpose) does not verify.
+#[test]
+fn only_the_griot_bundle_purpose_verifies() {
+    use sha2::{Digest, Sha256};
+    let dir = tempfile::tempdir().unwrap();
+    let signed = sign(bundle(dir.path()), &key());
+    assert!(signed.signing_payload().starts_with(b"griot/bundle/v1\0"));
+    let vk = *key().verifying_key();
+
+    let digest = canonical_digest(&signed.bundle);
+    let fields = |h: &mut Sha256, bytes: &[u8]| {
+        h.update((bytes.len() as u32).to_be_bytes());
+        h.update(bytes);
+    };
+    let mut old = Sha256::new();
+    fields(&mut old, b"t03:parcel-bundle-signing-payload:v1");
+    fields(&mut old, &digest);
+    fields(&mut old, &signed.metadata.key_generation.to_le_bytes());
+    fields(&mut old, &signed.metadata.signed_at_unix_ms.to_le_bytes());
+    let old = old.finalize().to_vec();
+    let unprefixed = signed.signing_payload()[b"griot/bundle/v1\0".len()..].to_vec();
+
+    for message in [old, unprefixed] {
+        let mut resigned = signed.clone();
+        let sig: Signature = key().sign(&message);
+        resigned.signature_hex = hex::encode(sig.to_der().as_bytes());
+        assert!(resigned.verify(&vk).is_err());
+    }
+}
+
 #[test]
 fn a_verified_bundle_registers_and_a_forged_one_does_not() {
     let dir = tempfile::tempdir().unwrap();

@@ -29,6 +29,8 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
 - Signed bundles are feature `signed-bundle` (`peql::signed_bundle`), verify-only:
   `SignedBundle::register` verifies and registers; signing is the issuer's.
 - parcel is pinned to the commit that adds `plan::validate_in` and builds without `wasm`.
+- A bundle signature covers `griot/bundle/v1 || 0x00 || sha256(…)` (`SIGNING_PURPOSE`); the
+  `t03:parcel-bundle-signing-payload:v1` domain is no longer accepted.
 
 **Removed**
 - The tenant engine wrapper, the worker pool shell, the platform socket clients, the HTTP bundle

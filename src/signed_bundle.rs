@@ -44,8 +44,8 @@ impl SignedBundle {
         serde_json::from_slice(bytes).map_err(|e| VerifyError(format!("signed bundle: {e}")))
     }
 
-    /// The bytes the issuer signs: a digest of the bundle's meaning, the key generation and
-    /// the signing time.
+    /// The bytes the issuer signs: [`SIGNING_PURPOSE`], a NUL, then a digest of the bundle's
+    /// meaning, the key generation and the signing time.
     pub fn signing_payload(&self) -> Vec<u8> {
         signing_payload(
             &canonical_digest(&self.bundle),
@@ -104,14 +104,18 @@ pub fn canonical_digest(b: &Bundle) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
-/// The domain separator is part of the signed format: issuers already sign with it.
-const SIGNING_DOMAIN: &[u8] = b"t03:parcel-bundle-signing-payload:v1";
+/// The purpose a bundle signature is made for: the issuer signs
+/// `SIGNING_PURPOSE || 0x00 || sha256(…)`, so a bundle signature never verifies as any other
+/// signature the same key makes, and no other signature verifies as a bundle.
+pub const SIGNING_PURPOSE: &[u8] = b"griot/bundle/v1";
 
 fn signing_payload(digest: &[u8], key_generation: u32, signed_at_unix_ms: u64) -> Vec<u8> {
     let mut h = Sha256::new();
-    field(&mut h, SIGNING_DOMAIN);
     field(&mut h, digest);
     field(&mut h, &key_generation.to_le_bytes());
     field(&mut h, &signed_at_unix_ms.to_le_bytes());
-    h.finalize().to_vec()
+    let mut message = SIGNING_PURPOSE.to_vec();
+    message.push(0);
+    message.extend_from_slice(&h.finalize());
+    message
 }
