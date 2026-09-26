@@ -118,7 +118,10 @@ impl SignedBundleFile {
     /// Verify the ECDSA P-256 signature against `vk`.
     ///
     /// Recomputes the bundle digest (must match `metadata.bundle_hash_hex`),
-    /// rebuilds the canonical signing payload, and verifies the DER signature.
+    /// rebuilds the canonical signing payload, and verifies the DER signature
+    /// over [`signed_message`] — the payload under the `griot/bundle/v1`
+    /// purpose prefix. A signature over anything else, including the old
+    /// `t03:` domain, is refused.
     pub fn verify(&self, vk: &VerifyingKey) -> Result<(), VerifyError> {
         let recomputed = canonical_digest(&self.bundle);
         let recorded = hex::decode(&self.metadata.bundle_hash_hex)
@@ -138,7 +141,7 @@ impl SignedBundleFile {
             hex::decode(&self.signature_hex).map_err(|e| VerifyError(format!("sig hex: {e}")))?;
         let sig = Signature::from_der(&sig_der)
             .map_err(|e| VerifyError(format!("invalid DER signature: {e}")))?;
-        vk.verify(&payload, &sig)
+        vk.verify(&signed_message(&payload), &sig)
             .map_err(|e| VerifyError(format!("signature verification failed: {e}")))
     }
 
@@ -212,7 +215,22 @@ pub fn canonical_digest(bundle: &CompiledBundle) -> Vec<u8> {
     hasher.finalize().to_vec()
 }
 
-/// The signed payload — identical to T03's `canonical_signing_payload`.
+/// The purpose every Griot bundle signature is made for. The issuer signs
+/// `SIGNING_PURPOSE || 0x00 || canonical_signing_payload`.
+pub const SIGNING_PURPOSE: &[u8] = b"griot/bundle/v1";
+
+/// The exact bytes a bundle signature covers: [`SIGNING_PURPOSE`], a NUL,
+/// then the canonical signing payload.
+pub fn signed_message(payload: &[u8]) -> Vec<u8> {
+    let mut message = Vec::with_capacity(SIGNING_PURPOSE.len() + 1 + payload.len());
+    message.extend_from_slice(SIGNING_PURPOSE);
+    message.push(0);
+    message.extend_from_slice(payload);
+    message
+}
+
+/// The canonical signing payload — identical to the issuer's
+/// `canonical_signing_payload`. The purpose prefix is the domain separator.
 pub fn canonical_signing_payload(
     bundle_hash: &[u8],
     key_generation: u32,
@@ -220,7 +238,6 @@ pub fn canonical_signing_payload(
     metadata_bundle_hash: &[u8],
 ) -> Vec<u8> {
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, b"t03:bundle-signing-payload:v1");
     hash_field(&mut hasher, bundle_hash);
     hash_field(&mut hasher, &key_generation.to_le_bytes());
     hash_field(&mut hasher, &signed_at_unix_ms.to_le_bytes());
@@ -537,15 +554,46 @@ mod tests {
             file.metadata.signed_at_unix_ms,
             &digest,
         );
-        let sig: Signature = sk.sign(&payload);
+        let sig: Signature = sk.sign(&signed_message(&payload));
         file.signature_hex = hex::encode(sig.to_der());
 
         file.verify(&vk).expect("signature must verify");
+
+        // The same payload signed without the purpose prefix is refused.
+        let mut unprefixed = file.clone();
+        let sig: Signature = sk.sign(&payload);
+        unprefixed.signature_hex = hex::encode(sig.to_der());
+        assert!(unprefixed.verify(&vk).is_err());
 
         // Tampering with the bundle must fail verification.
         let mut tampered = file.clone();
         tampered.bundle.manifest.contract_id = "evil".into();
         assert!(tampered.verify(&vk).is_err());
+    }
+
+    /// A bundle signed under the retired `t03:bundle-signing-payload:v1`
+    /// domain does not verify: there is no dual acceptance.
+    #[test]
+    fn the_retired_t03_domain_is_refused() {
+        let mut file = SignedBundleFile::from_json(&demo_bundle_json()).unwrap();
+        let sk = SigningKey::from_bytes(&[7u8; 32].into()).unwrap();
+        let vk = VerifyingKey::from(&sk);
+        let digest = canonical_digest(&file.bundle);
+        file.metadata.bundle_hash_hex = hex::encode(&digest);
+
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, b"t03:bundle-signing-payload:v1");
+        hash_field(&mut hasher, &digest);
+        hash_field(&mut hasher, &file.metadata.key_generation.to_le_bytes());
+        hash_field(&mut hasher, &file.metadata.signed_at_unix_ms.to_le_bytes());
+        hash_field(&mut hasher, &digest);
+        let old_payload = hasher.finalize().to_vec();
+
+        for message in [old_payload.clone(), signed_message(&old_payload)] {
+            let sig: Signature = sk.sign(&message);
+            file.signature_hex = hex::encode(sig.to_der());
+            assert!(file.verify(&vk).is_err(), "the t03 domain must not verify");
+        }
     }
 
     #[test]
