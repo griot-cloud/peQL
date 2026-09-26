@@ -848,11 +848,20 @@ impl Engine {
     /// A session with parcel's functions, gates, the gate barrier, and the object stores the
     /// bindings read: where a [`Engine::view`] plan is planned and run.
     pub fn session(&self) -> SessionContext {
-        let config = SessionConfig::new()
+        self.session_for(None)
+    }
+
+    /// [`Engine::session`] planning for `partitions` partitions, when given, instead of one per
+    /// core: the parallelism an executor that runs the plan inside a memory budget can hold.
+    fn session_for(&self, partitions: Option<usize>) -> SessionContext {
+        let mut config = SessionConfig::new()
             .with_information_schema(false)
             .set_bool("datafusion.execution.parquet.pushdown_filters", true)
             .set_bool("datafusion.execution.parquet.reorder_filters", true)
             .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
+        if let Some(partitions) = partitions {
+            config = config.with_target_partitions(partitions.max(1));
+        }
         let state = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
@@ -871,9 +880,14 @@ impl Engine {
 
     /// Resolve every contract the SQL names, register their views, and plan the query with
     /// shapes applied.
-    async fn prepare(&self, sql: &str, caller: &Caller) -> Result<Prepared> {
+    async fn prepare(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+    ) -> Result<Prepared> {
         guard::check_sql(sql)?;
-        let ctx = self.session();
+        let ctx = self.session_for(partitions);
         let state = ctx.state();
         let statement = state.sql_to_statement(sql, &datafusion::config::Dialect::Generic)?;
         let refs = state.resolve_table_references(&statement)?;
@@ -969,7 +983,7 @@ impl Engine {
     /// The physical plan a query would run, as text: shows pruning and pushed-down filters.
     /// For operators; callers cannot `EXPLAIN`. Nothing is charged.
     pub async fn explain(&self, sql: &str, caller: &Caller) -> Result<String> {
-        let p = self.prepare(sql, caller).await?;
+        let p = self.prepare(sql, caller, None).await?;
         let physical = self.physical(&p).await?;
         Ok(datafusion::physical_plan::displayable(physical.as_ref())
             .indent(true)
@@ -983,7 +997,7 @@ impl Engine {
     /// that follows is. Nothing is charged.
     pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
         let started = Instant::now();
-        match self.prepare(sql, caller).await {
+        match self.prepare(sql, caller, None).await {
             Ok(p) => Ok(Checked {
                 schema: Arc::new(p.plan.schema().as_arrow().clone()),
                 contracts: p.resolutions,
@@ -1025,8 +1039,19 @@ impl Engine {
     /// applies to the caller in the plan and the budgets it spends charged now. See
     /// [`Engine::plan`], which this is for one contract.
     pub async fn view(&self, name: &str, caller: &Caller) -> Result<Planned> {
+        self.view_for(name, caller, None).await
+    }
+
+    /// [`Engine::view`] planned for `partitions` partitions, when given, instead of one per
+    /// core (see [`Engine::plan_for`]).
+    pub async fn view_for(
+        &self,
+        name: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+    ) -> Result<Planned> {
         let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
-        self.plan(&sql, caller).await
+        self.plan_for(&sql, caller, partitions).await
     }
 
     /// SQL in which every table is a contract, planned for an executor that runs the plan
@@ -1036,8 +1061,22 @@ impl Engine {
     /// is audited and returned as `query` would return it. What the executor does with the
     /// batches is its own: no envelope is made, since no answer is formed here.
     pub async fn plan(&self, sql: &str, caller: &Caller) -> Result<Planned> {
+        self.plan_for(sql, caller, None).await
+    }
+
+    /// [`Engine::plan`] for `partitions` partitions, when given, instead of one per core. An
+    /// executor that runs the plan inside a memory budget plans for the parallelism the budget
+    /// holds: every partition of a scan, an exchange or a merge runs at once and holds its own
+    /// batches, so the partition count is what bounds the plan's memory outside its operators'
+    /// pool. The answer does not depend on it.
+    pub async fn plan_for(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+    ) -> Result<Planned> {
         let started = Instant::now();
-        let out = match self.prepare(sql, caller).await {
+        let out = match self.prepare(sql, caller, partitions).await {
             Ok(p) => self.planned(p, caller).await,
             Err(e) => Err(e),
         };
@@ -1114,7 +1153,7 @@ impl Engine {
     }
 
     async fn run(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<QueryResult> {
-        let p = self.prepare(sql, caller).await?;
+        let p = self.prepare(sql, caller, None).await?;
         if let Some(batches) = self.cache.as_ref().and_then(|c| c.get(&p.cache_key)) {
             let rows = batches.iter().map(|b| b.num_rows()).sum();
             let envelope = Envelope {
