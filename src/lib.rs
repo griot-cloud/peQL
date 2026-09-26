@@ -12,14 +12,18 @@
 //!   store      the compiled contract, if the caller may see it
 //!   resolve    decide · guarantee · which shapes apply        (parcel-runtime)
 //!   view       scan → admits → projection → ctx bound → Gate  (parcel's expressions)
-//!   shapes     suppress · aggregate noise; budgets charged     (parcel_runtime::shape)
-//!   execute    DataFusion; refused unless every scan is gated
+//!   shapes     suppress · aggregate noise                     (parcel_runtime::shape)
+//!   physical   DataFusion, whole-result suppress as SuppressExec; refused unless gated
+//!   charge     every budget the plan spends, all or none
+//!   execute    the planned plan
 //!   envelope   resolutions · scan stats · attestation · audit · signature
 //! ```
 //!
-//! Around `query`: [`Engine::check`] runs every check without reading a row (what Flight
-//! SQL's `GetFlightInfo` answers), [`Engine::view`] is the gated plan an out-of-core executor
-//! reads, and [`Engine::write`] is the only way data lands.
+//! Everything up to `charge` is [`Engine::plan`], which hands the shaped, charged plan to an
+//! executor that runs it out of core ([`Engine::view`] is the same for one contract);
+//! `query` runs that same plan itself. [`Engine::check`] runs every check without reading a
+//! row (what Flight SQL's `GetFlightInfo` answers), and [`Engine::write`] is the only way
+//! data lands.
 
 pub mod audit;
 pub mod binding;
@@ -34,6 +38,7 @@ pub mod gate;
 pub mod guard;
 pub mod manifest;
 pub mod object_binding;
+pub mod shape;
 pub mod signer;
 pub mod store;
 
@@ -50,7 +55,7 @@ pub mod signed_bundle;
 pub mod lance_table;
 
 pub use binding::{BindingResolver, LocalParquet, Location};
-pub use engine::{Checked, Engine, QueryResult, Verdict, WriteMode, WriteReport};
+pub use engine::{Checked, Engine, Planned, QueryResult, Verdict, WriteMode, WriteReport, Writing};
 pub use envelope::{Envelope, EnvelopeSigner, Resolution};
 pub use error::{PeqlError, Result};
 pub use manifest::Manifest;

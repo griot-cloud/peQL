@@ -1,4 +1,4 @@
-//! The audit log (peQL design 4.11): one record per query, refused or answered.
+//! The audit log (peQL design 4.11): one record per query, refused, answered or planned.
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -32,6 +32,8 @@ pub struct AuditRecord {
 #[serde(rename_all = "snake_case", tag = "kind", content = "reason")]
 pub enum Outcome {
     Answered,
+    /// Planned for an executor that runs it ([`crate::Engine::plan`]); its budgets are charged.
+    Planned,
     Refused(String),
     Failed(String),
 }

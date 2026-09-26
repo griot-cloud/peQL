@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -41,6 +42,7 @@ use crate::functions::FunctionStore;
 use crate::gate::{BoundTable, Gate, GateBarrier, GatedQueryPlanner, ensure_gated};
 use crate::guard;
 use crate::manifest::Manifest;
+use crate::shape::SuppressExec;
 use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered};
 
 /// The validation verdict, with the hash of the data it describes.
@@ -92,6 +94,26 @@ pub struct Checked {
 enum Bound {
     Files(Location),
     Table(Arc<dyn TableProvider>),
+}
+
+/// A write in progress under one contract: see [`Engine::begin_write`].
+pub struct Writing {
+    reg: Arc<Registered>,
+    location: Location,
+    rows: AtomicUsize,
+    /// An overwrite whose old files are still there.
+    overwrite: tokio::sync::Mutex<bool>,
+}
+
+impl Writing {
+    /// The contract written under.
+    pub fn contract(&self) -> &str {
+        self.reg.name()
+    }
+    /// Rows written so far.
+    pub fn rows(&self) -> usize {
+        self.rows.load(Ordering::SeqCst)
+    }
 }
 
 pub struct Engine {
@@ -435,15 +457,25 @@ impl Engine {
 
     /// Write batches under a contract (parcel design 10): enrich, compute flags and derived
     /// columns, cluster and partition, stamp the contract hash, validate, write the manifest.
+    /// One [`Engine::begin_write`], one [`Engine::write_part`], one [`Engine::finish_write`].
     pub async fn write(
         &self,
         name: &str,
         batches: Vec<RecordBatch>,
         mode: WriteMode,
     ) -> Result<WriteReport> {
+        let w = self.begin_write(name, mode).await?;
+        self.write_part(&w, batches).await?;
+        self.finish_write(w).await
+    }
+
+    /// Start a write under a contract that arrives in parts, as an out-of-core writer (Moruna's
+    /// `PeqlSink`) delivers it. With [`WriteMode::Overwrite`] the contract's files are removed
+    /// before the first part lands. The data is written by [`Engine::write_part`], as many times as there are parts,
+    /// and the manifest is refreshed once, by [`Engine::finish_write`]; until then the
+    /// manifest describes the data as it was.
+    pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
         let reg = self.get(name)?;
-        let c = &reg.compilation;
-        let cc = &c.contract;
         let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!(
                 "`{name}` is bound to a table; only file bindings are written"
@@ -457,11 +489,45 @@ impl Engine {
         if let Location::Local(root) = &location {
             std::fs::create_dir_all(root)?;
         }
+        Ok(Writing {
+            reg,
+            location,
+            rows: AtomicUsize::new(0),
+            overwrite: tokio::sync::Mutex::new(mode == WriteMode::Overwrite),
+        })
+    }
+
+    /// An overwrite removes the contract's files once, before the first part lands (or at the
+    /// finish of a write with no parts), and only once that part has been planned, so a part
+    /// that does not conform leaves the data as it was.
+    async fn clear_for_overwrite(&self, w: &Writing) -> Result<()> {
+        let mut pending = w.overwrite.lock().await;
+        if *pending {
+            match &w.location {
+                Location::Local(root) => {
+                    for f in binding::list_files(root)? {
+                        std::fs::remove_file(f)?;
+                    }
+                }
+                Location::Object(o) => o.remove_files().await?,
+            }
+            *pending = false;
+        }
+        Ok(())
+    }
+
+    /// Write one part of a write begun by [`Engine::begin_write`]: conform it to the row
+    /// schema, enrich, compute flags and derived columns, cluster and partition, and write
+    /// Parquet files stamped with the contract hash. Parts may be written concurrently; each
+    /// lands in files of its own. Returns the rows written.
+    pub async fn write_part(&self, w: &Writing, batches: Vec<RecordBatch>) -> Result<usize> {
+        let c = &w.reg.compilation;
+        let cc = &c.contract;
         let batches = batches
             .into_iter()
             .map(|b| conform(b, &cc.row_schema))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let rows_written: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
 
         let ctx = self.session();
         let mem = MemTable::try_new(cc.row_schema.clone(), vec![batches])?;
@@ -485,17 +551,8 @@ impl Engine {
         let df = ctx
             .execute_logical_plan(parcel_core::compile::resolve(plan)?)
             .await?;
+        self.clear_for_overwrite(w).await?;
 
-        if mode == WriteMode::Overwrite {
-            match &location {
-                Location::Local(root) => {
-                    for f in binding::list_files(root)? {
-                        std::fs::remove_file(f)?;
-                    }
-                }
-                Location::Object(o) => o.remove_files().await?,
-            }
-        }
         let layout = &c.write.layout;
         let sort: Vec<SortExpr> = layout
             .cluster_by
@@ -522,15 +579,22 @@ impl Engine {
                 .or_default()
                 .bloom_filter_enabled = Some(true);
         }
-        let url = match &location {
+        let url = match &w.location {
             Location::Local(root) => binding::local_url(root, true)?,
             Location::Object(o) => o.url(true),
         };
         df.write_parquet(&url, options, Some(parquet)).await?;
+        w.rows.fetch_add(rows, Ordering::SeqCst);
+        Ok(rows)
+    }
 
-        // The data changed: refresh every contract bound to it, the writer's last.
+    /// Finish a write begun by [`Engine::begin_write`]: the data changed, so refresh every
+    /// contract bound to it, the writer's last, which validates it and writes its manifest.
+    pub async fn finish_write(&self, w: Writing) -> Result<WriteReport> {
+        self.clear_for_overwrite(&w).await?;
+        let name = w.reg.name();
         let written_at = Utc::now();
-        let key = location.key()?;
+        let key = w.location.key()?;
         for other in self.store.list() {
             if other.name() == name {
                 continue;
@@ -543,7 +607,7 @@ impl Engine {
         }
         let (verdict, manifest) = self.refresh(name, written_at).await?;
         Ok(WriteReport {
-            rows_written,
+            rows_written: w.rows.load(Ordering::SeqCst),
             files: manifest.files.len(),
             verdict,
         })
@@ -692,17 +756,9 @@ impl Engine {
     }
 
     /// The plan that stands in for a contract, for one caller (peQL design 4.5): scan, filter
-    /// on admits and drop-level flags, project the exposed columns, bind `ctx`, gate.
-    ///
-    /// This is the gated plan an out-of-core executor consumes as its source (Moruna's
-    /// `PlanSource`): take `resolution` from [`Engine::resolve`] for the same caller (it
-    /// carries the `decide` and `guarantee` outcome and whether stored flags are read), plan
-    /// the result in [`Engine::session`] so the gate becomes a `GateExec`, and refuse the
-    /// physical plan unless [`crate::gate::ensure_gated`] accepts it. The plan is the
-    /// contract's rows for this caller and nothing more: `suppress` and aggregate `noise`
-    /// apply to a query over the view ([`Engine::query`]), so a consumer that aggregates the
-    /// view itself must not release what those shapes would have changed.
-    pub async fn view(
+    /// on admits and drop-level flags, project the exposed columns, bind `ctx`, gate. A query
+    /// names contracts; each name is this plan, and the query's shapes apply over them.
+    async fn contract_view(
         &self,
         name: &str,
         caller: &Caller,
@@ -824,7 +880,7 @@ impl Engine {
             self.visible(&name, caller)?;
             self.ensure_manifest(&name).await?;
             let (resolution, manifest) = self.resolve(&name, caller)?;
-            let view = self.view(&name, caller, &resolution).await?;
+            let view = self.contract_view(&name, caller, &resolution).await?;
             ctx.register_table(t.clone(), Arc::new(ViewTable::new(view, None)))?;
             let reg = self.get(&name)?;
             for s in parcel_runtime::plan::active_shapes(&reg.compilation.contract, caller)? {
@@ -863,14 +919,43 @@ impl Engine {
         })
     }
 
+    /// The physical plan of a prepared query, with the shapes that act while it runs, refused
+    /// unless every scan is under its contract's gate.
     async fn physical(&self, p: &Prepared) -> Result<Arc<dyn ExecutionPlan>> {
-        let physical = p.ctx.state().create_physical_plan(&p.plan).await?;
+        let mut physical = p.ctx.state().create_physical_plan(&p.plan).await?;
+        if let (Some(k), false) = (p.suppress_k, p.has_aggregate) {
+            physical = Arc::new(SuppressExec::new(k, physical));
+        }
         ensure_gated(physical.as_ref())?;
         Ok(physical)
     }
 
+    /// Plan a prepared query for one execution: the physical plan, with the budgets it spends
+    /// charged now, all or none. Every answer peQL gives is planned here.
+    async fn planned(&self, p: Prepared, caller: &Caller) -> Result<Planned> {
+        let plan = self.physical(&p).await?;
+        let budgets = if p.charges.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.budgets
+                .charge_all(&format!("{}/{}", caller.tenant, caller.id), &p.charges)?
+        };
+        let mut charges = BTreeMap::new();
+        for (budget, epsilon) in &p.charges {
+            *charges.entry(budget.clone()).or_insert(0.0) += epsilon;
+        }
+        Ok(Planned {
+            ctx: p.ctx,
+            plan,
+            contracts: p.resolutions,
+            suppress_k: p.suppress_k,
+            charges,
+            budgets,
+        })
+    }
+
     /// The physical plan a query would run, as text: shows pruning and pushed-down filters.
-    /// For operators; callers cannot `EXPLAIN`.
+    /// For operators; callers cannot `EXPLAIN`. Nothing is charged.
     pub async fn explain(&self, sql: &str, caller: &Caller) -> Result<String> {
         let p = self.prepare(sql, caller).await?;
         let physical = self.physical(&p).await?;
@@ -883,7 +968,7 @@ impl Engine {
     /// answer with: the statement guard, visibility, `decide`, `guarantee`, the plan guard.
     /// A refusal here is the refusal the query would meet.
     /// Refusals are audited as a query's are; a check that passes is not, since the query
-    /// that follows is.
+    /// that follows is. Nothing is charged.
     pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
         let started = Instant::now();
         match self.prepare(sql, caller).await {
@@ -893,19 +978,16 @@ impl Engine {
             }),
             Err(e) => {
                 if e.is_refusal() {
-                    self.audit.record(&AuditRecord {
-                        id: Uuid::new_v4(),
-                        at: Utc::now(),
-                        caller_id: caller.id.clone(),
-                        tenant: caller.tenant.clone(),
-                        purpose: caller.purpose.clone(),
-                        sql_sha256: parcel_core::hash::sha256_hex(sql.as_bytes()),
-                        contracts: Vec::new(),
-                        outcome: Outcome::Refused(e.to_string()),
-                        rows: 0,
-                        elapsed_ms: started.elapsed().as_millis() as u64,
-                        charges: Vec::new(),
-                    })?;
+                    self.audit(
+                        Uuid::new_v4(),
+                        sql,
+                        caller,
+                        started,
+                        Outcome::Refused(e.to_string()),
+                        0,
+                        Vec::new(),
+                        Vec::new(),
+                    )?;
                 }
                 Err(e)
             }
@@ -926,29 +1008,86 @@ impl Engine {
         }
     }
 
+    /// A contract as one caller may read it, planned for an executor that runs the plan
+    /// itself (Moruna's `PlanSource`): `SELECT *` over the contract, with every shape that
+    /// applies to the caller in the plan and the budgets it spends charged now. See
+    /// [`Engine::plan`], which this is for one contract.
+    pub async fn view(&self, name: &str, caller: &Caller) -> Result<Planned> {
+        let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+        self.plan(&sql, caller).await
+    }
+
+    /// SQL in which every table is a contract, planned for an executor that runs the plan
+    /// itself: resolved, gated, shaped, and charged, exactly as [`Engine::query`] plans it.
+    /// The budgets are charged once, here, for one execution of [`Planned::plan`]; the
+    /// planning is audited with its charges, and a refusal (including an exhausted budget)
+    /// is audited and returned as `query` would return it. What the executor does with the
+    /// batches is its own: no envelope is made, since no answer is formed here.
+    pub async fn plan(&self, sql: &str, caller: &Caller) -> Result<Planned> {
+        let started = Instant::now();
+        let out = match self.prepare(sql, caller).await {
+            Ok(p) => self.planned(p, caller).await,
+            Err(e) => Err(e),
+        };
+        let (outcome, charges, contracts) = match &out {
+            Ok(p) => (
+                Outcome::Planned,
+                p.charges.clone().into_iter().collect(),
+                contract_ids(&p.contracts),
+            ),
+            Err(e) if e.is_refusal() => (Outcome::Refused(e.to_string()), Vec::new(), Vec::new()),
+            Err(e) => (Outcome::Failed(e.to_string()), Vec::new(), Vec::new()),
+        };
+        self.audit(
+            Uuid::new_v4(),
+            sql,
+            caller,
+            started,
+            outcome,
+            0,
+            charges,
+            contracts,
+        )?;
+        out
+    }
+
     /// Run SQL in which every table is a contract.
     pub async fn query(&self, sql: &str, caller: &Caller) -> Result<QueryResult> {
         let started = Instant::now();
         let audit_id = Uuid::new_v4();
         let out = self.run(sql, caller, audit_id).await;
         let (outcome, rows, charges, contracts) = match &out {
-            Ok((r, charges)) => (
+            Ok(r) => (
                 Outcome::Answered,
                 r.envelope.rows,
-                charges.clone(),
-                r.envelope
-                    .contracts
-                    .iter()
-                    .map(|c| format!("{}@{}#{}", c.contract, c.version, c.compilation_hash))
-                    .collect(),
+                r.envelope.charges.clone().into_iter().collect(),
+                contract_ids(&r.envelope.contracts),
             ),
             Err(e) if e.is_refusal() => {
                 (Outcome::Refused(e.to_string()), 0, Vec::new(), Vec::new())
             }
             Err(e) => (Outcome::Failed(e.to_string()), 0, Vec::new(), Vec::new()),
         };
+        self.audit(
+            audit_id, sql, caller, started, outcome, rows, charges, contracts,
+        )?;
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit(
+        &self,
+        id: Uuid,
+        sql: &str,
+        caller: &Caller,
+        started: Instant,
+        outcome: Outcome,
+        rows: usize,
+        charges: Vec<(String, f64)>,
+        contracts: Vec<String>,
+    ) -> Result<()> {
         self.audit.record(&AuditRecord {
-            id: audit_id,
+            id,
             at: Utc::now(),
             caller_id: caller.id.clone(),
             tenant: caller.tenant.clone(),
@@ -959,16 +1098,10 @@ impl Engine {
             rows,
             elapsed_ms: started.elapsed().as_millis() as u64,
             charges,
-        })?;
-        out.map(|(r, _)| r)
+        })
     }
 
-    async fn run(
-        &self,
-        sql: &str,
-        caller: &Caller,
-        audit_id: Uuid,
-    ) -> Result<(QueryResult, Vec<(String, f64)>)> {
+    async fn run(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<QueryResult> {
         let p = self.prepare(sql, caller).await?;
         if let Some(batches) = self.cache.as_ref().and_then(|c| c.get(&p.cache_key)) {
             let rows = batches.iter().map(|b| b.num_rows()).sum();
@@ -989,58 +1122,41 @@ impl Engine {
                 Some(b) => b.schema(),
                 None => Arc::new(p.plan.schema().as_arrow().clone()),
             };
-            return Ok((
-                QueryResult {
-                    schema,
-                    batches,
-                    envelope,
-                    signature,
-                },
-                Vec::new(),
-            ));
+            return Ok(QueryResult {
+                schema,
+                batches,
+                envelope,
+                signature,
+            });
         }
-        let physical = self.physical(&p).await?;
-        let budgets = if p.charges.is_empty() {
-            BTreeMap::new()
-        } else {
-            self.budgets
-                .charge_all(&format!("{}/{}", caller.tenant, caller.id), &p.charges)?
-        };
-        let mut batches =
-            datafusion::physical_plan::collect(physical.clone(), p.ctx.task_ctx()).await?;
-        if let (Some(k), false) = (p.suppress_k, p.has_aggregate) {
-            batches = parcel_runtime::shape::suppress_ungrouped(batches, k);
-        }
+        let cache_key = p.cache_key.clone();
+        let planned = self.planned(p, caller).await?;
+        let batches =
+            datafusion::physical_plan::collect(planned.plan.clone(), planned.ctx.task_ctx())
+                .await?;
         let rows = batches.iter().map(|b| b.num_rows()).sum();
         if let Some(c) = &self.cache {
-            c.put(p.cache_key.clone(), batches.clone());
-        }
-        let mut charges = BTreeMap::new();
-        for (budget, epsilon) in &p.charges {
-            *charges.entry(budget.clone()).or_insert(0.0) += epsilon;
+            c.put(cache_key, batches.clone());
         }
         let envelope = Envelope {
             caller: Asker::of(caller),
-            contracts: p.resolutions,
+            contracts: planned.contracts,
             rows,
-            suppress_k: p.suppress_k,
-            charges,
-            budgets,
-            scan: ScanStats::from_plan(physical.as_ref()),
+            suppress_k: planned.suppress_k,
+            charges: planned.charges,
+            budgets: planned.budgets,
+            scan: ScanStats::from_plan(planned.plan.as_ref()),
             attestation: Attestation::of(sql, &batches),
             audit_id,
             cached: false,
         };
         let signature = self.sign(&envelope).await?;
-        Ok((
-            QueryResult {
-                schema: physical.schema(),
-                batches,
-                envelope,
-                signature,
-            },
-            p.charges,
-        ))
+        Ok(QueryResult {
+            schema: planned.plan.schema(),
+            batches,
+            envelope,
+            signature,
+        })
     }
 
     async fn sign(&self, envelope: &Envelope) -> Result<Option<String>> {
@@ -1048,6 +1164,36 @@ impl Engine {
             Some(s) => s.sign(envelope).await.map(Some).map_err(PeqlError::Signing),
             None => Ok(None),
         }
+    }
+}
+
+/// A query planned for one execution by an executor of the caller's choosing: what
+/// [`Engine::view`] and [`Engine::plan`] return, and what [`Engine::query`] runs. The plan is
+/// gated (every scan under its contract's `GateExec`), carries every shape that applies to
+/// the caller (group suppression, aggregate and row noise, and whole-result suppression as a
+/// [`SuppressExec`]), and its budgets are already charged. Run it in [`Planned::ctx`].
+pub struct Planned {
+    /// The session the plan was made in, whose functions and object stores it runs with.
+    pub ctx: SessionContext,
+    /// Executed once, each partition once. The charge is for one release of what it
+    /// computes: running it again (after DataFusion's `reset_plan_states`) draws fresh
+    /// noise that nothing has paid for, so an executor does so only to recompute what it
+    /// discards, never to release a second answer.
+    pub plan: Arc<dyn ExecutionPlan>,
+    /// What the resolver decided for every contract the query named.
+    pub contracts: Vec<Resolution>,
+    /// The `suppress` threshold in force.
+    pub suppress_k: Option<u64>,
+    /// Epsilon charged per budget.
+    pub charges: BTreeMap<String, f64>,
+    /// Privacy budget left per budget after the charge.
+    pub budgets: BTreeMap<String, f64>,
+}
+
+impl Planned {
+    /// The schema of the plan's batches.
+    pub fn schema(&self) -> SchemaRef {
+        self.plan.schema()
     }
 }
 
@@ -1059,6 +1205,14 @@ struct Prepared {
     charges: Vec<(String, f64)>,
     suppress_k: Option<u64>,
     has_aggregate: bool,
+}
+
+/// `name@version#compilation_hash` for each contract, as the audit log names them.
+fn contract_ids(contracts: &[Resolution]) -> Vec<String> {
+    contracts
+        .iter()
+        .map(|c| format!("{}@{}#{}", c.contract, c.version, c.compilation_hash))
+        .collect()
 }
 
 /// The caller's bound context as the contract sees it: its parameter values, in order.
