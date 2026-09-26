@@ -15,7 +15,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 peql = { path = "../.." }
-parcel-runtime = { git = "https://github.com/griot-cloud/parcel", branch = "main" }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b" }
 datafusion = "55.1.0"
 serde_json = "1"
 pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }

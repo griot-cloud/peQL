@@ -1,10 +1,22 @@
-//! A parcel bundle with the T03 authority's ECDSA P-256 signature.
+//! A parcel bundle with its issuer's ECDSA P-256 signature (feature `signed-bundle`).
+//!
+//! The engine only verifies: the signature proves who issued a bundle, and recompiling it to
+//! its compilation hash (as every registration does) proves what it says. Signing belongs to
+//! the issuer; [`SignedBundle::signing_payload`] is the exact byte string it signs.
 
-use p256::ecdsa::signature::{Signer, Verifier};
-use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
+use std::sync::Arc;
+
+use p256::ecdsa::Signature;
+use p256::ecdsa::signature::Verifier;
 use parcel_runtime::bundle::Bundle;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+
+pub use p256::ecdsa::VerifyingKey;
+
+use crate::engine::Engine;
+use crate::error::{PeqlError, Result};
+use crate::store::Registered;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -13,7 +25,7 @@ pub struct VerifyError(pub String);
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SignedBundle {
     pub bundle: Bundle,
-    /// DER-encoded signature over the signing payload, hex.
+    /// DER-encoded signature over [`SignedBundle::signing_payload`], hex.
     pub signature_hex: String,
     pub metadata: SignedBundleMetadata,
 }
@@ -23,54 +35,45 @@ pub struct SignedBundleMetadata {
     /// [`canonical_digest`] of the bundle, hex.
     pub bundle_hash_hex: String,
     pub signed_at_unix_ms: u64,
-    /// Which generation of the authority's key signed it.
+    /// Which generation of the issuer's key signed it.
     pub key_generation: u32,
 }
 
 impl SignedBundle {
-    pub fn from_json(bytes: &[u8]) -> Result<SignedBundle, VerifyError> {
+    pub fn from_json(bytes: &[u8]) -> std::result::Result<SignedBundle, VerifyError> {
         serde_json::from_slice(bytes).map_err(|e| VerifyError(format!("signed bundle: {e}")))
     }
 
-    /// Sign a bundle: what the authority does.
-    pub fn sign(
-        bundle: Bundle,
-        key: &SigningKey,
-        key_generation: u32,
-        signed_at_unix_ms: u64,
-    ) -> SignedBundle {
-        let digest = canonical_digest(&bundle);
-        let payload = signing_payload(&digest, key_generation, signed_at_unix_ms);
-        let sig: Signature = key.sign(&payload);
-        SignedBundle {
-            bundle,
-            signature_hex: hex::encode(sig.to_der().as_bytes()),
-            metadata: SignedBundleMetadata {
-                bundle_hash_hex: hex::encode(digest),
-                signed_at_unix_ms,
-                key_generation,
-            },
-        }
+    /// The bytes the issuer signs: a digest of the bundle's meaning, the key generation and
+    /// the signing time.
+    pub fn signing_payload(&self) -> Vec<u8> {
+        signing_payload(
+            &canonical_digest(&self.bundle),
+            self.metadata.key_generation,
+            self.metadata.signed_at_unix_ms,
+        )
     }
 
     /// Check the signature. The bundle's content is checked separately, by recompiling it.
-    pub fn verify(&self, key: &VerifyingKey) -> Result<(), VerifyError> {
+    pub fn verify(&self, key: &VerifyingKey) -> std::result::Result<(), VerifyError> {
         let digest = canonical_digest(&self.bundle);
         if hex::encode(&digest) != self.metadata.bundle_hash_hex {
             return Err(VerifyError(
                 "the bundle does not match the hash its metadata records".into(),
             ));
         }
-        let payload = signing_payload(
-            &digest,
-            self.metadata.key_generation,
-            self.metadata.signed_at_unix_ms,
-        );
         let der = hex::decode(&self.signature_hex)
             .map_err(|e| VerifyError(format!("signature hex: {e}")))?;
         let sig = Signature::from_der(&der).map_err(|e| VerifyError(format!("signature: {e}")))?;
-        key.verify(&payload, &sig)
+        key.verify(&self.signing_payload(), &sig)
             .map_err(|e| VerifyError(format!("signature verification failed: {e}")))
+    }
+
+    /// Verify the signature, then register the bundle (which recompiles it to its hash).
+    pub fn register(&self, engine: &Engine, key: &VerifyingKey) -> Result<Arc<Registered>> {
+        self.verify(key)
+            .map_err(|e| PeqlError::Invalid(format!("bundle signature: {e}")))?;
+        engine.register_bundle(&self.bundle)
     }
 }
 
@@ -101,9 +104,12 @@ pub fn canonical_digest(b: &Bundle) -> Vec<u8> {
     h.finalize().to_vec()
 }
 
+/// The domain separator is part of the signed format: issuers already sign with it.
+const SIGNING_DOMAIN: &[u8] = b"t03:parcel-bundle-signing-payload:v1";
+
 fn signing_payload(digest: &[u8], key_generation: u32, signed_at_unix_ms: u64) -> Vec<u8> {
     let mut h = Sha256::new();
-    field(&mut h, b"t03:parcel-bundle-signing-payload:v1");
+    field(&mut h, SIGNING_DOMAIN);
     field(&mut h, digest);
     field(&mut h, &key_generation.to_le_bytes());
     field(&mut h, &signed_at_unix_ms.to_le_bytes());

@@ -4,17 +4,7 @@ The standard engine works with local Parquet and needs no platform services. Rus
 
 ## Signed contract bundles
 
-Enable the `platform` Cargo feature to fetch bundles from an HTTP contract service. `PlatformBundleSource` requests:
-
-```text
-GET /v1/contracts/{contract-name}/bundle
-```
-
-Configure the source with an authentication header if required. Supplying an ECDSA P-256 verifying key with `with_verifying_key` enables signature verification; without that key, the source relies on its transport and does not verify the signature.
-
-Calling `source.register(&engine, name).await` fetches the bundle, checks that it names the requested contract, and registers it with the engine. Registration verifies the parcel bundle independently of the optional signature check.
-
-In Griot deployments, this contract service is called **T03**. No T03 service is included in peQL.
+Enable the `signed-bundle` Cargo feature to accept bundles signed with ECDSA P-256 by their issuer. peQL only verifies; signing belongs to the issuer. `SignedBundle::register(&engine, &key)` checks the signature and then registers the bundle, which recompiles it to its compilation hash. `signing_payload()` returns the exact bytes the issuer signs.
 
 ## Custom functions
 
@@ -33,14 +23,16 @@ Function authoring, the WebAssembly interface and manifest fields belong to parc
 
 Rust applications can bind a DataFusion `TableProvider` to a registered contract with `Engine::bind_table`. This lets the application supply data while retaining the contract query path.
 
-The optional `lance` feature adds a Lance table provider on Unix. `LanceTableProvider::open_uri` opens a dataset by path or object-store URI. `open` reads through Griot's storage service, **T04**, over its Unix socket. Building this feature requires `protoc`.
+`ObjectStoreParquet` serves bindings from a prefix of an object store (`s3://bucket/prefix/`) the way the default resolver serves local directories: streamed listing tables, the same write path, and manifests beside the data. Install it with `Engine::with_bindings`. Pass the store in: `ObjectStoreParquet::new("s3://bucket/prefix/", store)` takes any `object_store` store, configured by the application; the `s3` feature adds the S3 store.
 
-## Query workers and result signing
+The optional `lance` feature adds a Lance table provider on Unix. `LanceTableProvider::open_uri` opens a dataset by path or object-store URI. Building this feature requires `protoc`.
 
-`LongRunningPoolManager` runs queued queries on workers sharing an engine. `PoolConfig` controls worker count, queue depth and shutdown drain time. A full queue or a shutting-down pool returns an error to the submitting application.
+## Flight SQL
 
-An optional `EnvelopeSigner` signs result envelopes. `T05Client` implements signing through Griot's notary service, **T05**, on Unix. A signer failure is returned as a pool error.
+The `flight` feature adds `peql::flight::FlightSql`, a Flight SQL service over tonic on a listener the application supplies (`serve_unix`, `serve_tcp`, or `serve` for any connection stream). `GetFlightInfo` and `CreatePreparedStatement` run `Engine::check`, so a refusal returns before any scan; `DoGet` runs `Engine::query` and puts `{"envelope", "signature"}` JSON in the first message's app metadata; `DoPut` bulk ingest runs `Engine::write` for the contract's owner.
 
-`K04DEngine` is the Griot integration wrapper for registered bundles and bound data. It checks a bundle handle's tenant against its configured tenant and applies a maximum result-row count after execution. It does not authenticate callers or check that every supplied caller's tenant matches the configured tenant; that remains the host application's responsibility.
+Each request names its caller in the `x-peql-caller` header (a `Caller` as base64 JSON; `caller_header` builds it). The header is trusted, so only whoever authenticated the caller may reach the listener. `FlightSql::for_caller` fixes one caller instead.
 
-These components are library integrations. They do not provide a standalone HTTP query server.
+## Result signing
+
+`Engine::with_signer` signs every query's envelope with an `EnvelopeSigner`; the result is `QueryResult::signature`. If signing fails, the query fails. `SocketSigner` reaches a signer over a Unix socket, TCP or any connected stream: one connection per envelope, the envelope as one JSON line out, and `{"jws": ...}` or `{"error": ...}` as one line back.

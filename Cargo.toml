@@ -14,10 +14,14 @@ description = "peQL: a query engine where every table is a parcel data contract"
 
 [features]
 default = []
-# Griot platform adapters: signed parcel bundles over HTTP (T03) and result signing (T05).
-platform = ["dep:reqwest", "dep:p256"]
-# Lance datasets read through the T04 storaged socket.
-lance = ["dep:lance", "dep:lance-io", "dep:object_store", "dep:arrow-ipc-lance", "dep:url"]
+# Verify parcel bundles signed by their issuer (ECDSA P-256). Signing is the issuer's.
+signed-bundle = ["dep:p256"]
+# Serve Flight SQL over tonic on a listener the caller supplies (Unix socket, TCP, ...).
+flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-stream"]
+# Bindings in Amazon S3 and S3-compatible stores (`s3://bucket/prefix/`).
+s3 = ["object_store/aws"]
+# Lance datasets read from a path or URI.
+lance = ["dep:lance", "dep:arrow-ipc-lance"]
 
 [lib]
 name = "peql"
@@ -28,8 +32,8 @@ name = "peql"
 path = "src/bin/peql.rs"
 
 [dependencies]
-parcel-core = { git = "https://github.com/griot-cloud/parcel", branch = "main" }
-parcel-runtime = { git = "https://github.com/griot-cloud/parcel", branch = "main" }
+parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b" }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b" }
 datafusion = "55.1.0"
 tokio = { version = "1.40", features = ["full"] }
 futures = "0.3"
@@ -48,16 +52,21 @@ lru = "0.12"
 tracing = "0.1"
 clap = { version = "4", features = ["derive"] }
 
-# platform
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"], optional = true }
+# Bindings in object stores. DataFusion 55 reads through object_store 0.13, so this is its.
+object_store = { version = "0.13", default-features = false }
+
+# signed-bundle
 p256 = { version = "0.13", features = ["ecdsa"], optional = true }
+
+# flight: the versions arrow-flight 59 (Arrow 59, DataFusion 55) is built on.
+arrow-flight = { version = "59.3", features = ["flight-sql"], optional = true }
+tonic = { version = "0.14", default-features = false, features = ["transport"], optional = true }
+prost = { version = "0.14", optional = true }
+tokio-stream = { version = "0.1", features = ["net"], optional = true }
 
 # lance: its Arrow is one version behind DataFusion 55's, so batches cross by Arrow IPC.
 lance = { version = "12", default-features = false, optional = true }
-lance-io = { version = "12", default-features = false, optional = true }
-object_store = { version = "0.14", optional = true }
 arrow-ipc-lance = { package = "arrow-ipc", version = "58", optional = true }
-url = { version = "2", optional = true }
 
 # The `peql` binary restores the default SIGPIPE.
 [target.'cfg(unix)'.dependencies]
@@ -66,6 +75,9 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 wat = "1"
+# A Flight SQL client over a Unix socket, in the flight tests.
+hyper-util = { version = "0.1", features = ["tokio"] }
+tower = { version = "0.5", features = ["util"] }
 
 # DataFusion is large; full debug info for every dependency fills disks quickly.
 [profile.dev]
@@ -77,3 +89,4 @@ debug = false
 
 [profile.test]
 debug = "line-tables-only"
+

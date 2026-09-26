@@ -26,6 +26,8 @@ pub enum PeqlError {
     Refused { verb: String },
     #[error("the plan for this query has no gate for `{0}`; it will not run")]
     Ungated(String),
+    #[error("the envelope could not be signed: {0}")]
+    Signing(String),
     #[error("{0}")]
     Invalid(String),
     #[error(transparent)]

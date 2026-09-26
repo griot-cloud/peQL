@@ -3,6 +3,38 @@
 All notable changes to this project are documented here. The format is loosely
 based on [Keep a Changelog](https://keepachangelog.com/).
 
+## [Unreleased]: the engine cut for a guest
+
+peQL is now only the engine: the platform socket clients, the worker pool shell and the HTTP
+bundle fetch are gone, and what a host needs to serve it is here instead.
+
+**Added**
+- Flight SQL (feature `flight`): `GetFlightInfo` and `CreatePreparedStatement` run every check
+  and return refusals before any scan; `DoGet` streams the answer with the envelope in the first
+  message's app metadata; `DoPut` bulk ingest is `Engine::write`, by the contract's owner. It
+  serves on any listener the embedding supplies: Unix socket, TCP, or a stream of its own.
+- `SocketSigner`: an `EnvelopeSigner` at the other end of a socket, one line of JSON each way.
+  `Engine::with_signer` signs every envelope; a query whose envelope cannot be signed fails.
+- `ObjectStoreParquet`: bindings in an object store (`s3://bucket/prefix/`), streamed, written
+  and validated like local directories, with manifests beside the data. The store is passed in;
+  feature `s3` adds the S3 store.
+- `Engine::check` (every check without a read; refusals audited), `Engine::authorize_write`,
+  `Engine::session`; `Engine::view` is documented as the gated plan an out-of-core executor reads.
+- The envelope names its caller and the epsilon charged; `QueryResult` carries the answer's
+  schema and the signature.
+
+**Changed**
+- `BindingResolver::root` is `location`, which returns a `Location` (local path or object store
+  prefix); `object_stores` lets a resolver register its stores with every session.
+- Signed bundles are feature `signed-bundle` (`peql::signed_bundle`), verify-only:
+  `SignedBundle::register` verifies and registers; signing is the issuer's.
+- parcel is pinned to the commit that adds `plan::validate_in` and builds without `wasm`.
+
+**Removed**
+- The tenant engine wrapper, the worker pool shell, the platform socket clients, the HTTP bundle
+  source, the `platform` feature and its `reqwest` dependency.
+- Lance through the byte-read socket; `LanceTableProvider::open_uri` remains.
+
 ## [0.4.0]: the runtime for parcel contracts
 
 peQL now enforces contracts written in [parcel](https://github.com/griot-cloud/parcel) and has
