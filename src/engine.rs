@@ -161,6 +161,8 @@ pub struct Engine {
     /// Manifests of contracts whose files are in an object store, as last read or written.
     object_manifests: RwLock<HashMap<String, Manifest>>,
     signer: Option<Arc<dyn EnvelopeSigner>>,
+    #[cfg(feature = "flight")]
+    spool_root: PathBuf,
 }
 
 impl Engine {
@@ -170,6 +172,8 @@ impl Engine {
         let root = root.as_ref();
         std::fs::create_dir_all(root.join("_peql"))?;
         Ok(Engine {
+            #[cfg(feature = "flight")]
+            spool_root: root.join("_peql/flight"),
             store: Arc::new(DirStore::open(root)?),
             functions: Arc::new(FunctionStore::open(root)?),
             bindings: Arc::new(LocalParquet {
@@ -189,10 +193,13 @@ impl Engine {
 
     /// Everything in memory; relative bindings resolve under `base`.
     pub fn in_memory(base: impl Into<PathBuf>) -> Engine {
+        let base = base.into();
         Engine {
+            #[cfg(feature = "flight")]
+            spool_root: base.join("_peql/flight"),
             store: Arc::new(MemoryStore::default()),
             functions: Arc::new(FunctionStore::in_memory()),
-            bindings: Arc::new(LocalParquet { base: base.into() }),
+            bindings: Arc::new(LocalParquet { base }),
             budgets: Arc::new(BudgetStore::in_memory()),
             audit: Arc::new(MemoryAudit::default()),
             cache: None,
@@ -1244,6 +1251,111 @@ impl Engine {
         out
     }
 
+    #[cfg(feature = "flight")]
+    pub(crate) async fn query_spooled(&self, sql: &str, caller: &Caller) -> Result<SpoolResult> {
+        let started = Instant::now();
+        let audit_id = Uuid::new_v4();
+        let out = self.spool(sql, caller, audit_id).await;
+        let (outcome, rows, charges, contracts) = match &out {
+            Ok(r) => (
+                Outcome::Answered,
+                r.envelope.rows,
+                r.envelope.charges.clone().into_iter().collect(),
+                contract_ids(&r.envelope.contracts),
+            ),
+            Err(e) if e.is_refusal() => {
+                (Outcome::Refused(e.to_string()), 0, Vec::new(), Vec::new())
+            }
+            Err(e) => (Outcome::Failed(e.to_string()), 0, Vec::new(), Vec::new()),
+        };
+        self.audit(
+            audit_id, sql, caller, started, outcome, rows, charges, contracts,
+        )?;
+        out
+    }
+
+    #[cfg(feature = "flight")]
+    async fn spool(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<SpoolResult> {
+        use datafusion::arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+        use futures::StreamExt;
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+        let prepared = self.prepare(sql, caller, None).await?;
+        let planned = self.planned(prepared, caller).await?;
+        std::fs::create_dir_all(&self.spool_root)?;
+        let mut file = tempfile::tempfile_in(&self.spool_root)?;
+        let mut rows = 0;
+        let mut stream = datafusion::physical_plan::execute_stream(
+            planned.plan.clone(),
+            planned.ctx.task_ctx(),
+        )?;
+        {
+            let mut writer = None;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                if writer.is_none() {
+                    writer = Some(
+                        StreamWriter::try_new(&mut file, &batch.schema())
+                            .map_err(datafusion::error::DataFusionError::from)?,
+                    );
+                }
+                writer
+                    .as_mut()
+                    .unwrap()
+                    .write(&batch)
+                    .map_err(datafusion::error::DataFusionError::from)?;
+                rows += batch.num_rows();
+            }
+            if let Some(mut writer) = writer {
+                writer
+                    .finish()
+                    .map_err(datafusion::error::DataFusionError::from)?;
+            }
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 65536];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        let envelope = Envelope {
+            caller: Asker::of(caller),
+            contracts: planned.contracts,
+            rows,
+            suppress_k: planned.suppress_k,
+            charges: planned.charges,
+            budgets: planned.budgets,
+            scan: ScanStats::from_plan(planned.plan.as_ref()),
+            attestation: Attestation {
+                query_sha256: parcel_core::hash::sha256_hex(sql.as_bytes()),
+                result_sha256: hex::encode(hash.finalize()),
+                at: Utc::now(),
+            },
+            audit_id,
+            cached: false,
+        };
+        let signature = self.sign(&envelope).await?;
+        file.seek(SeekFrom::Start(0))?;
+        let batches = if file.metadata()?.len() == 0 {
+            None
+        } else {
+            Some(
+                StreamReader::try_new(file, None)
+                    .map_err(datafusion::error::DataFusionError::from)?,
+            )
+        };
+        Ok(SpoolResult {
+            schema: planned.plan.schema(),
+            batches,
+            envelope,
+            signature,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn audit(
         &self,
@@ -1393,4 +1505,12 @@ fn params_fingerprint(cc: &parcel_core::CompiledContract, caller: &Caller) -> Re
     let mut kv: Vec<(String, String)> = m.into_iter().map(|(k, v)| (k, format!("{v:?}"))).collect();
     kv.sort();
     Ok(format!("{kv:?}"))
+}
+
+#[cfg(feature = "flight")]
+pub(crate) struct SpoolResult {
+    pub schema: SchemaRef,
+    pub batches: Option<datafusion::arrow::ipc::reader::StreamReader<std::fs::File>>,
+    pub envelope: Envelope,
+    pub signature: Option<String>,
 }

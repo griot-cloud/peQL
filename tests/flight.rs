@@ -305,4 +305,81 @@ async fn one_fixed_caller_and_a_signed_envelope() {
         .as_str()
         .unwrap();
     assert_eq!(meta["signature"], format!("sig-for-{sha}"));
+    assert_eq!(
+        sha,
+        parcel_core::hash::sha256_hex(&peql::envelope::ipc_bytes(&batches))
+    );
+}
+
+#[tokio::test]
+async fn a_multi_batch_answer_streams_from_disk_and_cleans_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path());
+    e.write(
+        "demo/readings",
+        vec![batch(1, 100_000)],
+        peql::WriteMode::Append,
+    )
+    .await
+    .unwrap();
+    let sock = dir.path().join("flight.sock");
+    serve(FlightSql::for_caller(Arc::new(e), owner()), &sock).await;
+    let mut c = client(&sock, None).await;
+    let info = c
+        .execute(r#"SELECT id FROM "demo/readings""#.into(), None)
+        .await
+        .unwrap();
+    let mut stream = c
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .unwrap();
+    let mut rows = 0;
+    let mut batches = 0;
+    while let Some(batch) = stream.next().await {
+        rows += batch.unwrap().num_rows();
+        batches += 1;
+    }
+    assert_eq!(rows, owner_ids(100_000).len());
+    assert!(batches > 1);
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("_peql/flight"))
+            .unwrap()
+            .count(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn signing_failure_releases_no_flight_frames_and_removes_the_spool() {
+    struct Refuse;
+    #[async_trait::async_trait]
+    impl peql::EnvelopeSigner for Refuse {
+        async fn sign(&self, _: &peql::Envelope) -> Result<String, String> {
+            Err("signer refused".into())
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path()).with_signer(Arc::new(Refuse));
+    e.write("demo/readings", vec![batch(1, 20)], peql::WriteMode::Append)
+        .await
+        .unwrap();
+    let sock = dir.path().join("flight.sock");
+    serve(FlightSql::for_caller(Arc::new(e), owner()), &sock).await;
+    let mut c = client(&sock, None).await;
+    let info = c
+        .execute(r#"SELECT id FROM "demo/readings""#.into(), None)
+        .await
+        .unwrap();
+    let error = c
+        .do_get(info.endpoint[0].ticket.clone().unwrap())
+        .await
+        .err()
+        .expect("no answer without a signature");
+    assert!(error.to_string().contains("signer refused"));
+    assert_eq!(
+        std::fs::read_dir(dir.path().join("_peql/flight"))
+            .unwrap()
+            .count(),
+        0
+    );
 }

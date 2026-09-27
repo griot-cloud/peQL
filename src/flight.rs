@@ -142,13 +142,22 @@ impl FlightSql {
         let caller = self.caller(metadata)?;
         let sql = std::str::from_utf8(sql)
             .map_err(|_| Status::invalid_argument("the ticket is not UTF-8 SQL"))?;
-        let res = self.engine.query(sql, &caller).await.map_err(status)?;
+        let res = self
+            .engine
+            .query_spooled(sql, &caller)
+            .await
+            .map_err(status)?;
         let app_metadata = serde_json::to_vec(&serde_json::json!({
             "envelope": res.envelope,
             "signature": res.signature,
         }))
         .map_err(|e| Status::internal(e.to_string()))?;
-        let batches = futures::stream::iter(res.batches.into_iter().map(Ok));
+        let batches = futures::stream::iter(
+            res.batches
+                .into_iter()
+                .flatten()
+                .map(|batch| batch.map_err(FlightError::from)),
+        );
         let stream = FlightDataEncoderBuilder::new()
             .with_schema(res.schema)
             .with_metadata(Bytes::from(app_metadata))

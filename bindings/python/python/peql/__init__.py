@@ -25,7 +25,7 @@ import pyarrow as _pa
 from ._native import Caller, Engine as _NativeEngine
 
 __all__ = ["Engine", "Caller", "Refused"]
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 # A query refused by policy (denied, not servable, budget spent, unknown contract).
 Refused = PermissionError

@@ -98,7 +98,10 @@ impl Engine {
     /// Compile a contract document against a schema (an Arrow IPC stream) and register it.
     fn register(&self, source: String, schema_ipc: &[u8]) -> PyResult<String> {
         let (schema, _) = read_ipc(schema_ipc)?;
-        let reg = self.inner.register_contract(&source, &schema).map_err(to_py)?;
+        let reg = self
+            .inner
+            .register_contract(&source, &schema)
+            .map_err(to_py)?;
         Ok(reg.name().to_owned())
     }
 
@@ -111,11 +114,21 @@ impl Engine {
 
     /// Write an Arrow IPC stream under a contract; returns the report as JSON.
     #[pyo3(signature = (name, data_ipc, append=false))]
-    fn write(&self, py: Python<'_>, name: String, data_ipc: &[u8], append: bool) -> PyResult<String> {
+    fn write(
+        &self,
+        py: Python<'_>,
+        name: String,
+        data_ipc: &[u8],
+        append: bool,
+    ) -> PyResult<String> {
         let (_, batches) = read_ipc(data_ipc)?;
-        let mode = if append { WriteMode::Append } else { WriteMode::Overwrite };
+        let mode = if append {
+            WriteMode::Append
+        } else {
+            WriteMode::Overwrite
+        };
         let report = py
-            .allow_threads(|| self.rt.block_on(self.inner.write(&name, batches, mode)))
+            .detach(|| self.rt.block_on(self.inner.write(&name, batches, mode)))
             .map_err(to_py)?;
         serde_json::to_string(&serde_json::json!({
             "rows_written": report.rows_written,
@@ -128,18 +141,24 @@ impl Engine {
     /// The validation verdict as JSON.
     fn validate(&self, py: Python<'_>, name: String) -> PyResult<String> {
         let v = py
-            .allow_threads(|| self.rt.block_on(self.inner.validate(&name)))
+            .detach(|| self.rt.block_on(self.inner.validate(&name)))
             .map_err(to_py)?;
         serde_json::to_string(&v).map_err(err)
     }
 
     /// Run `sql` as `caller`: the result as Arrow IPC file bytes, and the envelope as JSON.
-    fn query<'py>(&self, py: Python<'py>, sql: String, caller: &Caller) -> PyResult<(Bound<'py, PyBytes>, String)> {
+    fn query<'py>(
+        &self,
+        py: Python<'py>,
+        sql: String,
+        caller: &Caller,
+    ) -> PyResult<(Bound<'py, PyBytes>, String)> {
         let caller = caller.inner.clone();
         let res = py
-            .allow_threads(|| self.rt.block_on(self.inner.query(&sql, &caller)))
+            .detach(|| self.rt.block_on(self.inner.query(&sql, &caller)))
             .map_err(to_py)?;
-        let ipc = ResultFormatter::format_results(&res.batches, ResultFormat::Arrow).map_err(err)?;
+        let ipc =
+            ResultFormatter::format_results(&res.batches, ResultFormat::Arrow).map_err(err)?;
         let envelope = serde_json::to_string(&res.envelope).map_err(err)?;
         Ok((PyBytes::new(py, &ipc), envelope))
     }
@@ -165,11 +184,15 @@ impl Engine {
 
     /// Names of every registered contract.
     fn contracts(&self) -> Vec<String> {
-        self.inner.contracts().iter().map(|r| r.name().to_owned()).collect()
+        self.inner
+            .contracts()
+            .iter()
+            .map(|r| r.name().to_owned())
+            .collect()
     }
 }
 
-#[pymodule]
+#[pymodule(gil_used = false)]
 fn _native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Engine>()?;
     m.add_class::<Caller>()?;
