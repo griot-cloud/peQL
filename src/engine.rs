@@ -1129,8 +1129,8 @@ impl Engine {
     /// Everything [`Engine::query`] checks before it reads a row, and the schema it would
     /// answer with: the statement guard, visibility, `decide`, `guarantee`, the plan guard.
     /// A refusal here is the refusal the query would meet.
-    /// Refusals are audited as a query's are; a check that passes is not, since the query
-    /// that follows is. Nothing is charged.
+    /// Failed checks are audited as a query's are; a check that passes is not, since
+    /// the query that follows is. Nothing is charged.
     pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
         let started = Instant::now();
         match self.prepare(sql, caller, None).await {
@@ -1139,18 +1139,21 @@ impl Engine {
                 contracts: p.resolutions,
             }),
             Err(e) => {
-                if e.is_refusal() {
-                    self.audit(
-                        Uuid::new_v4(),
-                        sql,
-                        caller,
-                        started,
-                        Outcome::Refused(e.to_string()),
-                        0,
-                        Vec::new(),
-                        Vec::new(),
-                    )?;
-                }
+                let outcome = if e.is_refusal() {
+                    Outcome::Refused(e.to_string())
+                } else {
+                    Outcome::Failed(e.to_string())
+                };
+                self.audit(
+                    Uuid::new_v4(),
+                    sql,
+                    caller,
+                    started,
+                    outcome,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                )?;
                 Err(e)
             }
         }
