@@ -5,7 +5,7 @@
 
 [package]
 name = "peql"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 rust-version = "1.94"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ default = []
 # Verify parcel bundles signed by their issuer (ECDSA P-256). Signing is the issuer's.
 signed-bundle = ["dep:p256"]
 # Serve Flight SQL over tonic on a listener the caller supplies (Unix socket, TCP, ...).
-flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-stream"]
+flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-stream", "dep:tempfile"]
 # Bindings in Amazon S3 and S3-compatible stores (`s3://bucket/prefix/`).
 s3 = ["object_store/aws"]
 # Lance datasets read from a path or URI.
@@ -32,8 +32,9 @@ name = "peql"
 path = "src/bin/peql.rs"
 
 [dependencies]
-parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b" }
-parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "6ce9d0b" }
+tempfile = { version = "3", optional = true }
+parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "ccdd702" }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "ccdd702" }
 datafusion = "55.1.0"
 tokio = { version = "1.40", features = ["full"] }
 futures = "0.3"

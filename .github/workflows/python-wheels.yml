@@ -177,6 +177,47 @@ jobs:
           path: bindings/python/dist/*.whl
           if-no-files-found: error
 
+  wheels-free-threaded:
+    name: cp314t / ${{ matrix.target }}
+    needs: version
+    if: needs.version.outputs.release == 'true' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: ubuntu-latest, target: x86_64 }
+          - { os: ubuntu-24.04-arm, target: aarch64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.SHA }}
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14t"
+      - name: Build the CPython 3.14 free-threaded wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: bindings/python
+          target: ${{ matrix.target }}
+          command: build
+          args: --release --locked --no-default-features --interpreter python3.14t --out dist
+          manylinux: auto
+      - name: Check the wheel without the GIL
+        shell: bash
+        working-directory: bindings/python
+        run: |
+          python -m pip install --upgrade pip pyarrow pytest
+          python -m pip install --no-index --find-links dist peql
+          python -c "import sys; assert not sys._is_gil_enabled(); import peql; assert not sys._is_gil_enabled()"
+          cp -R tests "$RUNNER_TEMP/peql-tests"
+          cd "$RUNNER_TEMP" && python -m pytest -q peql-tests
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist-cp314t-${{ matrix.target }}
+          path: bindings/python/dist/*.whl
+          if-no-files-found: error
+
   sdist:
     name: sdist
     needs: version
@@ -199,7 +240,7 @@ jobs:
 
   release:
     name: publish to PyPI and tag
-    needs: [version, binaries, wheels, sdist]
+    needs: [version, binaries, wheels, wheels-free-threaded, sdist]
     if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment:

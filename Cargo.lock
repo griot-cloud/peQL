@@ -5095,8 +5095,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-core"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
 dependencies = [
  "cel",
  "chrono",
@@ -5118,8 +5118,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-runtime"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
 dependencies = [
  "cel",
  "chrono",
@@ -5139,8 +5139,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-udf"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
 
 [[package]]
 name = "parking"
@@ -5240,7 +5240,7 @@ dependencies = [
 
 [[package]]
 name = "peql"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "arrow-flight",
  "arrow-ipc 58.3.0",

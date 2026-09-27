@@ -74,3 +74,28 @@ def test_envelope_and_describe(tmp_path):
         ("region", "Utf8"),
     ]
     assert eng.validate("sales/orders")["valid"]
+
+
+def test_free_threaded_import_keeps_the_gil_disabled():
+    import sys
+    import sysconfig
+
+    if not sysconfig.get_config_var("Py_GIL_DISABLED"):
+        pytest.skip("requires a free-threaded interpreter")
+    assert not sys._is_gil_enabled()
+
+
+def test_parallel_queries_keep_each_callers_view(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    eng = _engine(tmp_path)
+
+    def read(tenant):
+        table = eng.query(SQL, peql.Caller("parallel", "analytics", tenant))
+        expected = 5 if tenant == "acme" else 2
+        assert table.num_rows == expected
+        if tenant == "globex":
+            assert all(len(value) == 64 for value in table.column("email").to_pylist())
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        list(pool.map(read, ["acme", "globex"] * 8))
