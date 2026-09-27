@@ -2670,8 +2670,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "parcel-core"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
 dependencies = [
  "cel",
  "chrono",
@@ -2693,8 +2693,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-runtime"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
 dependencies = [
  "cel",
  "chrono",
@@ -2714,8 +2714,8 @@ dependencies = [
 
 [[package]]
 name = "parcel-udf"
-version = "0.0.1"
-source = "git+https://github.com/griot-cloud/parcel?rev=6ce9d0b#6ce9d0be556e3fe8bbd360e0fc0a204ff748a21a"
+version = "0.0.3"
+source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
 
 [[package]]
 name = "parking_lot"

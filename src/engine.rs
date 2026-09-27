@@ -1013,9 +1013,11 @@ impl Engine {
         partitions: Option<usize>,
     ) -> Result<Prepared> {
         guard::check_sql(sql)?;
+        let (expanded_sql, searches) = crate::vector::expand(sql)?;
         let ctx = self.session_for(partitions);
         let state = ctx.state();
-        let statement = state.sql_to_statement(sql, &datafusion::config::Dialect::Generic)?;
+        let statement =
+            state.sql_to_statement(&expanded_sql, &datafusion::config::Dialect::Generic)?;
         let refs = state.resolve_table_references(&statement)?;
         let mut resolutions: Vec<Resolution> = Vec::new();
         let mut active = Vec::new();
@@ -1051,7 +1053,11 @@ impl Engine {
             ));
             resolutions.push(resolution);
         }
-        let plan = ctx.state().create_logical_plan(sql).await?;
+        for search in searches {
+            let schema = self.describe(&search.table, caller)?;
+            ctx.register_udf(search.udf(schema.as_ref())?);
+        }
+        let plan = ctx.state().create_logical_plan(&expanded_sql).await?;
         guard::check_plan(&plan)?;
         let optimized = ctx.state().optimize(&plan)?;
         let active_refs: Vec<&parcel_core::compile::ShapeRule> = active.iter().collect();

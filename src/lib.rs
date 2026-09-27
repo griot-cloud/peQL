@@ -41,6 +41,7 @@ pub mod object_binding;
 pub mod shape;
 pub mod signer;
 pub mod store;
+mod vector;
 
 /// Flight SQL over tonic (feature `flight`).
 #[cfg(feature = "flight")]
