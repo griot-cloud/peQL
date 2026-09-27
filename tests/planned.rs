@@ -579,3 +579,60 @@ async fn a_plan_for_fewer_partitions_answers_the_same() {
     let any = run(e.plan(sql, &owner()).await.unwrap()).await;
     assert_eq!(two.batches, any.batches);
 }
+
+/// Row groups in every Parquet file under `dir`, and the files.
+fn row_groups(dir: &std::path::Path) -> (usize, usize) {
+    use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
+    let mut groups = 0;
+    let mut files = 0;
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(d) = dirs.pop() {
+        for entry in std::fs::read_dir(d).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|x| x == "parquet") {
+                let reader =
+                    SerializedFileReader::new(std::fs::File::open(&path).unwrap()).unwrap();
+                groups += reader.metadata().num_row_groups();
+                files += 1;
+            }
+        }
+    }
+    (groups, files)
+}
+
+/// A write that bounds its memory (`Writing::with_memory`, an out-of-core writer's share of its
+/// budget) cuts each file's row groups at a quarter of it, and lands and validates the same
+/// rows as one that does not.
+#[tokio::test]
+async fn a_write_inside_its_memory_cuts_its_row_groups() {
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path(), Arc::default()).await;
+    let rows = 200_000;
+    let w = e
+        .begin_write("demo/cells", WriteMode::Overwrite)
+        .await
+        .unwrap()
+        .with_memory(4 << 20);
+    e.write_part(&w, vec![cells(0, rows)]).await.unwrap();
+    let report = e.finish_write(w).await.unwrap();
+    assert!(report.verdict.valid);
+    assert_eq!(report.verdict.row_count as i64, rows);
+    let (bounded, files) = row_groups(&dir.path().join("cells"));
+    assert!(
+        bounded > files,
+        "a file of more than a mebibyte is several row groups: {bounded} in {files} files"
+    );
+
+    let w = e
+        .begin_write("demo/cells", WriteMode::Overwrite)
+        .await
+        .unwrap();
+    e.write_part(&w, vec![cells(0, rows)]).await.unwrap();
+    let unbounded = e.finish_write(w).await.unwrap();
+    assert_eq!(unbounded.verdict.row_count, report.verdict.row_count);
+    assert_eq!(unbounded.verdict.stats, report.verdict.stats);
+    let (groups, files) = row_groups(&dir.path().join("cells"));
+    assert_eq!(groups, files, "one row group a file without a bound");
+}

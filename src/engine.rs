@@ -101,8 +101,12 @@ pub struct Writing {
     reg: Arc<Registered>,
     location: Location,
     rows: AtomicUsize,
+    /// The in-memory bytes of the parts written so far, for the width of a row.
+    bytes: AtomicUsize,
     /// An overwrite whose old files are still there.
     overwrite: tokio::sync::Mutex<bool>,
+    /// What one part may hold while it is written, when the writer bounds it.
+    memory: Option<usize>,
 }
 
 impl Writing {
@@ -114,7 +118,31 @@ impl Writing {
     pub fn rows(&self) -> usize {
         self.rows.load(Ordering::SeqCst)
     }
+
+    /// Bound what writing one part holds to about `bytes`, beside the part itself, and what
+    /// [`Engine::finish_write`]'s validation holds to the same: an out-of-core writer (Moruna's
+    /// `PeqlSink`) gives each part in flight a share of its memory budget. The part's writers
+    /// and the sort of a clustered layout reserve from a pool of `bytes`, and the sort spills
+    /// past what the writers leave it; each file's row groups are flushed at an eighth of it and
+    /// its output buffered in another eighth, so a part partitioned into a few files is written
+    /// inside it; bloom filters are sized for the rows a part has rather than for a million; the
+    /// part is written as one stream. A part whose open files would need more than `bytes` is
+    /// refused with DataFusion's `ResourcesExhausted` rather than held. Without it a part is
+    /// written in row groups of up to a million rows and sorted in memory.
+    pub fn with_memory(mut self, bytes: usize) -> Writing {
+        self.memory = Some(bytes.max(MIN_WRITE_MEMORY));
+        self
+    }
+
+    /// The bytes a row of the parts written so far takes in memory, at least one.
+    fn row_bytes(&self) -> usize {
+        let rows = self.rows.load(Ordering::SeqCst).max(1);
+        (self.bytes.load(Ordering::SeqCst) / rows).max(1)
+    }
 }
+
+/// The least [`Writing::with_memory`] accepts: a row group of a megabyte.
+const MIN_WRITE_MEMORY: usize = 4 << 20;
 
 pub struct Engine {
     store: Arc<dyn ContractStore>,
@@ -505,7 +533,9 @@ impl Engine {
             reg,
             location,
             rows: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
             overwrite: tokio::sync::Mutex::new(mode == WriteMode::Overwrite),
+            memory: None,
         })
     }
 
@@ -540,8 +570,12 @@ impl Engine {
             .map(|b| conform(b, &cc.row_schema))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
-        let ctx = self.session();
+        let ctx = match w.memory {
+            Some(memory) => self.bounded_session(memory, 1, None)?,
+            None => self.session(),
+        };
         let mem = MemTable::try_new(cc.row_schema.clone(), vec![batches])?;
         let scan = LogicalPlanBuilder::scan("incoming", provider_as_source(Arc::new(mem)), None)?
             .build()?;
@@ -584,12 +618,24 @@ impl Engine {
             .key_value_metadata
             .insert(CONTRACT_NAME_KEY.into(), Some(cc.name.clone()));
         parquet.global.statistics_enabled = Some("page".into());
+        // One stream per file: the parallel serialiser keeps every file's buffers until the
+        // process ends, a part's worth per file written (measured, DataFusion 55.1).
+        parquet.global.allow_single_file_parallelism = false;
+        if let Some(memory) = w.memory {
+            parquet.global.max_row_group_bytes = Some(
+                datafusion::config::MaxRowGroupBytes::try_new(memory / 8)
+                    .map_err(|e| PeqlError::Invalid(e.to_string()))?,
+            );
+        }
         for c in &layout.bloom {
-            parquet
+            let options = parquet
                 .column_specific_options
                 .entry(c.clone())
-                .or_default()
-                .bloom_filter_enabled = Some(true);
+                .or_default();
+            options.bloom_filter_enabled = Some(true);
+            if w.memory.is_some() {
+                options.bloom_filter_ndv = Some(rows.max(1) as u64);
+            }
         }
         let url = match &w.location {
             Location::Local(root) => binding::local_url(root, true)?,
@@ -597,6 +643,7 @@ impl Engine {
         };
         df.write_parquet(&url, options, Some(parquet)).await?;
         w.rows.fetch_add(rows, Ordering::SeqCst);
+        w.bytes.fetch_add(bytes, Ordering::SeqCst);
         Ok(rows)
     }
 
@@ -614,10 +661,10 @@ impl Engine {
             if let Ok(Bound::Files(r)) = self.bound(&other)
                 && r.key().ok().as_ref() == Some(&key)
             {
-                self.refresh(other.name(), written_at).await?;
+                self.refresh_in(other.name(), written_at, Some(&w)).await?;
             }
         }
-        let (verdict, manifest) = self.refresh(name, written_at).await?;
+        let (verdict, manifest) = self.refresh_in(name, written_at, Some(&w)).await?;
         Ok(WriteReport {
             rows_written: w.rows.load(Ordering::SeqCst),
             files: manifest.files.len(),
@@ -627,12 +674,31 @@ impl Engine {
 
     /// Validate a contract over its files and save its manifest.
     async fn refresh(&self, name: &str, written_at: DateTime<Utc>) -> Result<(Verdict, Manifest)> {
+        self.refresh_in(name, written_at, None).await
+    }
+
+    /// [`Engine::refresh`], validating inside a write's memory when it has one.
+    async fn refresh_in(
+        &self,
+        name: &str,
+        written_at: DateTime<Utc>,
+        w: Option<&Writing>,
+    ) -> Result<(Verdict, Manifest)> {
         let reg = self.get(name)?;
         let cc = &reg.compilation.contract;
         let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!("`{name}` has no files")));
         };
-        let verdict = self.validate(name).await?;
+        let plan = reg.compilation.validation.plan.clone();
+        let verdict = match w.and_then(|w| w.memory.map(|m| (m, w.row_bytes()))) {
+            Some((memory, row_bytes)) => {
+                // A scan holds a few batches: each is an eighth of the write's memory.
+                let batch = (memory / 8 / row_bytes).clamp(64, 8192);
+                let ctx = self.bounded_session(memory, 1, Some(batch))?;
+                self.validate_in(&ctx, name, plan).await?
+            }
+            None => self.validate_with(name, plan).await?,
+        };
         let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
         let files = match &location {
             Location::Local(root) => binding::list_files(root)?
@@ -679,11 +745,20 @@ impl Engine {
     /// Run a validation plan obtained elsewhere (e.g. decoded from a bundle) over the
     /// contract's data. This is what a certificate verifier does: same plan, same data.
     pub async fn validate_with(&self, name: &str, plan: LogicalPlan) -> Result<Verdict> {
+        self.validate_in(&self.session(), name, plan).await
+    }
+
+    /// [`Engine::validate_with`] in a given session.
+    async fn validate_in(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        plan: LogicalPlan,
+    ) -> Result<Verdict> {
         let reg = self.get(name)?;
         let provider = self.raw_provider(&reg).await?;
         let verdict =
-            parcel_runtime::plan::validate_in(&self.session(), &reg.compilation, plan, provider)
-                .await?;
+            parcel_runtime::plan::validate_in(session, &reg.compilation, plan, provider).await?;
         let data_hash = match self.bound(&reg)? {
             Bound::Files(Location::Local(root)) => {
                 binding::data_hash(&root, &binding::list_files(&root)?)?
@@ -851,9 +926,42 @@ impl Engine {
         self.session_for(None)
     }
 
+    /// [`Engine::session`] for work that holds about `memory` bytes: `partitions` partitions,
+    /// batches of `batch` rows when given, operators that reserve memory (a write's files, a
+    /// clustered write's sort) reserving from a pool of `memory`, and written files buffered in
+    /// an eighth of it.
+    fn bounded_session(
+        &self,
+        memory: usize,
+        partitions: usize,
+        batch: Option<usize>,
+    ) -> Result<SessionContext> {
+        use datafusion::execution::memory_pool::FairSpillPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        let mut config = self.config_for(Some(partitions));
+        let options = config.options_mut();
+        options.execution.minimum_parallel_output_files =
+            datafusion::config::ConfigNonZeroUsize::try_new(1)
+                .map_err(|e| PeqlError::Invalid(e.to_string()))?;
+        options.execution.objectstore_writer_buffer_size = (memory / 8).max(1 << 20);
+        options.execution.sort_spill_reservation_bytes = memory / 8;
+        if let Some(rows) = batch {
+            options.execution.batch_size = datafusion::config::ConfigNonZeroUsize::try_new(rows)
+                .map_err(|e| PeqlError::Invalid(e.to_string()))?;
+        }
+        let env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(memory)))
+            .build_arc()?;
+        Ok(self.session_with(config, Some(env)))
+    }
+
     /// [`Engine::session`] planning for `partitions` partitions, when given, instead of one per
     /// core: the parallelism an executor that runs the plan inside a memory budget can hold.
     fn session_for(&self, partitions: Option<usize>) -> SessionContext {
+        self.session_with(self.config_for(partitions), None)
+    }
+
+    fn config_for(&self, partitions: Option<usize>) -> SessionConfig {
         let mut config = SessionConfig::new()
             .with_information_schema(false)
             .set_bool("datafusion.execution.parquet.pushdown_filters", true)
@@ -862,11 +970,22 @@ impl Engine {
         if let Some(partitions) = partitions {
             config = config.with_target_partitions(partitions.max(1));
         }
-        let state = SessionStateBuilder::new()
+        config
+    }
+
+    fn session_with(
+        &self,
+        config: SessionConfig,
+        env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    ) -> SessionContext {
+        let mut builder = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .with_query_planner(Arc::new(GatedQueryPlanner))
-            .build();
+            .with_query_planner(Arc::new(GatedQueryPlanner));
+        if let Some(env) = env {
+            builder = builder.with_runtime_env(env);
+        }
+        let state = builder.build();
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(GateBarrier));
         for udf in parcel_core::udfs::parcel_udfs() {
