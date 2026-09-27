@@ -1054,6 +1054,10 @@ impl Engine {
             resolutions.push(resolution);
         }
         for search in searches {
+            // A CTE cannot shadow a vector target and erase its contract resolution.
+            if !resolutions.iter().any(|r| r.contract == search.table) {
+                return Err(PeqlError::UnknownContract(search.table));
+            }
             let schema = self.describe(&search.table, caller)?;
             ctx.register_udf(search.udf(schema.as_ref())?);
         }

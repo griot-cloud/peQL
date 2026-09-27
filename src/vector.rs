@@ -1,4 +1,5 @@
 //! Exact similarity ranking over the caller's governed contract view.
+use std::collections::HashSet;
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -6,7 +7,7 @@ use datafusion::arrow::array::{Array, FixedSizeListArray, Float32Array, Float64A
 use datafusion::arrow::datatypes::{DataType, Schema};
 use datafusion::logical_expr::{ColumnarValue, ScalarUDF, Volatility, create_udf};
 use datafusion::sql::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, Statement, TableFactor, Value, VisitMut, VisitorMut,
+    Expr, FunctionArg, FunctionArgExpr, Query, Statement, TableFactor, Value, VisitMut, VisitorMut,
 };
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::Parser;
@@ -68,9 +69,20 @@ fn number(expr: &Expr) -> Result<f64> {
 pub(crate) fn expand(sql: &str) -> Result<(String, Vec<Search>)> {
     struct Expand {
         searches: Vec<Search>,
+        ctes: HashSet<String>,
     }
     impl VisitorMut for Expand {
         type Break = PeqlError;
+        fn pre_visit_query(&mut self, query: &mut Query) -> ControlFlow<Self::Break> {
+            if let Some(with) = &query.with {
+                self.ctes.extend(
+                    with.cte_tables
+                        .iter()
+                        .map(|cte| cte.alias.name.value.to_ascii_lowercase()),
+                );
+            }
+            ControlFlow::Continue(())
+        }
         fn pre_visit_table_factor(&mut self, factor: &mut TableFactor) -> ControlFlow<Self::Break> {
             let TableFactor::Table {
                 name,
@@ -190,9 +202,21 @@ pub(crate) fn expand(sql: &str) -> Result<(String, Vec<Search>)> {
     }
     let mut statements =
         Parser::parse_sql(&GenericDialect, sql).map_err(|e| invalid(e.to_string()))?;
-    let mut expand = Expand { searches: vec![] };
+    let mut expand = Expand {
+        searches: vec![],
+        ctes: HashSet::new(),
+    };
     if let ControlFlow::Break(e) = statements.visit(&mut expand) {
         return Err(e);
+    }
+    if expand
+        .searches
+        .iter()
+        .any(|search| expand.ctes.contains(&search.table.to_ascii_lowercase()))
+    {
+        return Err(invalid(
+            "a CTE cannot shadow a vector_search contract target",
+        ));
     }
     let rewritten = if expand.searches.is_empty() {
         sql.to_owned()
