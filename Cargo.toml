@@ -20,6 +20,9 @@ signed-bundle = ["dep:p256"]
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-stream"]
 # Bindings in Amazon S3 and S3-compatible stores (`s3://bucket/prefix/`).
 s3 = ["object_store/aws"]
+# Bindings in Google Cloud Storage (`gs://bucket/prefix/`). The store, and its credential, are
+# the embedder's: peQL reads no ADC file and calls no metadata server.
+gcs = ["object_store/gcp"]
 # Lance datasets read from a path or URI.
 lance = ["dep:lance", "dep:arrow-ipc-lance"]
 

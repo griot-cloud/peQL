@@ -1,4 +1,5 @@
-//! Bindings in an object store: `s3://bucket/prefix/`, or any store `object_store` speaks.
+//! Bindings in an object store: `s3://bucket/prefix/`, `gs://bucket/prefix/`, or any store
+//! `object_store` speaks.
 //!
 //! [`ObjectStoreParquet`] resolves a contract's binding to a prefix in one store and serves it
 //! the way [`crate::binding::LocalParquet`] serves a directory: a streaming listing table with
@@ -21,6 +22,29 @@
 //!     .build()
 //!     .unwrap();
 //! let bindings = ObjectStoreParquet::new("s3://lake/tenant-a/", Arc::new(store))?;
+//! let engine = peql::Engine::open("/var/lib/peql")?.with_bindings(Arc::new(bindings));
+//! # Ok(()) }
+//! ```
+//!
+//! The store is always the embedder's, built with the credential the embedder holds; peQL
+//! builds none and looks for none. For Google Cloud Storage (the `gcs` feature) that is a
+//! `CredentialProvider` serving a bearer token the embedder was handed, never ADC or the
+//! metadata server:
+//!
+//! ```no_run
+//! # #[cfg(feature = "gcs")]
+//! # fn f(token: String) -> peql::Result<()> {
+//! use std::sync::Arc;
+//! use object_store::StaticCredentialProvider;
+//! use object_store::gcp::{GcpCredential, GoogleCloudStorageBuilder};
+//! use peql::object_binding::ObjectStoreParquet;
+//!
+//! let store = GoogleCloudStorageBuilder::new()
+//!     .with_bucket_name("lake")
+//!     .with_credentials(Arc::new(StaticCredentialProvider::new(GcpCredential { bearer: token })))
+//!     .build()
+//!     .unwrap();
+//! let bindings = ObjectStoreParquet::new("gs://lake/tenant-a/", Arc::new(store))?;
 //! let engine = peql::Engine::open("/var/lib/peql")?.with_bindings(Arc::new(bindings));
 //! # Ok(()) }
 //! ```

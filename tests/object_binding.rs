@@ -118,6 +118,19 @@ async fn an_s3_binding_through_the_object_store_path() {
     scenario("s3://lake/tenant-a/", store, "tenant-a/").await;
 }
 
+/// A `gs://` base takes the same path: the resolver names the store by its scheme and bucket,
+/// and the store itself is whatever the embedder hands in.
+#[tokio::test]
+async fn a_gcs_binding_through_the_object_store_path() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    scenario(
+        "gs://lake/tenant-a/warehouse/",
+        store,
+        "tenant-a/warehouse/",
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn bindings_resolve_inside_the_store_or_not_at_all() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
@@ -164,4 +177,43 @@ fn an_s3_store_is_passed_in_not_read_from_the_environment() {
     let stores = r.object_stores();
     assert_eq!(stores.len(), 1);
     assert_eq!(stores[0].0.as_str(), "s3://lake/");
+}
+
+/// A GCS store configured in code, with the bearer token the embedder was handed: no ADC file,
+/// no metadata server. Building it contacts nothing; the resolver registers it under `gs://lake`.
+#[cfg(feature = "gcs")]
+#[tokio::test]
+async fn a_gcs_store_takes_the_embedders_token_not_the_environment() {
+    use object_store::client::CredentialProvider;
+    use object_store::gcp::GcpCredential;
+    use peql::BindingResolver;
+
+    #[derive(Debug)]
+    struct Handed(String);
+    #[async_trait::async_trait]
+    impl CredentialProvider for Handed {
+        type Credential = GcpCredential;
+        async fn get_credential(&self) -> object_store::Result<Arc<GcpCredential>> {
+            Ok(Arc::new(GcpCredential {
+                bearer: self.0.clone(),
+            }))
+        }
+    }
+
+    let provider = Arc::new(Handed("per-run-token".into()));
+    let store = object_store::gcp::GoogleCloudStorageBuilder::new()
+        .with_bucket_name("lake")
+        .with_base_url("http://127.0.0.1:9")
+        .with_client_options(object_store::ClientOptions::new().with_allow_http(true))
+        .with_credentials(provider.clone())
+        .build()
+        .unwrap();
+    assert_eq!(
+        provider.get_credential().await.unwrap().bearer,
+        "per-run-token"
+    );
+    let r = ObjectStoreParquet::new("gs://lake/tenant-a/", Arc::new(store)).unwrap();
+    let stores = r.object_stores();
+    assert_eq!(stores.len(), 1);
+    assert_eq!(stores[0].0.as_str(), "gs://lake/");
 }
