@@ -26,8 +26,8 @@ parcel-runtime = { path = "../parcel/crates/parcel-runtime" }
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets --features platform -- -D warnings
-cargo test --features platform
+cargo clippy --all-targets --features flight,signed-bundle,s3 -- -D warnings
+cargo test --features flight,signed-bundle,s3
 cargo build --bin peql
 PEQL="$PWD/target/debug/peql" examples/run-all.sh
 ```

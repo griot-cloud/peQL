@@ -85,12 +85,14 @@ The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`,
 
 | Field | Meaning |
 | --- | --- |
+| `caller` | The caller's id, tenant and purpose, as the engine was told them. |
 | `contracts` | Names, versions, hashes, decision rules, annotations, active result rules and use of stored calculations. |
 | `rows` | Number of returned rows. |
 | `suppress_k` | Active minimum group size, if any. |
+| `charges` | Epsilon this query charged, per budget. |
 | `budgets` | Remaining amounts for budgets charged by this query. An empty map is not a full ledger balance. |
 | `scan` | Scan/release row counts, scanned Arrow bytes, file bytes read and pruning counters. |
-| `attestation` | Query and result SHA-256 hashes plus a timestamp; not a signature. |
+| `attestation` | Query and result SHA-256 hashes plus a timestamp; not a signature. With a signer configured, `QueryResult::signature` carries the signed envelope. |
 | `audit_id` | Identifier of the corresponding audit entry. |
 | `cached` | Whether stored result batches were returned. |
 
@@ -107,6 +109,7 @@ The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`,
 | `BudgetExhausted` | Spending and the limit for that caller's named budget. |
 | `Refused` | Whether the SQL is a single supported read-only query. |
 | `Invalid`, `DataFusion`, `Io` | The accompanying message: input, planning, execution or storage failed. |
+| `Signing` | The configured envelope signer: it refused or did not answer, so the query returns nothing. |
 | `Ungated` | A contract scan is missing its required execution gate; report this as an engine/integration issue. |
 
 In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotServable`, `GuaranteeFailed`, `BudgetExhausted` and `Refused`. `NotWritten` is a separate failure. Python maps the refusal group to `peql.Refused`.
@@ -125,7 +128,7 @@ Keep the workspace state and dataset files together when moving or backing up a 
 
 ## Build features
 
-The default Rust build has no optional features enabled. `platform` adds HTTP signed-bundle support. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build. The storage and notary Unix-socket clients are available on Unix targets.
+The default Rust build has no optional features enabled. `flight` adds the Flight SQL service, `signed-bundle` verification of signed bundles, and `s3` the S3 store for object-store bindings. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build.
 
 See {doc}`platform` for integration behaviour.
 

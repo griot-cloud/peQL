@@ -3,6 +3,7 @@
 
 use std::collections::BTreeMap;
 
+use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use datafusion::arrow::array::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
@@ -122,13 +123,34 @@ pub fn ipc_bytes(batches: &[RecordBatch]) -> Vec<u8> {
     out
 }
 
+/// Who asked, as the engine was told.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Asker {
+    pub id: String,
+    pub tenant: String,
+    pub purpose: String,
+}
+
+impl Asker {
+    pub fn of(caller: &parcel_runtime::Caller) -> Asker {
+        Asker {
+            id: caller.id.clone(),
+            tenant: caller.tenant.clone(),
+            purpose: caller.purpose.clone(),
+        }
+    }
+}
+
 /// Everything a caller learns about a query besides the rows.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Envelope {
+    pub caller: Asker,
     pub contracts: Vec<Resolution>,
     pub rows: usize,
     /// Groups smaller than this were removed.
     pub suppress_k: Option<u64>,
+    /// Epsilon this query charged, per budget.
+    pub charges: BTreeMap<String, f64>,
     /// Privacy budget left per budget after this query.
     pub budgets: BTreeMap<String, f64>,
     pub scan: ScanStats,
@@ -137,4 +159,14 @@ pub struct Envelope {
     pub audit_id: Uuid,
     /// Served from the result cache.
     pub cached: bool,
+}
+
+/// Signs a query's envelope, returning a compact JWS: the provenance certificate for the
+/// answer. The engine holds no key; whoever does implements this (see
+/// [`crate::signer::SocketSigner`] for one reached over a socket). The envelope names the
+/// caller as the engine was told it; a signer that authenticated the caller itself should bind
+/// its own knowledge, not the envelope's claim.
+#[async_trait]
+pub trait EnvelopeSigner: Send + Sync {
+    async fn sign(&self, envelope: &Envelope) -> std::result::Result<String, String>;
 }

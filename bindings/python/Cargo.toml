@@ -3,7 +3,7 @@
 
 [package]
 name = "peql-python"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 publish = false
 
@@ -15,11 +15,15 @@ crate-type = ["cdylib"]
 
 [dependencies]
 peql = { path = "../.." }
-parcel-runtime = { git = "https://github.com/griot-cloud/parcel", branch = "main" }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "ccdd702" }
 datafusion = "55.1.0"
 serde_json = "1"
-pyo3 = { version = "0.23", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.27", features = ["extension-module"] }
 tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[features]
+default = ["abi3"]
+abi3 = ["pyo3/abi3-py39"]
 
 [profile.dev]
 debug = "line-tables-only"

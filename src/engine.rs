@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
@@ -30,15 +31,18 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::audit::{AuditLog, AuditRecord, JsonlAudit, MemoryAudit, Outcome};
-use crate::binding::{self, BindingResolver, CONTRACT_HASH_KEY, CONTRACT_NAME_KEY, LocalParquet};
+use crate::binding::{
+    self, BindingResolver, CONTRACT_HASH_KEY, CONTRACT_NAME_KEY, LocalParquet, Location,
+};
 use crate::budget::BudgetStore;
 use crate::cache::{CacheKey, QueryCache};
-use crate::envelope::{Attestation, Envelope, Resolution, ScanStats};
+use crate::envelope::{Asker, Attestation, Envelope, EnvelopeSigner, Resolution, ScanStats};
 use crate::error::{PeqlError, Result};
 use crate::functions::FunctionStore;
 use crate::gate::{BoundTable, Gate, GateBarrier, GatedQueryPlanner, ensure_gated};
 use crate::guard;
 use crate::manifest::Manifest;
+use crate::shape::SuppressExec;
 use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered};
 
 /// The validation verdict, with the hash of the data it describes.
@@ -70,15 +74,75 @@ pub enum WriteMode {
 }
 
 pub struct QueryResult {
+    /// The schema of the answer, which holds even when there are no batches.
+    pub schema: SchemaRef,
     pub batches: Vec<RecordBatch>,
     pub envelope: Envelope,
+    /// The envelope signed by the engine's [`EnvelopeSigner`], a compact JWS, when it has one.
+    pub signature: Option<String>,
 }
 
-/// Where a contract's data comes from when it is not its binding's files.
+/// What a query would return and which contracts would govern it, found without running it.
+#[derive(Clone, Debug)]
+pub struct Checked {
+    /// The schema of the answer.
+    pub schema: SchemaRef,
+    pub contracts: Vec<Resolution>,
+}
+
+/// Where a contract's data comes from: its binding's files, or a table bound in their place.
 enum Bound {
-    Files(PathBuf),
+    Files(Location),
     Table(Arc<dyn TableProvider>),
 }
+
+/// A write in progress under one contract: see [`Engine::begin_write`].
+pub struct Writing {
+    reg: Arc<Registered>,
+    location: Location,
+    rows: AtomicUsize,
+    /// The in-memory bytes of the parts written so far, for the width of a row.
+    bytes: AtomicUsize,
+    /// An overwrite whose old files are still there.
+    overwrite: tokio::sync::Mutex<bool>,
+    /// What one part may hold while it is written, when the writer bounds it.
+    memory: Option<usize>,
+}
+
+impl Writing {
+    /// The contract written under.
+    pub fn contract(&self) -> &str {
+        self.reg.name()
+    }
+    /// Rows written so far.
+    pub fn rows(&self) -> usize {
+        self.rows.load(Ordering::SeqCst)
+    }
+
+    /// Bound what writing one part holds to about `bytes`, beside the part itself, and what
+    /// [`Engine::finish_write`]'s validation holds to the same: an out-of-core writer (Moruna's
+    /// `PeqlSink`) gives each part in flight a share of its memory budget. The part's writers
+    /// and the sort of a clustered layout reserve from a pool of `bytes`, and the sort spills
+    /// past what the writers leave it; each file's row groups are flushed at an eighth of it and
+    /// its output buffered in another eighth, so a part partitioned into a few files is written
+    /// inside it; bloom filters are sized for the rows a part has rather than for a million; the
+    /// part is written as one stream. A part whose open files would need more than `bytes` is
+    /// refused with DataFusion's `ResourcesExhausted` rather than held. Without it a part is
+    /// written in row groups of up to a million rows and sorted in memory.
+    pub fn with_memory(mut self, bytes: usize) -> Writing {
+        self.memory = Some(bytes.max(MIN_WRITE_MEMORY));
+        self
+    }
+
+    /// The bytes a row of the parts written so far takes in memory, at least one.
+    fn row_bytes(&self) -> usize {
+        let rows = self.rows.load(Ordering::SeqCst).max(1);
+        (self.bytes.load(Ordering::SeqCst) / rows).max(1)
+    }
+}
+
+/// The least [`Writing::with_memory`] accepts: a row group of a megabyte.
+const MIN_WRITE_MEMORY: usize = 4 << 20;
 
 pub struct Engine {
     store: Arc<dyn ContractStore>,
@@ -94,6 +158,11 @@ pub struct Engine {
     /// Documents a contract may inherit from that are not registered themselves.
     documents: RwLock<BTreeMap<String, ContractDoc>>,
     use_stored: RwLock<bool>,
+    /// Manifests of contracts whose files are in an object store, as last read or written.
+    object_manifests: RwLock<HashMap<String, Manifest>>,
+    signer: Option<Arc<dyn EnvelopeSigner>>,
+    #[cfg(feature = "flight")]
+    spool_root: PathBuf,
 }
 
 impl Engine {
@@ -103,6 +172,8 @@ impl Engine {
         let root = root.as_ref();
         std::fs::create_dir_all(root.join("_peql"))?;
         Ok(Engine {
+            #[cfg(feature = "flight")]
+            spool_root: root.join("_peql/flight"),
             store: Arc::new(DirStore::open(root)?),
             functions: Arc::new(FunctionStore::open(root)?),
             bindings: Arc::new(LocalParquet {
@@ -115,15 +186,20 @@ impl Engine {
             table_manifests: RwLock::default(),
             documents: RwLock::default(),
             use_stored: RwLock::new(true),
+            object_manifests: RwLock::default(),
+            signer: None,
         })
     }
 
     /// Everything in memory; relative bindings resolve under `base`.
     pub fn in_memory(base: impl Into<PathBuf>) -> Engine {
+        let base = base.into();
         Engine {
+            #[cfg(feature = "flight")]
+            spool_root: base.join("_peql/flight"),
             store: Arc::new(MemoryStore::default()),
             functions: Arc::new(FunctionStore::in_memory()),
-            bindings: Arc::new(LocalParquet { base: base.into() }),
+            bindings: Arc::new(LocalParquet { base }),
             budgets: Arc::new(BudgetStore::in_memory()),
             audit: Arc::new(MemoryAudit::default()),
             cache: None,
@@ -131,6 +207,8 @@ impl Engine {
             table_manifests: RwLock::default(),
             documents: RwLock::default(),
             use_stored: RwLock::new(true),
+            object_manifests: RwLock::default(),
+            signer: None,
         }
     }
 
@@ -148,6 +226,13 @@ impl Engine {
     }
     pub fn with_audit(mut self, audit: Arc<dyn AuditLog>) -> Engine {
         self.audit = audit;
+        self
+    }
+
+    /// Sign every answer's envelope. A query whose envelope cannot be signed fails: with a
+    /// signer configured, no answer leaves without its certificate.
+    pub fn with_signer(mut self, signer: Arc<dyn EnvelopeSigner>) -> Engine {
+        self.signer = Some(signer);
         self
     }
 
@@ -337,7 +422,7 @@ impl Engine {
             return Ok(Bound::Table(t.clone()));
         }
         self.bindings
-            .root(&reg.compilation.contract)
+            .location(&reg.compilation.contract)
             .map(Bound::Files)
             .ok_or_else(|| {
                 PeqlError::Invalid(format!("`{}` has no binding peQL can read", reg.name()))
@@ -365,54 +450,139 @@ impl Engine {
                 .expect("lock")
                 .get(name)
                 .cloned()),
-            Bound::Files(root) => Ok(Manifest::load(&root, name)?),
+            Bound::Files(Location::Local(root)) => Ok(Manifest::load(&root, name)?),
+            Bound::Files(Location::Object(_)) => Ok(self
+                .object_manifests
+                .read()
+                .expect("lock")
+                .get(name)
+                .cloned()),
         }
     }
 
-    /// A contract registered over files written elsewhere has no manifest yet: make one.
+    /// Where a contract's files are, as its binding resolves them; `None` for a contract served
+    /// from a table. Two contracts bound to the same files have one location whatever their
+    /// names, so this is what an executor compares to tell whether a write lands where a read
+    /// reads.
+    pub fn location(&self, name: &str) -> Result<Option<Location>> {
+        let reg = self.get(name)?;
+        match self.bound(&reg)? {
+            Bound::Table(_) => Ok(None),
+            Bound::Files(location) => Ok(Some(location)),
+        }
+    }
+
+    /// A contract registered over files written elsewhere has no manifest yet: make one. For
+    /// files in an object store, read the manifest again, since another engine may write there.
     pub async fn ensure_manifest(&self, name: &str) -> Result<()> {
         let reg = self.get(name)?;
-        let Bound::Files(root) = self.bound(&reg)? else {
-            return Ok(());
-        };
-        if Manifest::load(&root, name)?.is_some() || binding::list_files(&root)?.is_empty() {
-            return Ok(());
+        match self.bound(&reg)? {
+            Bound::Table(_) => Ok(()),
+            Bound::Files(Location::Local(root)) => {
+                if Manifest::load(&root, name)?.is_some() || binding::list_files(&root)?.is_empty()
+                {
+                    return Ok(());
+                }
+                self.refresh(name, Utc::now()).await?;
+                Ok(())
+            }
+            Bound::Files(Location::Object(o)) => {
+                if let Some(m) = o.load_manifest(name).await? {
+                    self.object_manifests
+                        .write()
+                        .expect("lock")
+                        .insert(name.to_owned(), m);
+                } else if !o.list_files().await?.is_empty() {
+                    self.refresh(name, Utc::now()).await?;
+                }
+                Ok(())
+            }
         }
-        self.refresh(name, Utc::now()).await?;
-        Ok(())
     }
 
     // ── write and validate ──────────────────────────────────────────────────
 
     /// Write batches under a contract (parcel design 10): enrich, compute flags and derived
     /// columns, cluster and partition, stamp the contract hash, validate, write the manifest.
+    /// One [`Engine::begin_write`], one [`Engine::write_part`], one [`Engine::finish_write`].
     pub async fn write(
         &self,
         name: &str,
         batches: Vec<RecordBatch>,
         mode: WriteMode,
     ) -> Result<WriteReport> {
+        let w = self.begin_write(name, mode).await?;
+        self.write_part(&w, batches).await?;
+        self.finish_write(w).await
+    }
+
+    /// Start a write under a contract that arrives in parts, as an out-of-core writer (Moruna's
+    /// `PeqlSink`) delivers it. With [`WriteMode::Overwrite`] the contract's files are removed
+    /// before the first part lands. The data is written by [`Engine::write_part`], as many times as there are parts,
+    /// and the manifest is refreshed once, by [`Engine::finish_write`]; until then the
+    /// manifest describes the data as it was.
+    pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
         let reg = self.get(name)?;
-        let c = &reg.compilation;
-        let cc = &c.contract;
-        let Bound::Files(root) = self.bound(&reg)? else {
+        let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!(
                 "`{name}` is bound to a table; only file bindings are written"
             )));
         };
-        if root.extension().is_some_and(|e| e == "parquet") {
+        if location.is_single_file() {
             return Err(PeqlError::Invalid(format!(
                 "`{name}` binds a single file; bind a directory to write to it"
             )));
         }
-        std::fs::create_dir_all(&root)?;
+        if let Location::Local(root) = &location {
+            std::fs::create_dir_all(root)?;
+        }
+        Ok(Writing {
+            reg,
+            location,
+            rows: AtomicUsize::new(0),
+            bytes: AtomicUsize::new(0),
+            overwrite: tokio::sync::Mutex::new(mode == WriteMode::Overwrite),
+            memory: None,
+        })
+    }
+
+    /// An overwrite removes the contract's files once, before the first part lands (or at the
+    /// finish of a write with no parts), and only once that part has been planned, so a part
+    /// that does not conform leaves the data as it was.
+    async fn clear_for_overwrite(&self, w: &Writing) -> Result<()> {
+        let mut pending = w.overwrite.lock().await;
+        if *pending {
+            match &w.location {
+                Location::Local(root) => {
+                    for f in binding::list_files(root)? {
+                        std::fs::remove_file(f)?;
+                    }
+                }
+                Location::Object(o) => o.remove_files().await?,
+            }
+            *pending = false;
+        }
+        Ok(())
+    }
+
+    /// Write one part of a write begun by [`Engine::begin_write`]: conform it to the row
+    /// schema, enrich, compute flags and derived columns, cluster and partition, and write
+    /// Parquet files stamped with the contract hash. Parts may be written concurrently; each
+    /// lands in files of its own. Returns the rows written.
+    pub async fn write_part(&self, w: &Writing, batches: Vec<RecordBatch>) -> Result<usize> {
+        let c = &w.reg.compilation;
+        let cc = &c.contract;
         let batches = batches
             .into_iter()
             .map(|b| conform(b, &cc.row_schema))
             .collect::<std::result::Result<Vec<_>, _>>()?;
-        let rows_written: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+        let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
-        let ctx = self.session();
+        let ctx = match w.memory {
+            Some(memory) => self.bounded_session(memory, 1, None)?,
+            None => self.session(),
+        };
         let mem = MemTable::try_new(cc.row_schema.clone(), vec![batches])?;
         let scan = LogicalPlanBuilder::scan("incoming", provider_as_source(Arc::new(mem)), None)?
             .build()?;
@@ -434,12 +604,8 @@ impl Engine {
         let df = ctx
             .execute_logical_plan(parcel_core::compile::resolve(plan)?)
             .await?;
+        self.clear_for_overwrite(w).await?;
 
-        if mode == WriteMode::Overwrite {
-            for f in binding::list_files(&root)? {
-                std::fs::remove_file(f)?;
-            }
-        }
         let layout = &c.write.layout;
         let sort: Vec<SortExpr> = layout
             .cluster_by
@@ -459,36 +625,55 @@ impl Engine {
             .key_value_metadata
             .insert(CONTRACT_NAME_KEY.into(), Some(cc.name.clone()));
         parquet.global.statistics_enabled = Some("page".into());
+        // One stream per file: the parallel serialiser keeps every file's buffers until the
+        // process ends, a part's worth per file written (measured, DataFusion 55.1).
+        parquet.global.allow_single_file_parallelism = false;
+        if let Some(memory) = w.memory {
+            parquet.global.max_row_group_bytes = Some(
+                datafusion::config::MaxRowGroupBytes::try_new(memory / 8)
+                    .map_err(|e| PeqlError::Invalid(e.to_string()))?,
+            );
+        }
         for c in &layout.bloom {
-            parquet
+            let options = parquet
                 .column_specific_options
                 .entry(c.clone())
-                .or_default()
-                .bloom_filter_enabled = Some(true);
+                .or_default();
+            options.bloom_filter_enabled = Some(true);
+            if w.memory.is_some() {
+                options.bloom_filter_ndv = Some(rows.max(1) as u64);
+            }
         }
-        df.write_parquet(
-            &crate::binding::local_url(&root, true)?,
-            options,
-            Some(parquet),
-        )
-        .await?;
+        let url = match &w.location {
+            Location::Local(root) => binding::local_url(root, true)?,
+            Location::Object(o) => o.url(true),
+        };
+        df.write_parquet(&url, options, Some(parquet)).await?;
+        w.rows.fetch_add(rows, Ordering::SeqCst);
+        w.bytes.fetch_add(bytes, Ordering::SeqCst);
+        Ok(rows)
+    }
 
-        // The data changed: refresh every contract bound to it, the writer's last.
+    /// Finish a write begun by [`Engine::begin_write`]: the data changed, so refresh every
+    /// contract bound to it, the writer's last, which validates it and writes its manifest.
+    pub async fn finish_write(&self, w: Writing) -> Result<WriteReport> {
+        self.clear_for_overwrite(&w).await?;
+        let name = w.reg.name();
         let written_at = Utc::now();
-        let key = root.canonicalize()?;
+        let key = w.location.key()?;
         for other in self.store.list() {
             if other.name() == name {
                 continue;
             }
             if let Ok(Bound::Files(r)) = self.bound(&other)
-                && r.canonicalize().ok() == Some(key.clone())
+                && r.key().ok().as_ref() == Some(&key)
             {
-                self.refresh(other.name(), written_at).await?;
+                self.refresh_in(other.name(), written_at, Some(&w)).await?;
             }
         }
-        let (verdict, manifest) = self.refresh(name, written_at).await?;
+        let (verdict, manifest) = self.refresh_in(name, written_at, Some(&w)).await?;
         Ok(WriteReport {
-            rows_written,
+            rows_written: w.rows.load(Ordering::SeqCst),
             files: manifest.files.len(),
             verdict,
         })
@@ -496,17 +681,42 @@ impl Engine {
 
     /// Validate a contract over its files and save its manifest.
     async fn refresh(&self, name: &str, written_at: DateTime<Utc>) -> Result<(Verdict, Manifest)> {
+        self.refresh_in(name, written_at, None).await
+    }
+
+    /// [`Engine::refresh`], validating inside a write's memory when it has one.
+    async fn refresh_in(
+        &self,
+        name: &str,
+        written_at: DateTime<Utc>,
+        w: Option<&Writing>,
+    ) -> Result<(Verdict, Manifest)> {
         let reg = self.get(name)?;
         let cc = &reg.compilation.contract;
-        let Bound::Files(root) = self.bound(&reg)? else {
+        let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!("`{name}` has no files")));
         };
-        let verdict = self.validate(name).await?;
+        let plan = reg.compilation.validation.plan.clone();
+        let verdict = match w.and_then(|w| w.memory.map(|m| (m, w.row_bytes()))) {
+            Some((memory, row_bytes)) => {
+                // A scan holds a few batches: each is an eighth of the write's memory.
+                let batch = (memory / 8 / row_bytes).clamp(64, 8192);
+                let ctx = self.bounded_session(memory, 1, Some(batch))?;
+                self.validate_in(&ctx, name, plan).await?
+            }
+            None => self.validate_with(name, plan).await?,
+        };
         let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
-        let files = binding::list_files(&root)?
-            .iter()
-            .map(|f| binding::file_entry(&root, f, &flag_columns))
-            .collect::<Result<Vec<_>>>()?;
+        let files = match &location {
+            Location::Local(root) => binding::list_files(root)?
+                .iter()
+                .map(|f| binding::file_entry(root, f, &flag_columns))
+                .collect::<Result<Vec<_>>>()?,
+            Location::Object(o) => {
+                o.file_entries(&o.list_files().await?, &flag_columns)
+                    .await?
+            }
+        };
         let manifest = Manifest {
             contract: cc.name.clone(),
             contract_hash: cc.contract_hash.clone(),
@@ -520,7 +730,16 @@ impl Engine {
             row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
             files,
         };
-        manifest.save(&root)?;
+        match &location {
+            Location::Local(root) => manifest.save(root)?,
+            Location::Object(o) => {
+                o.save_manifest(&manifest).await?;
+                self.object_manifests
+                    .write()
+                    .expect("lock")
+                    .insert(name.to_owned(), manifest.clone());
+            }
+        }
         Ok((verdict, manifest))
     }
 
@@ -533,11 +752,25 @@ impl Engine {
     /// Run a validation plan obtained elsewhere (e.g. decoded from a bundle) over the
     /// contract's data. This is what a certificate verifier does: same plan, same data.
     pub async fn validate_with(&self, name: &str, plan: LogicalPlan) -> Result<Verdict> {
+        self.validate_in(&self.session(), name, plan).await
+    }
+
+    /// [`Engine::validate_with`] in a given session.
+    async fn validate_in(
+        &self,
+        session: &SessionContext,
+        name: &str,
+        plan: LogicalPlan,
+    ) -> Result<Verdict> {
         let reg = self.get(name)?;
         let provider = self.raw_provider(&reg).await?;
-        let verdict = parcel_runtime::plan::validate(&reg.compilation, plan, provider).await?;
+        let verdict =
+            parcel_runtime::plan::validate_in(session, &reg.compilation, plan, provider).await?;
         let data_hash = match self.bound(&reg)? {
-            Bound::Files(root) => binding::data_hash(&root, &binding::list_files(&root)?)?,
+            Bound::Files(Location::Local(root)) => {
+                binding::data_hash(&root, &binding::list_files(&root)?)?
+            }
+            Bound::Files(Location::Object(o)) => o.data_hash(&o.list_files().await?).await?,
             Bound::Table(t) => {
                 let batches = self.session().read_table(t)?.collect().await?;
                 parcel_core::hash::sha256_hex(&crate::envelope::ipc_bytes(&batches))
@@ -617,8 +850,9 @@ impl Engine {
     }
 
     /// The plan that stands in for a contract, for one caller (peQL design 4.5): scan, filter
-    /// on admits and drop-level flags, project the exposed columns, bind `ctx`, gate.
-    pub async fn view(
+    /// on admits and drop-level flags, project the exposed columns, bind `ctx`, gate. A query
+    /// names contracts; each name is this plan, and the query's shapes apply over them.
+    async fn contract_view(
         &self,
         name: &str,
         caller: &Caller,
@@ -693,33 +927,97 @@ impl Engine {
 
     // ── query ───────────────────────────────────────────────────────────────
 
-    /// A session with parcel's functions, gates, and the gate barrier.
-    fn session(&self) -> SessionContext {
-        let config = SessionConfig::new()
+    /// A session with parcel's functions, gates, the gate barrier, and the object stores the
+    /// bindings read: where a [`Engine::view`] plan is planned and run.
+    pub fn session(&self) -> SessionContext {
+        self.session_for(None)
+    }
+
+    /// [`Engine::session`] for work that holds about `memory` bytes: `partitions` partitions,
+    /// batches of `batch` rows when given, operators that reserve memory (a write's files, a
+    /// clustered write's sort) reserving from a pool of `memory`, and written files buffered in
+    /// an eighth of it.
+    fn bounded_session(
+        &self,
+        memory: usize,
+        partitions: usize,
+        batch: Option<usize>,
+    ) -> Result<SessionContext> {
+        use datafusion::execution::memory_pool::FairSpillPool;
+        use datafusion::execution::runtime_env::RuntimeEnvBuilder;
+        let mut config = self.config_for(Some(partitions));
+        let options = config.options_mut();
+        options.execution.minimum_parallel_output_files =
+            datafusion::config::ConfigNonZeroUsize::try_new(1)
+                .map_err(|e| PeqlError::Invalid(e.to_string()))?;
+        options.execution.objectstore_writer_buffer_size = (memory / 8).max(1 << 20);
+        options.execution.sort_spill_reservation_bytes = memory / 8;
+        if let Some(rows) = batch {
+            options.execution.batch_size = datafusion::config::ConfigNonZeroUsize::try_new(rows)
+                .map_err(|e| PeqlError::Invalid(e.to_string()))?;
+        }
+        let env = RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(FairSpillPool::new(memory)))
+            .build_arc()?;
+        Ok(self.session_with(config, Some(env)))
+    }
+
+    /// [`Engine::session`] planning for `partitions` partitions, when given, instead of one per
+    /// core: the parallelism an executor that runs the plan inside a memory budget can hold.
+    fn session_for(&self, partitions: Option<usize>) -> SessionContext {
+        self.session_with(self.config_for(partitions), None)
+    }
+
+    fn config_for(&self, partitions: Option<usize>) -> SessionConfig {
+        let mut config = SessionConfig::new()
             .with_information_schema(false)
             .set_bool("datafusion.execution.parquet.pushdown_filters", true)
             .set_bool("datafusion.execution.parquet.reorder_filters", true)
             .set_bool("datafusion.sql_parser.enable_ident_normalization", false);
-        let state = SessionStateBuilder::new()
+        if let Some(partitions) = partitions {
+            config = config.with_target_partitions(partitions.max(1));
+        }
+        config
+    }
+
+    fn session_with(
+        &self,
+        config: SessionConfig,
+        env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
+    ) -> SessionContext {
+        let mut builder = SessionStateBuilder::new()
             .with_config(config)
             .with_default_features()
-            .with_query_planner(Arc::new(GatedQueryPlanner))
-            .build();
+            .with_query_planner(Arc::new(GatedQueryPlanner));
+        if let Some(env) = env {
+            builder = builder.with_runtime_env(env);
+        }
+        let state = builder.build();
         let ctx = SessionContext::new_with_state(state);
         ctx.add_optimizer_rule(Arc::new(GateBarrier));
         for udf in parcel_core::udfs::parcel_udfs() {
             ctx.register_udf(udf);
+        }
+        for (url, store) in self.bindings.object_stores() {
+            ctx.register_object_store(url.as_ref(), store);
         }
         ctx
     }
 
     /// Resolve every contract the SQL names, register their views, and plan the query with
     /// shapes applied.
-    async fn prepare(&self, sql: &str, caller: &Caller) -> Result<Prepared> {
+    async fn prepare(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+    ) -> Result<Prepared> {
         guard::check_sql(sql)?;
-        let ctx = self.session();
+        let (expanded_sql, searches) = crate::vector::expand(sql)?;
+        let ctx = self.session_for(partitions);
         let state = ctx.state();
-        let statement = state.sql_to_statement(sql, &datafusion::config::Dialect::Generic)?;
+        let statement =
+            state.sql_to_statement(&expanded_sql, &datafusion::config::Dialect::Generic)?;
         let refs = state.resolve_table_references(&statement)?;
         let mut resolutions: Vec<Resolution> = Vec::new();
         let mut active = Vec::new();
@@ -736,7 +1034,7 @@ impl Engine {
             self.visible(&name, caller)?;
             self.ensure_manifest(&name).await?;
             let (resolution, manifest) = self.resolve(&name, caller)?;
-            let view = self.view(&name, caller, &resolution).await?;
+            let view = self.contract_view(&name, caller, &resolution).await?;
             ctx.register_table(t.clone(), Arc::new(ViewTable::new(view, None)))?;
             let reg = self.get(&name)?;
             for s in parcel_runtime::plan::active_shapes(&reg.compilation.contract, caller)? {
@@ -755,7 +1053,15 @@ impl Engine {
             ));
             resolutions.push(resolution);
         }
-        let plan = ctx.state().create_logical_plan(sql).await?;
+        for search in searches {
+            // A CTE cannot shadow a vector target and erase its contract resolution.
+            if !resolutions.iter().any(|r| r.contract == search.table) {
+                return Err(PeqlError::UnknownContract(search.table));
+            }
+            let schema = self.describe(&search.table, caller)?;
+            ctx.register_udf(search.udf(schema.as_ref())?);
+        }
+        let plan = ctx.state().create_logical_plan(&expanded_sql).await?;
         guard::check_plan(&plan)?;
         let optimized = ctx.state().optimize(&plan)?;
         let active_refs: Vec<&parcel_core::compile::ShapeRule> = active.iter().collect();
@@ -775,20 +1081,164 @@ impl Engine {
         })
     }
 
+    /// The physical plan of a prepared query, with the shapes that act while it runs, refused
+    /// unless every scan is under its contract's gate.
     async fn physical(&self, p: &Prepared) -> Result<Arc<dyn ExecutionPlan>> {
-        let physical = p.ctx.state().create_physical_plan(&p.plan).await?;
+        let mut physical = p.ctx.state().create_physical_plan(&p.plan).await?;
+        if let (Some(k), false) = (p.suppress_k, p.has_aggregate) {
+            physical = Arc::new(SuppressExec::new(k, physical));
+        }
         ensure_gated(physical.as_ref())?;
         Ok(physical)
     }
 
+    /// Plan a prepared query for one execution: the physical plan, with the budgets it spends
+    /// charged now, all or none. Every answer peQL gives is planned here.
+    async fn planned(&self, p: Prepared, caller: &Caller) -> Result<Planned> {
+        let plan = self.physical(&p).await?;
+        let budgets = if p.charges.is_empty() {
+            BTreeMap::new()
+        } else {
+            self.budgets
+                .charge_all(&format!("{}/{}", caller.tenant, caller.id), &p.charges)?
+        };
+        let mut charges = BTreeMap::new();
+        for (budget, epsilon) in &p.charges {
+            *charges.entry(budget.clone()).or_insert(0.0) += epsilon;
+        }
+        Ok(Planned {
+            ctx: p.ctx,
+            plan,
+            contracts: p.resolutions,
+            suppress_k: p.suppress_k,
+            charges,
+            budgets,
+        })
+    }
+
     /// The physical plan a query would run, as text: shows pruning and pushed-down filters.
-    /// For operators; callers cannot `EXPLAIN`.
+    /// For operators; callers cannot `EXPLAIN`. Nothing is charged.
     pub async fn explain(&self, sql: &str, caller: &Caller) -> Result<String> {
-        let p = self.prepare(sql, caller).await?;
+        let p = self.prepare(sql, caller, None).await?;
         let physical = self.physical(&p).await?;
         Ok(datafusion::physical_plan::displayable(physical.as_ref())
             .indent(true)
             .to_string())
+    }
+
+    /// Everything [`Engine::query`] checks before it reads a row, and the schema it would
+    /// answer with: the statement guard, visibility, `decide`, `guarantee`, the plan guard.
+    /// A refusal here is the refusal the query would meet.
+    /// Failed checks are audited as a query's are; a check that passes is not, since
+    /// the query that follows is. Nothing is charged.
+    pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
+        let started = Instant::now();
+        match self.prepare(sql, caller, None).await {
+            Ok(p) => Ok(Checked {
+                schema: Arc::new(p.plan.schema().as_arrow().clone()),
+                contracts: p.resolutions,
+            }),
+            Err(e) => {
+                let outcome = if e.is_refusal() {
+                    Outcome::Refused(e.to_string())
+                } else {
+                    Outcome::Failed(e.to_string())
+                };
+                self.audit(
+                    Uuid::new_v4(),
+                    sql,
+                    caller,
+                    started,
+                    outcome,
+                    0,
+                    Vec::new(),
+                    Vec::new(),
+                )?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Whether `caller` may write under `name`: the contract's owner tenant may, and so may
+    /// anyone for a contract with no owner. Nothing else about a write depends on the caller,
+    /// so an embedding that accepts writes from callers checks this before [`Engine::write`].
+    pub fn authorize_write(&self, name: &str, caller: &Caller) -> Result<()> {
+        let reg = self.visible(name, caller)?;
+        match reg.owner() {
+            Some(owner) if owner != caller.tenant => Err(PeqlError::Denied {
+                contract: name.to_owned(),
+                rule: "writes are the owner's".into(),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// A contract as one caller may read it, planned for an executor that runs the plan
+    /// itself (Moruna's `PlanSource`): `SELECT *` over the contract, with every shape that
+    /// applies to the caller in the plan and the budgets it spends charged now. See
+    /// [`Engine::plan`], which this is for one contract.
+    pub async fn view(&self, name: &str, caller: &Caller) -> Result<Planned> {
+        self.view_for(name, caller, None).await
+    }
+
+    /// [`Engine::view`] planned for `partitions` partitions, when given, instead of one per
+    /// core (see [`Engine::plan_for`]).
+    pub async fn view_for(
+        &self,
+        name: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+    ) -> Result<Planned> {
+        let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+        self.plan_for(&sql, caller, partitions).await
+    }
+
+    /// SQL in which every table is a contract, planned for an executor that runs the plan
+    /// itself: resolved, gated, shaped, and charged, exactly as [`Engine::query`] plans it.
+    /// The budgets are charged once, here, for one execution of [`Planned::plan`]; the
+    /// planning is audited with its charges, and a refusal (including an exhausted budget)
+    /// is audited and returned as `query` would return it. What the executor does with the
+    /// batches is its own: no envelope is made, since no answer is formed here.
+    pub async fn plan(&self, sql: &str, caller: &Caller) -> Result<Planned> {
+        self.plan_for(sql, caller, None).await
+    }
+
+    /// [`Engine::plan`] for `partitions` partitions, when given, instead of one per core. An
+    /// executor that runs the plan inside a memory budget plans for the parallelism the budget
+    /// holds: every partition of a scan, an exchange or a merge runs at once and holds its own
+    /// batches, so the partition count is what bounds the plan's memory outside its operators'
+    /// pool. The answer does not depend on it.
+    pub async fn plan_for(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+    ) -> Result<Planned> {
+        let started = Instant::now();
+        let out = match self.prepare(sql, caller, partitions).await {
+            Ok(p) => self.planned(p, caller).await,
+            Err(e) => Err(e),
+        };
+        let (outcome, charges, contracts) = match &out {
+            Ok(p) => (
+                Outcome::Planned,
+                p.charges.clone().into_iter().collect(),
+                contract_ids(&p.contracts),
+            ),
+            Err(e) if e.is_refusal() => (Outcome::Refused(e.to_string()), Vec::new(), Vec::new()),
+            Err(e) => (Outcome::Failed(e.to_string()), Vec::new(), Vec::new()),
+        };
+        self.audit(
+            Uuid::new_v4(),
+            sql,
+            caller,
+            started,
+            outcome,
+            0,
+            charges,
+            contracts,
+        )?;
+        out
     }
 
     /// Run SQL in which every table is a contract.
@@ -797,23 +1247,142 @@ impl Engine {
         let audit_id = Uuid::new_v4();
         let out = self.run(sql, caller, audit_id).await;
         let (outcome, rows, charges, contracts) = match &out {
-            Ok((r, charges)) => (
+            Ok(r) => (
                 Outcome::Answered,
                 r.envelope.rows,
-                charges.clone(),
-                r.envelope
-                    .contracts
-                    .iter()
-                    .map(|c| format!("{}@{}#{}", c.contract, c.version, c.compilation_hash))
-                    .collect(),
+                r.envelope.charges.clone().into_iter().collect(),
+                contract_ids(&r.envelope.contracts),
             ),
             Err(e) if e.is_refusal() => {
                 (Outcome::Refused(e.to_string()), 0, Vec::new(), Vec::new())
             }
             Err(e) => (Outcome::Failed(e.to_string()), 0, Vec::new(), Vec::new()),
         };
+        self.audit(
+            audit_id, sql, caller, started, outcome, rows, charges, contracts,
+        )?;
+        out
+    }
+
+    #[cfg(feature = "flight")]
+    pub(crate) async fn query_spooled(&self, sql: &str, caller: &Caller) -> Result<SpoolResult> {
+        let started = Instant::now();
+        let audit_id = Uuid::new_v4();
+        let out = self.spool(sql, caller, audit_id).await;
+        let (outcome, rows, charges, contracts) = match &out {
+            Ok(r) => (
+                Outcome::Answered,
+                r.envelope.rows,
+                r.envelope.charges.clone().into_iter().collect(),
+                contract_ids(&r.envelope.contracts),
+            ),
+            Err(e) if e.is_refusal() => {
+                (Outcome::Refused(e.to_string()), 0, Vec::new(), Vec::new())
+            }
+            Err(e) => (Outcome::Failed(e.to_string()), 0, Vec::new(), Vec::new()),
+        };
+        self.audit(
+            audit_id, sql, caller, started, outcome, rows, charges, contracts,
+        )?;
+        out
+    }
+
+    #[cfg(feature = "flight")]
+    async fn spool(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<SpoolResult> {
+        use datafusion::arrow::ipc::{reader::StreamReader, writer::StreamWriter};
+        use futures::StreamExt;
+        use sha2::{Digest, Sha256};
+        use std::io::{Read, Seek, SeekFrom};
+        let prepared = self.prepare(sql, caller, None).await?;
+        let planned = self.planned(prepared, caller).await?;
+        std::fs::create_dir_all(&self.spool_root)?;
+        let mut file = tempfile::tempfile_in(&self.spool_root)?;
+        let mut rows = 0;
+        let mut stream = datafusion::physical_plan::execute_stream(
+            planned.plan.clone(),
+            planned.ctx.task_ctx(),
+        )?;
+        {
+            let mut writer = None;
+            while let Some(batch) = stream.next().await {
+                let batch = batch?;
+                if writer.is_none() {
+                    writer = Some(
+                        StreamWriter::try_new(&mut file, &batch.schema())
+                            .map_err(datafusion::error::DataFusionError::from)?,
+                    );
+                }
+                writer
+                    .as_mut()
+                    .unwrap()
+                    .write(&batch)
+                    .map_err(datafusion::error::DataFusionError::from)?;
+                rows += batch.num_rows();
+            }
+            if let Some(mut writer) = writer {
+                writer
+                    .finish()
+                    .map_err(datafusion::error::DataFusionError::from)?;
+            }
+        }
+        file.seek(SeekFrom::Start(0))?;
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 65536];
+        loop {
+            let n = file.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            hash.update(&buffer[..n]);
+        }
+        let envelope = Envelope {
+            caller: Asker::of(caller),
+            contracts: planned.contracts,
+            rows,
+            suppress_k: planned.suppress_k,
+            charges: planned.charges,
+            budgets: planned.budgets,
+            scan: ScanStats::from_plan(planned.plan.as_ref()),
+            attestation: Attestation {
+                query_sha256: parcel_core::hash::sha256_hex(sql.as_bytes()),
+                result_sha256: hex::encode(hash.finalize()),
+                at: Utc::now(),
+            },
+            audit_id,
+            cached: false,
+        };
+        let signature = self.sign(&envelope).await?;
+        file.seek(SeekFrom::Start(0))?;
+        let batches = if file.metadata()?.len() == 0 {
+            None
+        } else {
+            Some(
+                StreamReader::try_new(file, None)
+                    .map_err(datafusion::error::DataFusionError::from)?,
+            )
+        };
+        Ok(SpoolResult {
+            schema: planned.plan.schema(),
+            batches,
+            envelope,
+            signature,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn audit(
+        &self,
+        id: Uuid,
+        sql: &str,
+        caller: &Caller,
+        started: Instant,
+        outcome: Outcome,
+        rows: usize,
+        charges: Vec<(String, f64)>,
+        contracts: Vec<String>,
+    ) -> Result<()> {
         self.audit.record(&AuditRecord {
-            id: audit_id,
+            id,
             at: Utc::now(),
             caller_id: caller.id.clone(),
             tenant: caller.tenant.clone(),
@@ -824,58 +1393,102 @@ impl Engine {
             rows,
             elapsed_ms: started.elapsed().as_millis() as u64,
             charges,
-        })?;
-        out.map(|(r, _)| r)
+        })
     }
 
-    async fn run(
-        &self,
-        sql: &str,
-        caller: &Caller,
-        audit_id: Uuid,
-    ) -> Result<(QueryResult, Vec<(String, f64)>)> {
-        let p = self.prepare(sql, caller).await?;
+    async fn run(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<QueryResult> {
+        let p = self.prepare(sql, caller, None).await?;
         if let Some(batches) = self.cache.as_ref().and_then(|c| c.get(&p.cache_key)) {
             let rows = batches.iter().map(|b| b.num_rows()).sum();
             let envelope = Envelope {
+                caller: Asker::of(caller),
                 contracts: p.resolutions,
                 rows,
                 suppress_k: p.suppress_k,
+                charges: BTreeMap::new(),
                 budgets: BTreeMap::new(),
                 scan: ScanStats::default(),
                 attestation: Attestation::of(sql, &batches),
                 audit_id,
                 cached: true,
             };
-            return Ok((QueryResult { batches, envelope }, Vec::new()));
+            let signature = self.sign(&envelope).await?;
+            let schema = match batches.first() {
+                Some(b) => b.schema(),
+                None => Arc::new(p.plan.schema().as_arrow().clone()),
+            };
+            return Ok(QueryResult {
+                schema,
+                batches,
+                envelope,
+                signature,
+            });
         }
-        let physical = self.physical(&p).await?;
-        let budgets = if p.charges.is_empty() {
-            BTreeMap::new()
-        } else {
-            self.budgets
-                .charge_all(&format!("{}/{}", caller.tenant, caller.id), &p.charges)?
-        };
-        let mut batches =
-            datafusion::physical_plan::collect(physical.clone(), p.ctx.task_ctx()).await?;
-        if let (Some(k), false) = (p.suppress_k, p.has_aggregate) {
-            batches = parcel_runtime::shape::suppress_ungrouped(batches, k);
-        }
+        let cache_key = p.cache_key.clone();
+        let planned = self.planned(p, caller).await?;
+        let batches =
+            datafusion::physical_plan::collect(planned.plan.clone(), planned.ctx.task_ctx())
+                .await?;
         let rows = batches.iter().map(|b| b.num_rows()).sum();
         if let Some(c) = &self.cache {
-            c.put(p.cache_key.clone(), batches.clone());
+            c.put(cache_key, batches.clone());
         }
         let envelope = Envelope {
-            contracts: p.resolutions,
+            caller: Asker::of(caller),
+            contracts: planned.contracts,
             rows,
-            suppress_k: p.suppress_k,
-            budgets,
-            scan: ScanStats::from_plan(physical.as_ref()),
+            suppress_k: planned.suppress_k,
+            charges: planned.charges,
+            budgets: planned.budgets,
+            scan: ScanStats::from_plan(planned.plan.as_ref()),
             attestation: Attestation::of(sql, &batches),
             audit_id,
             cached: false,
         };
-        Ok((QueryResult { batches, envelope }, p.charges))
+        let signature = self.sign(&envelope).await?;
+        Ok(QueryResult {
+            schema: planned.plan.schema(),
+            batches,
+            envelope,
+            signature,
+        })
+    }
+
+    async fn sign(&self, envelope: &Envelope) -> Result<Option<String>> {
+        match &self.signer {
+            Some(s) => s.sign(envelope).await.map(Some).map_err(PeqlError::Signing),
+            None => Ok(None),
+        }
+    }
+}
+
+/// A query planned for one execution by an executor of the caller's choosing: what
+/// [`Engine::view`] and [`Engine::plan`] return, and what [`Engine::query`] runs. The plan is
+/// gated (every scan under its contract's `GateExec`), carries every shape that applies to
+/// the caller (group suppression, aggregate and row noise, and whole-result suppression as a
+/// [`SuppressExec`]), and its budgets are already charged. Run it in [`Planned::ctx`].
+pub struct Planned {
+    /// The session the plan was made in, whose functions and object stores it runs with.
+    pub ctx: SessionContext,
+    /// Executed once, each partition once. The charge is for one release of what it
+    /// computes: running it again (after DataFusion's `reset_plan_states`) draws fresh
+    /// noise that nothing has paid for, so an executor does so only to recompute what it
+    /// discards, never to release a second answer.
+    pub plan: Arc<dyn ExecutionPlan>,
+    /// What the resolver decided for every contract the query named.
+    pub contracts: Vec<Resolution>,
+    /// The `suppress` threshold in force.
+    pub suppress_k: Option<u64>,
+    /// Epsilon charged per budget.
+    pub charges: BTreeMap<String, f64>,
+    /// Privacy budget left per budget after the charge.
+    pub budgets: BTreeMap<String, f64>,
+}
+
+impl Planned {
+    /// The schema of the plan's batches.
+    pub fn schema(&self) -> SchemaRef {
+        self.plan.schema()
     }
 }
 
@@ -889,6 +1502,14 @@ struct Prepared {
     has_aggregate: bool,
 }
 
+/// `name@version#compilation_hash` for each contract, as the audit log names them.
+fn contract_ids(contracts: &[Resolution]) -> Vec<String> {
+    contracts
+        .iter()
+        .map(|c| format!("{}@{}#{}", c.contract, c.version, c.compilation_hash))
+        .collect()
+}
+
 /// The caller's bound context as the contract sees it: its parameter values, in order.
 fn params_fingerprint(cc: &parcel_core::CompiledContract, caller: &Caller) -> Result<String> {
     let datafusion::common::ParamValues::Map(m) = param_values(cc, caller)? else {
@@ -897,4 +1518,12 @@ fn params_fingerprint(cc: &parcel_core::CompiledContract, caller: &Caller) -> Re
     let mut kv: Vec<(String, String)> = m.into_iter().map(|(k, v)| (k, format!("{v:?}"))).collect();
     kv.sort();
     Ok(format!("{kv:?}"))
+}
+
+#[cfg(feature = "flight")]
+pub(crate) struct SpoolResult {
+    pub schema: SchemaRef,
+    pub batches: Option<datafusion::arrow::ipc::reader::StreamReader<std::fs::File>>,
+    pub envelope: Envelope,
+    pub signature: Option<String>,
 }
