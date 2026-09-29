@@ -370,11 +370,9 @@ async fn signing_failure_releases_no_flight_frames_and_removes_the_spool() {
         .execute(r#"SELECT id FROM "demo/readings""#.into(), None)
         .await
         .unwrap();
-    let error = c
-        .do_get(info.endpoint[0].ticket.clone().unwrap())
-        .await
-        .err()
-        .expect("no answer without a signature");
+    let Err(error) = c.do_get(info.endpoint[0].ticket.clone().unwrap()).await else {
+        panic!("no answer without a signature");
+    };
     assert!(error.to_string().contains("signer refused"));
     assert_eq!(
         std::fs::read_dir(dir.path().join("_peql/flight"))

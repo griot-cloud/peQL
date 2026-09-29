@@ -23,7 +23,7 @@ Function authoring, the WebAssembly interface and manifest fields belong to parc
 
 Rust applications can bind a DataFusion `TableProvider` to a registered contract with `Engine::bind_table`. This lets the application supply data while retaining the contract query path.
 
-`ObjectStoreParquet` serves bindings from a prefix of an object store (`s3://bucket/prefix/`) the way the default resolver serves local directories: streamed listing tables, the same write path, and manifests beside the data. Install it with `Engine::with_bindings`. Pass the store in: `ObjectStoreParquet::new("s3://bucket/prefix/", store)` takes any `object_store` store, configured by the application; the `s3` feature adds the S3 store.
+`ObjectStoreParquet` serves bindings from a prefix of an object store (`s3://bucket/prefix/`) the way the default resolver serves local directories: streamed listing tables, the same write path, and manifests beside the data. Install it with `Engine::with_bindings`. Pass the store in: `ObjectStoreParquet::new("s3://bucket/prefix/", store)` takes any `object_store` store, configured by the application; the `s3` feature adds the S3 store and the `gcs` feature the Google Cloud Storage store (`gs://bucket/prefix/`). peQL never builds a store or finds a credential itself: the embedder builds the store, with whatever credential it holds (for GCS, a `CredentialProvider` that serves a bearer token it was handed), so peQL reads no ADC file and no metadata server.
 
 The optional `lance` feature adds a Lance table provider on Unix. `LanceTableProvider::open_uri` opens a dataset by path or object-store URI. Building this feature requires `protoc`.
 
