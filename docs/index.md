@@ -3,9 +3,7 @@ layout: landing
 content_max_width: 68rem
 ---
 
-<div class="peql-home">
-
-<div class="peql-hero-logo" role="img" aria-label="peQL logo"></div>
+<div class="griot-home">
 
 # peQL
 

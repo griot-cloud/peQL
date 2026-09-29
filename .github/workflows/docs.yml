@@ -5,7 +5,12 @@ on:
     paths:
       - "docs/**"
       - ".github/workflows/docs.yml"
-  push:
+  # The site is published only from a commit CI passed on main: this workflow waits for
+  # CI's run on the push and builds and deploys only when that run succeeded, so a red main
+  # never publishes documentation, the same rule the release follows.
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
     branches: [main]
 
 permissions:
@@ -17,9 +22,15 @@ concurrency:
 
 jobs:
   build:
+    if: >-
+      github.event_name == 'pull_request' ||
+      (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The commit CI tested, not whatever main is by the time this runs.
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -32,7 +43,7 @@ jobs:
           path: docs/_build/html
 
   deploy:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'workflow_run'
     needs: build
     permissions:
       pages: write
