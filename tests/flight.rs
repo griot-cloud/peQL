@@ -373,8 +373,7 @@ async fn signing_failure_releases_no_flight_frames_and_removes_the_spool() {
     let error = c
         .do_get(info.endpoint[0].ticket.clone().unwrap())
         .await
-        .err()
-        .expect("no answer without a signature");
+        .expect_err("no answer without a signature");
     assert!(error.to_string().contains("signer refused"));
     assert_eq!(
         std::fs::read_dir(dir.path().join("_peql/flight"))

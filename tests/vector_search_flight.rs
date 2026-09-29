@@ -79,13 +79,16 @@ async fn flight_ranks_the_current_callers_masked_rows_and_audits_refusals() {
     unpublished.tenant = "unpublished".into();
     guest_client.set_header(CALLER_HEADER, caller_header(&unpublished));
     assert!(guest_client.execute(query, None).await.is_err());
-    let records = audit.records.lock().unwrap();
-    assert_eq!(records.len(), 4);
-    assert!(matches!(records[0].outcome, Outcome::Answered));
-    assert!(matches!(records[1].outcome, Outcome::Refused(_)));
-    assert!(matches!(records[2].outcome, Outcome::Failed(_)));
-    assert!(matches!(records[3].outcome, Outcome::Refused(_)));
-    drop(records);
+    // Scoped, not dropped: clippy's `await_holding_lock` judges the guard's lexical scope,
+    // and the server's shutdown below awaits.
+    {
+        let records = audit.records.lock().unwrap();
+        assert_eq!(records.len(), 4);
+        assert!(matches!(records[0].outcome, Outcome::Answered));
+        assert!(matches!(records[1].outcome, Outcome::Refused(_)));
+        assert!(matches!(records[2].outcome, Outcome::Failed(_)));
+        assert!(matches!(records[3].outcome, Outcome::Refused(_)));
+    }
     drop(decoded);
     drop(owner_client);
     drop(guest_client);
