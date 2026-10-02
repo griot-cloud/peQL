@@ -139,12 +139,29 @@ fn batch(rows: &[Order]) -> RecordBatch {
     .unwrap()
 }
 
-/// Where the contract's data lives.
+/// Where the contract's data lives, as its document says.
 #[derive(Clone, Copy, Debug)]
 enum Binding {
+    /// `binding: {parquet: orders/}`, the fixture as written.
     Parquet,
+    /// `binding: {iceberg: sales.orders}`, read through a catalog the engine is given.
     #[cfg(feature = "iceberg")]
     Iceberg,
+}
+
+/// The contract's document bound to `binding`.
+fn document(binding: Binding) -> String {
+    match binding {
+        Binding::Parquet => CONTRACT.to_owned(),
+        #[cfg(feature = "iceberg")]
+        Binding::Iceberg => iceberg_document(),
+    }
+}
+
+fn iceberg_document() -> String {
+    let doc = CONTRACT.replace("parquet: orders/", "iceberg: sales.orders");
+    assert_ne!(doc, CONTRACT, "the fixture's binding is `parquet: orders/`");
+    doc
 }
 
 async fn engine(dir: &std::path::Path, binding: Binding) -> Engine {
@@ -154,14 +171,10 @@ async fn engine(dir: &std::path::Path, binding: Binding) -> Engine {
         #[cfg(feature = "iceberg")]
         Binding::Iceberg => {
             let catalog = support::iceberg_catalog(&dir.join("warehouse"), "sales").await;
-            e.with_bindings(Arc::new(
-                peql::iceberg_table::IcebergTables::new(catalog)
-                    .with_table("sales/orders", support::table_ident("sales", "orders")),
-            ))
+            e.with_bindings(Arc::new(peql::iceberg_table::IcebergTables::new(catalog)))
         }
     };
-    let source = CONTRACT.replace("file:///data/orders/", "orders/");
-    e.register_contract(&source, &schema())
+    e.register_contract(&document(binding), &schema())
         .unwrap_or_else(|err| panic!("{err}"));
     e
 }
@@ -515,6 +528,35 @@ async fn unwritten_contract_is_reported(binding: Binding) {
         "{:?}",
         q.err()
     );
+}
+
+/// An engine given no Iceberg catalog refuses a contract bound to an Iceberg table, naming the
+/// contract and the table, whether it reads or writes.
+#[tokio::test]
+async fn an_iceberg_binding_without_a_catalog_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::in_memory(dir.path());
+    engine
+        .register_contract(&iceberg_document(), &schema())
+        .unwrap_or_else(|err| panic!("{err}"));
+    let want = "`sales/orders` is bound to the Iceberg table `sales.orders` \
+                (`binding: {iceberg: sales.orders}`), and this engine has no Iceberg catalog";
+
+    let w = engine
+        .write("sales/orders", vec![batch(&orders())], WriteMode::Append)
+        .await;
+    match w {
+        Err(EngineError::Invalid(m)) => assert_eq!(m, want),
+        other => panic!("{:?}", other.map(|r| r.rows_written)),
+    }
+    let q = engine
+        .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
+        .await;
+    match q {
+        Err(EngineError::Invalid(m)) => assert_eq!(m, want),
+        other => panic!("{:?}", other.map(|r| r.envelope.rows)),
+    }
+    assert!(!dir.path().join("orders").exists());
 }
 
 /// Each test as `<test>::parquet` and, with feature `iceberg`, `<test>::iceberg`.

@@ -37,14 +37,15 @@ use futures::TryStreamExt;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutPayload};
 use parcel_core::CompiledContract;
+use parcel_core::document::Source;
 
 use crate::binding::{self, BindingResolver, DataHash, Location};
 use crate::error::{PeqlError, Result};
 use crate::manifest::{FileEntry, MANIFEST_DIR, Manifest};
 
-/// Parquet under one prefix of one object store. A binding that is a URL must name this
-/// store (`s3://lake/...` for a resolver over `s3://lake/`); a relative binding resolves under
-/// the resolver's prefix. Anything else has no binding here.
+/// Parquet under one prefix of one object store. A Parquet binding that is a URL must name
+/// this store (`s3://lake/...` for a resolver over `s3://lake/`); a relative one resolves
+/// under the resolver's prefix. Anything else, an Iceberg binding among it, has no binding here.
 #[derive(Clone, Debug)]
 pub struct ObjectStoreParquet {
     store_url: ObjectStoreUrl,
@@ -76,7 +77,9 @@ impl ObjectStoreParquet {
 
     /// Where a contract's binding lives in this store, if it lives here.
     pub fn object_location(&self, contract: &CompiledContract) -> Option<ObjectLocation> {
-        let raw = contract.binding.parquet.as_str();
+        let Source::Parquet(raw) = &contract.binding.source else {
+            return None;
+        };
         let path = match raw.split_once("://") {
             Some(_) => {
                 let rest = raw.strip_prefix(self.store_url.as_str())?;
@@ -108,14 +111,16 @@ impl BindingResolver for ObjectStoreParquet {
         contract: &CompiledContract,
         stored: bool,
     ) -> Result<Arc<dyn TableProvider>> {
-        let loc = self.object_location(contract).ok_or_else(|| {
-            PeqlError::Invalid(format!(
-                "`{}` binds `{}`, which is not in {}",
-                contract.name,
-                contract.binding.parquet,
-                self.store_url.as_str()
-            ))
-        })?;
+        let loc = self
+            .object_location(contract)
+            .ok_or_else(|| match &contract.binding.source {
+                Source::Parquet(path) => PeqlError::Invalid(format!(
+                    "`{}` binds `{path}`, which is not in {}",
+                    contract.name,
+                    self.store_url.as_str()
+                )),
+                Source::Iceberg(_) => binding::unresolved(contract),
+            })?;
         let single = loc.is_single_file();
         binding::listing_table_at(contract, &loc.url(!single), single, stored)
     }
