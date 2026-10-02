@@ -14,27 +14,32 @@ use peql::iceberg_table::{IcebergTables, SUMMARY_CONTRACT, SUMMARY_CONTRACT_HASH
 use peql::{AsOf, Caller, Engine, PeqlError, WriteMode};
 use support::*;
 
+/// The readings contract bound, by its document, to `demo.readings`.
+fn readings() -> String {
+    let doc = READINGS.replace("parquet: readings/", "iceberg: demo.readings");
+    assert_ne!(
+        doc, READINGS,
+        "the readings contract is bound to `parquet: readings/`"
+    );
+    doc
+}
+
 struct Setup {
     _dir: tempfile::TempDir,
     catalog: Arc<dyn Catalog>,
-    tables: Arc<IcebergTables>,
     engine: Engine,
 }
 
 async fn setup() -> Setup {
     let dir = tempfile::tempdir().unwrap();
     let catalog = iceberg_catalog(&dir.path().join("warehouse"), "demo").await;
-    let tables = Arc::new(
-        IcebergTables::new(catalog.clone())
-            .with_table("demo/readings", table_ident("demo", "readings")),
-    );
-    let engine = Engine::in_memory(dir.path()).with_bindings(tables.clone());
-    engine.register_contract(READINGS, &schema()).unwrap();
+    let engine =
+        Engine::in_memory(dir.path()).with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    engine.register_contract(&readings(), &schema()).unwrap();
     engine.publish("demo/readings", "partner").unwrap();
     Setup {
         _dir: dir,
         catalog,
-        tables,
         engine,
     }
 }
@@ -132,11 +137,9 @@ async fn a_contract_reads_and_writes_an_iceberg_table() {
     engine.set_use_stored(true);
 
     // Another engine with only the catalog and the contract reads the facts of the snapshot.
-    let other = Engine::in_memory(s._dir.path()).with_bindings(Arc::new(
-        IcebergTables::new(s.catalog.clone())
-            .with_table("demo/readings", table_ident("demo", "readings")),
-    ));
-    other.register_contract(READINGS, &schema()).unwrap();
+    let other = Engine::in_memory(s._dir.path())
+        .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+    other.register_contract(&readings(), &schema()).unwrap();
     let res = other
         .query(
             r#"SELECT COUNT(*) AS n FROM "demo/readings" WHERE region = 'WA'"#,
@@ -425,11 +428,9 @@ async fn each_snapshot_keeps_its_own_facts() {
     assert_eq!(res.envelope.contracts[0].snapshot_id, Some(s1));
 
     // A contract bound to the same table records its own facts for each snapshot it reads.
-    s.tables
-        .bind("demo/readings-copy", table_ident("demo", "readings"));
     engine
         .register_contract(
-            &READINGS.replace("contract: demo/readings", "contract: demo/readings-copy"),
+            &readings().replace("contract: demo/readings", "contract: demo/readings-copy"),
             &schema(),
         )
         .unwrap();
@@ -460,7 +461,7 @@ const PLAIN_V1: &str = r#"
 contract: demo/plain
 version: 1
 binding:
-  parquet: unused/
+  iceberg: demo.plain
 expose:
   - {name: id, type: int64}
   - {name: a, type: utf8}
@@ -473,7 +474,7 @@ const PLAIN_V2: &str = r#"
 contract: demo/plain
 version: 2
 binding:
-  parquet: unused/
+  iceberg: demo.plain
 expose:
   - {name: id, type: int64}
   - {name: a, type: utf8}
@@ -509,7 +510,6 @@ fn plain(columns: &[(&str, DataType)], ids: &[i64]) -> RecordBatch {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
     let s = setup().await;
-    s.tables.bind("demo/plain", table_ident("demo", "plain"));
     let engine = &s.engine;
     let v1_cols = [
         ("id", DataType::Int64),
@@ -574,7 +574,6 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
     assert_eq!(res.envelope.contracts[0].snapshot_id, Some(s2));
 
     // The first version, frozen at the first snapshot, reads the first snapshot's columns.
-    s.tables.bind("demo/plain-v1", table_ident("demo", "plain"));
     engine
         .register_contract(
             &PLAIN_V1.replace("contract: demo/plain", "contract: demo/plain-v1"),
@@ -653,6 +652,69 @@ async fn an_unwritten_iceberg_contract_is_reported_and_snapshots_need_a_table() 
         )
         .await;
     assert!(r.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_binding_with_nested_namespaces_names_the_table_in_the_innermost() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = iceberg_catalog(&dir.path().join("warehouse"), "lake").await;
+    let nested = iceberg::NamespaceIdent::from_strs(["lake", "demo"]).unwrap();
+    catalog
+        .create_namespace(&nested, std::collections::HashMap::new())
+        .await
+        .unwrap();
+    let engine =
+        Engine::in_memory(dir.path()).with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    engine
+        .register_contract(
+            &READINGS.replace("parquet: readings/", "iceberg: lake.demo.readings"),
+            &schema(),
+        )
+        .unwrap();
+    engine
+        .write("demo/readings", vec![batch(1, 10)], WriteMode::Append)
+        .await
+        .unwrap();
+
+    let t = catalog
+        .load_table(&iceberg::TableIdent::new(nested, "readings".into()))
+        .await
+        .unwrap();
+    assert!(t.metadata().current_snapshot().is_some());
+    assert!(
+        !catalog
+            .table_exists(&table_ident("lake", "readings"))
+            .await
+            .unwrap()
+    );
+    let res = engine
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(10));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_parquet_binding_is_not_read_through_a_catalog() {
+    let s = setup().await;
+    s.engine
+        .register_contract(
+            &READINGS.replace("contract: demo/readings", "contract: demo/files"),
+            &schema(),
+        )
+        .unwrap();
+    let w = s
+        .engine
+        .write("demo/files", vec![batch(1, 4)], WriteMode::Append)
+        .await;
+    match w {
+        Err(PeqlError::Invalid(m)) => assert_eq!(
+            m,
+            "`demo/files` is bound to `binding: {parquet: readings/}`, which this engine's \
+             bindings do not reach"
+        ),
+        other => panic!("{:?}", other.map(|r| r.rows_written)),
+    }
 }
 
 /// A catalog that, once armed, lets another writer commit just before the next commit it is
@@ -767,11 +829,9 @@ async fn the_catalog_refuses_an_overwrite_once_the_table_has_moved() {
         inner: iceberg_catalog(&dir.path().join("warehouse"), "demo").await,
         armed: std::sync::atomic::AtomicBool::new(false),
     });
-    let engine = Engine::in_memory(dir.path()).with_bindings(Arc::new(
-        IcebergTables::new(catalog.clone())
-            .with_table("demo/readings", table_ident("demo", "readings")),
-    ));
-    engine.register_contract(READINGS, &schema()).unwrap();
+    let engine =
+        Engine::in_memory(dir.path()).with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    engine.register_contract(&readings(), &schema()).unwrap();
     let base = engine
         .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
         .await

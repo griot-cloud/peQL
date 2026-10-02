@@ -468,12 +468,11 @@ impl Engine {
         if let Some(t) = self.tables.read().expect("lock").get(reg.name()) {
             return Ok(Bound::Table(t.clone()));
         }
+        let cc = &reg.compilation.contract;
         self.bindings
-            .location(&reg.compilation.contract)
+            .location(cc)
             .map(Bound::Files)
-            .ok_or_else(|| {
-                PeqlError::Invalid(format!("`{}` has no binding peQL can read", reg.name()))
-            })
+            .ok_or_else(|| binding::unresolved(cc))
     }
 
     pub fn manifest(&self, name: &str) -> Result<Option<Manifest>> {

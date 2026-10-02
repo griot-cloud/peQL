@@ -5,7 +5,7 @@ contract: sales/orders
 version: 3
 
 binding:
-  parquet: file:///data/orders/
+  parquet: orders/
   partitioned_by: [region, dt]
 
 expose:

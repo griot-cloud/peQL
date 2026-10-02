@@ -1,7 +1,8 @@
 //! Contracts bound to Iceberg tables (feature `iceberg`).
 //!
-//! [`IcebergTables`] resolves a contract to a table in an Iceberg catalog the caller supplies;
-//! peQL never builds a catalog of its own and does not know what is behind the one it is given.
+//! [`IcebergTables`] resolves a contract to the table its document names
+//! (`binding: {iceberg: sales.orders}`) in an Iceberg catalog the caller supplies; peQL never
+//! builds a catalog of its own and does not know what is behind the one it is given.
 //! A read is a view over the table as of one snapshot: the current one, or one the caller
 //! names ([`crate::Engine::query_as_of`]). A write lands its data files as the Parquet binding
 //! lands them, then commits one snapshot through the catalog: an append is the catalog crate's
@@ -17,20 +18,18 @@
 //! ```no_run
 //! # async fn f(catalog: std::sync::Arc<dyn iceberg::Catalog>) -> peql::Result<()> {
 //! use std::sync::Arc;
-//! use iceberg::{NamespaceIdent, TableIdent};
 //! use peql::iceberg_table::IcebergTables;
 //!
-//! let tables = IcebergTables::new(catalog).with_table(
-//!     "demo/readings",
-//!     TableIdent::new(NamespaceIdent::new("demo".into()), "readings".into()),
-//! );
+//! // Every contract whose binding is `{iceberg: <namespace>.<table>}` reads and writes that
+//! // table in `catalog`.
+//! let tables = IcebergTables::new(catalog);
 //! let engine = peql::Engine::open("/var/lib/peql")?.with_bindings(Arc::new(tables));
 //! # Ok(()) }
 //! ```
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -52,6 +51,7 @@ use iceberg::{
     Catalog, ErrorKind, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent,
 };
 use parcel_core::CompiledContract;
+use parcel_core::document::Source;
 use parcel_runtime::plan::col_ref;
 use uuid::Uuid;
 
@@ -69,47 +69,35 @@ pub const SUMMARY_WRITE: &str = "peql.write";
 /// Where a contract's facts for one snapshot live, under the table's location.
 const FACTS_DIR: &str = "metadata/peql";
 
-/// Contracts bound to tables in one Iceberg catalog. Each contract is bound to a table by
-/// [`IcebergTables::with_table`]; a contract with no table has no binding here.
+/// Contracts bound to tables in one Iceberg catalog. A contract whose document says
+/// `binding: {iceberg: <namespace>.<table>}` is bound to that table in the catalog: every part
+/// but the last is a namespace level, the last is the table, as parcel splits them. A contract
+/// bound to anything else has no binding here.
 #[derive(Debug)]
 pub struct IcebergTables {
     catalog: Arc<dyn Catalog>,
-    tables: RwLock<HashMap<String, TableIdent>>,
 }
 
 impl IcebergTables {
     /// Tables in `catalog`, which the caller built and owns.
     pub fn new(catalog: Arc<dyn Catalog>) -> IcebergTables {
-        IcebergTables {
-            catalog,
-            tables: RwLock::default(),
-        }
-    }
-
-    /// Bind `contract` to `table`.
-    pub fn with_table(self, contract: &str, table: TableIdent) -> IcebergTables {
-        self.bind(contract, table);
-        self
-    }
-
-    /// Bind `contract` to `table`, replacing any table it was bound to.
-    pub fn bind(&self, contract: &str, table: TableIdent) {
-        self.tables
-            .write()
-            .expect("lock")
-            .insert(contract.to_owned(), table);
+        IcebergTables { catalog }
     }
 
     pub fn catalog(&self) -> &Arc<dyn Catalog> {
         &self.catalog
     }
 
-    /// The table a contract is bound to, if it is bound here.
-    pub fn table(&self, contract: &str) -> Option<IcebergLocation> {
-        let table = self.tables.read().expect("lock").get(contract).cloned()?;
+    /// The table a contract's binding names, if it names an Iceberg table.
+    pub fn table(&self, contract: &CompiledContract) -> Option<IcebergLocation> {
+        let Source::Iceberg(t) = &contract.binding.source else {
+            return None;
+        };
+        let namespace = NamespaceIdent::from_vec(t.namespace.clone())
+            .expect("parcel's Iceberg identifier has at least one namespace part");
         Some(IcebergLocation {
             catalog: self.catalog.clone(),
-            table,
+            table: TableIdent::new(namespace, t.table.clone()),
         })
     }
 }
@@ -121,9 +109,9 @@ impl BindingResolver for IcebergTables {
         contract: &CompiledContract,
         stored: bool,
     ) -> Result<Arc<dyn TableProvider>> {
-        let loc = self.table(&contract.name).ok_or_else(|| {
-            PeqlError::Invalid(format!("`{}` is bound to no Iceberg table", contract.name))
-        })?;
+        let loc = self
+            .table(contract)
+            .ok_or_else(|| binding::unresolved(contract))?;
         let table = loc.load().await?.ok_or_else(|| PeqlError::NotWritten {
             contract: contract.name.clone(),
         })?;
@@ -138,7 +126,7 @@ impl BindingResolver for IcebergTables {
     }
 
     fn location(&self, contract: &CompiledContract) -> Option<Location> {
-        self.table(&contract.name).map(Location::Iceberg)
+        self.table(contract).map(Location::Iceberg)
     }
 }
 

@@ -1,6 +1,7 @@
 //! Binding resolution (peQL design 4.4): a contract's binding as a DataFusion table.
 //! Parquet bindings are listing tables over a directory or an object store prefix: streamed,
-//! never loaded whole, with hive partitions and statistics pruning.
+//! never loaded whole, with hive partitions and statistics pruning. Iceberg bindings are
+//! tables in a catalog the caller supplies ([`crate::iceberg_table`]).
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -20,6 +21,7 @@ use datafusion::parquet::file::reader::{FileReader, SerializedFileReader};
 use datafusion::parquet::file::statistics::Statistics;
 use object_store::ObjectStore;
 use parcel_core::CompiledContract;
+use parcel_core::document::Source;
 
 use crate::error::{PeqlError, Result};
 use crate::manifest::{FileEntry, FlagStatus};
@@ -81,21 +83,42 @@ impl Location {
     }
 }
 
+/// The refusal for a contract whose binding the engine's resolver does not reach: it names
+/// the contract and the binding.
+pub fn unresolved(contract: &CompiledContract) -> PeqlError {
+    PeqlError::Invalid(match &contract.binding.source {
+        Source::Iceberg(table) => format!(
+            "`{}` is bound to the Iceberg table `{table}` (`binding: {{iceberg: {table}}}`), \
+             and this engine has no Iceberg catalog",
+            contract.name
+        ),
+        Source::Parquet(path) => format!(
+            "`{}` is bound to `binding: {{parquet: {path}}}`, which this engine's bindings do \
+             not reach",
+            contract.name
+        ),
+    })
+}
+
 /// Parquet directories on the local filesystem; relative bindings resolve under `base`.
+/// A contract bound to anything but Parquet has no binding here.
 #[derive(Clone, Debug)]
 pub struct LocalParquet {
     pub base: PathBuf,
 }
 
 impl LocalParquet {
-    pub fn root(&self, contract: &CompiledContract) -> PathBuf {
-        let raw = contract.binding.parquet.trim_start_matches("file://");
-        let p = Path::new(raw);
-        if p.is_absolute() {
+    /// Where a Parquet-bound contract's files are; `None` for any other binding.
+    pub fn root(&self, contract: &CompiledContract) -> Option<PathBuf> {
+        let Source::Parquet(raw) = &contract.binding.source else {
+            return None;
+        };
+        let p = Path::new(raw.trim_start_matches("file://"));
+        Some(if p.is_absolute() {
             p.to_path_buf()
         } else {
             self.base.join(p)
-        }
+        })
     }
 }
 
@@ -106,11 +129,12 @@ impl BindingResolver for LocalParquet {
         contract: &CompiledContract,
         stored: bool,
     ) -> Result<Arc<dyn TableProvider>> {
-        listing_table(contract, &self.root(contract), stored)
+        let root = self.root(contract).ok_or_else(|| unresolved(contract))?;
+        listing_table(contract, &root, stored)
     }
 
     fn location(&self, contract: &CompiledContract) -> Option<Location> {
-        Some(Location::Local(self.root(contract)))
+        self.root(contract).map(Location::Local)
     }
 }
 

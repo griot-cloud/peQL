@@ -5535,7 +5535,7 @@ dependencies = [
 [[package]]
 name = "parcel-core"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
+source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
 dependencies = [
  "cel",
  "chrono",
@@ -5558,7 +5558,7 @@ dependencies = [
 [[package]]
 name = "parcel-runtime"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
+source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
 dependencies = [
  "cel",
  "chrono",
@@ -5579,7 +5579,7 @@ dependencies = [
 [[package]]
 name = "parcel-udf"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=ccdd702#ccdd7024d58aa9f41e86aebdccdf8dcf581d108c"
+source = "git+https://github.com/griot-cloud/parcel?rev=93322ad#93322ad53c1e13ba1e9aa7cf85a183390e539bf8"
 
 [[package]]
 name = "parking"
@@ -5922,7 +5922,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "343d3bd7056eda839b03204e68deff7d1b13aba7af2b2fd16890697274262ee7"
 dependencies = [
  "heck",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "log",
  "multimap",
  "petgraph",
@@ -5941,7 +5941,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "27c6023962132f4b30eb4c172c91ce92d933da334c59c23cddee82358ddafb0b"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.117",

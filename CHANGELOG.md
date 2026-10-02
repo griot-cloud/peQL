@@ -10,11 +10,11 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
 
 **Added**
 - Iceberg tables (feature `iceberg`): a contract bound to an Iceberg table is read, written and
-  validated through iceberg-rust and datafusion-iceberg. `IcebergTables` maps a contract to a
-  table in the host's `iceberg::Catalog` (parcel cannot yet name the binding in the document:
-  `Binding` holds only `parquet`). `Engine::query_as_of`, `plan_as_of`, `view_as_of`,
-  `manifest_as_of` and `validate_with_as_of` read as of a snapshot; `query`, `plan` and `view`
-  read the current one. A write commits one snapshot: an append through the crate's
+  validated through iceberg-rust and datafusion-iceberg. `IcebergTables::new(catalog)` binds
+  every contract whose document says `binding: {iceberg: <namespace>.<table>}` to that table in
+  the host's `iceberg::Catalog`, with no mapping of its own. `Engine::query_as_of`,
+  `plan_as_of`, `view_as_of`, `manifest_as_of` and `validate_with_as_of` read as of a snapshot;
+  `query`, `plan` and `view` read the current one. A write commits one snapshot: an append through the crate's
   `fast_append`; an overwrite as a snapshot holding only the new files, committed against the
   base with `RefSnapshotIdMatch` so a second overwrite from the same base is a `Conflict`
   (its `operation` reads `append`; the summary carries `peql.write=overwrite`). The manifest's
@@ -46,7 +46,10 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
   prefix); `object_stores` lets a resolver register its stores with every session.
 - Signed bundles are feature `signed-bundle` (`peql::signed_bundle`), verify-only:
   `SignedBundle::register` verifies and registers; signing is the issuer's.
-- parcel is pinned to the commit that adds `plan::validate_in` and builds without `wasm`.
+- parcel is pinned to `93322ad`, which adds `plan::validate_in`, builds without `wasm`, and
+  names a binding's source in the document: `Binding.source` is `Parquet` or `Iceberg`. The
+  Parquet resolvers reach only Parquet bindings; a contract bound to an Iceberg table on an
+  engine given no catalog is refused with an error naming the contract and the table.
 - A bundle signature covers `griot/bundle/v1 || 0x00 || sha256(…)` (`SIGNING_PURPOSE`); the
   `t03:parcel-bundle-signing-payload:v1` domain is no longer accepted.
 
