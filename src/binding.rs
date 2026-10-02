@@ -29,6 +29,8 @@ pub const CONTRACT_HASH_KEY: &str = "parcel.contract_hash";
 pub const CONTRACT_NAME_KEY: &str = "parcel.contract";
 
 /// Turns a contract's binding into the table its view reads.
+// `async_trait` marks every method `#[must_use]`; the futures it returns already are.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BindingResolver: Send + Sync {
     /// The data the contract binds. With `stored`, it includes the flag, derived and `_other`

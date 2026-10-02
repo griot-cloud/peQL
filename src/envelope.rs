@@ -169,6 +169,8 @@ pub struct Envelope {
 /// [`crate::signer::SocketSigner`] for one reached over a socket). The envelope names the
 /// caller as the engine was told it; a signer that authenticated the caller itself should bind
 /// its own knowledge, not the envelope's claim.
+// `async_trait` marks every method `#[must_use]`; the futures it returns already are.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait EnvelopeSigner: Send + Sync {
     async fn sign(&self, envelope: &Envelope) -> std::result::Result<String, String>;
