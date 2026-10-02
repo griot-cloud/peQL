@@ -678,14 +678,14 @@ impl IcebergWrite {
                 as_base: table.clone(),
             };
             let tx = Transaction::new(table);
-            return Ok(tx
+            return tx
                 .fast_append()
                 .add_data_files(files)
                 .set_snapshot_properties(summary)
                 .apply(tx)?
                 .commit(&pinned)
                 .await
-                .map_err(|e| pinned.refused(e))?);
+                .map_err(|e| pinned.refused(e));
         };
         let md = table.metadata();
         if md.format_version() != FormatVersion::V2 {
