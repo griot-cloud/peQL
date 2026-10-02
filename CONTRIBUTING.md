@@ -6,7 +6,7 @@ served belongs here. See [How it works](docs/execution.md#what-parcel-does).
 
 ## Setup
 
-Rust 1.94 or newer. The `lance` feature also needs `protoc`.
+Rust 1.95 or newer. The `lance` feature also needs `protoc`.
 
 ```bash
 git clone https://github.com/griot-cloud/peql && cd peql

@@ -28,6 +28,9 @@ pub struct Resolution {
     pub shapes: Vec<String>,
     /// Whether flags and derived columns were read from storage (true) or evaluated live.
     pub flags_materialised: bool,
+    /// The table snapshot read, for data in a table with snapshots (Iceberg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
 }
 
 /// What the scans of a query read.
@@ -166,6 +169,8 @@ pub struct Envelope {
 /// [`crate::signer::SocketSigner`] for one reached over a socket). The envelope names the
 /// caller as the engine was told it; a signer that authenticated the caller itself should bind
 /// its own knowledge, not the envelope's claim.
+// `async_trait` marks every method `#[must_use]`; the futures it returns already are.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait EnvelopeSigner: Send + Sync {
     async fn sign(&self, envelope: &Envelope) -> std::result::Result<String, String>;

@@ -51,6 +51,9 @@ pub struct Verdict {
     #[serde(flatten)]
     pub verdict: parcel_runtime::plan::Verdict,
     pub data_hash: String,
+    /// The table snapshot the data is, for data in a table with snapshots (Iceberg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
 }
 
 impl std::ops::Deref for Verdict {
@@ -65,6 +68,38 @@ pub struct WriteReport {
     pub rows_written: usize,
     pub files: usize,
     pub verdict: Verdict,
+    /// The snapshot the write committed, for a table with snapshots (Iceberg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<SnapshotCommit>,
+}
+
+/// The snapshot a write committed to a table with snapshots, and the one it followed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct SnapshotCommit {
+    pub snapshot_id: i64,
+    /// The table's snapshot before this one; `None` for a table's first.
+    pub parent_snapshot_id: Option<i64>,
+}
+
+/// Which snapshot of its table each contract a read names is read as of. A contract not
+/// named here is read at its table's current snapshot. Only contracts bound to a table with
+/// snapshots (Iceberg) can be named.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AsOf(BTreeMap<String, i64>);
+
+impl AsOf {
+    /// Every contract at its table's current snapshot.
+    pub fn current() -> AsOf {
+        AsOf::default()
+    }
+    /// Read `contract` as of `snapshot_id`.
+    pub fn with(mut self, contract: &str, snapshot_id: i64) -> AsOf {
+        self.0.insert(contract.to_owned(), snapshot_id);
+        self
+    }
+    pub fn get(&self, contract: &str) -> Option<i64> {
+        self.0.get(contract).copied()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -107,6 +142,9 @@ pub struct Writing {
     overwrite: tokio::sync::Mutex<bool>,
     /// What one part may hold while it is written, when the writer bounds it.
     memory: Option<usize>,
+    /// A write to an Iceberg table, which [`Engine::finish_write`] commits as one snapshot.
+    #[cfg(feature = "iceberg")]
+    iceberg: Option<crate::iceberg_table::IcebergWrite>,
 }
 
 impl Writing {
@@ -160,6 +198,10 @@ pub struct Engine {
     use_stored: RwLock<bool>,
     /// Manifests of contracts whose files are in an object store, as last read or written.
     object_manifests: RwLock<HashMap<String, Manifest>>,
+    /// The facts of contracts bound to Iceberg tables for their table's current snapshot, as
+    /// last read or written.
+    #[cfg(feature = "iceberg")]
+    iceberg_manifests: RwLock<HashMap<String, Manifest>>,
     signer: Option<Arc<dyn EnvelopeSigner>>,
     #[cfg(feature = "flight")]
     spool_root: PathBuf,
@@ -187,6 +229,8 @@ impl Engine {
             documents: RwLock::default(),
             use_stored: RwLock::new(true),
             object_manifests: RwLock::default(),
+            #[cfg(feature = "iceberg")]
+            iceberg_manifests: RwLock::default(),
             signer: None,
         })
     }
@@ -208,6 +252,8 @@ impl Engine {
             documents: RwLock::default(),
             use_stored: RwLock::new(true),
             object_manifests: RwLock::default(),
+            #[cfg(feature = "iceberg")]
+            iceberg_manifests: RwLock::default(),
             signer: None,
         }
     }
@@ -400,6 +446,7 @@ impl Engine {
                 data_hash: verdict.data_hash.clone(),
                 row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
                 files: Vec::new(),
+                snapshot_id: None,
             },
         );
         Ok(verdict)
@@ -429,18 +476,6 @@ impl Engine {
             })
     }
 
-    /// The raw data, for validation: row columns only.
-    async fn raw_provider(&self, reg: &Registered) -> Result<Arc<dyn TableProvider>> {
-        match self.bound(reg)? {
-            Bound::Table(t) => Ok(t),
-            Bound::Files(_) => {
-                self.bindings
-                    .provider(&reg.compilation.contract, false)
-                    .await
-            }
-        }
-    }
-
     pub fn manifest(&self, name: &str) -> Result<Option<Manifest>> {
         let reg = self.get(name)?;
         match self.bound(&reg)? {
@@ -457,6 +492,37 @@ impl Engine {
                 .expect("lock")
                 .get(name)
                 .cloned()),
+            #[cfg(feature = "iceberg")]
+            Bound::Files(Location::Iceberg(_)) => Ok(self
+                .iceberg_manifests
+                .read()
+                .expect("lock")
+                .get(name)
+                .cloned()),
+        }
+    }
+
+    /// What a contract bound to a table with snapshots (Iceberg) knows about one snapshot's
+    /// data, as recorded with that snapshot; `None` when nothing has been recorded for it.
+    pub async fn manifest_as_of(&self, name: &str, snapshot_id: i64) -> Result<Option<Manifest>> {
+        #[cfg(not(feature = "iceberg"))]
+        let _ = snapshot_id;
+        let reg = self.get(name)?;
+        match self.bound(&reg)? {
+            #[cfg(feature = "iceberg")]
+            Bound::Files(Location::Iceberg(t)) => {
+                let table = t.load().await?.ok_or_else(|| PeqlError::NotWritten {
+                    contract: name.to_owned(),
+                })?;
+                if table.metadata().snapshot_by_id(snapshot_id).is_none() {
+                    return Err(PeqlError::Invalid(format!(
+                        "{} has no snapshot {snapshot_id}",
+                        t.table
+                    )));
+                }
+                t.load_facts(&table, snapshot_id, name).await
+            }
+            _ => Err(no_snapshots(name)),
         }
     }
 
@@ -474,6 +540,7 @@ impl Engine {
 
     /// A contract registered over files written elsewhere has no manifest yet: make one. For
     /// files in an object store, read the manifest again, since another engine may write there.
+    /// For an Iceberg table, read the facts of its current snapshot, or record them.
     pub async fn ensure_manifest(&self, name: &str) -> Result<()> {
         let reg = self.get(name)?;
         match self.bound(&reg)? {
@@ -497,7 +564,43 @@ impl Engine {
                 }
                 Ok(())
             }
+            #[cfg(feature = "iceberg")]
+            Bound::Files(Location::Iceberg(t)) => {
+                let current = match t.load().await? {
+                    Some(table) => table.metadata().current_snapshot_id().map(|s| (table, s)),
+                    None => None,
+                };
+                let Some((table, snapshot)) = current else {
+                    self.iceberg_manifests.write().expect("lock").remove(name);
+                    return Ok(());
+                };
+                match t.load_facts(&table, snapshot, name).await? {
+                    Some(m) => {
+                        self.iceberg_manifests
+                            .write()
+                            .expect("lock")
+                            .insert(name.to_owned(), m);
+                    }
+                    None => {
+                        self.refresh_in(name, Utc::now(), None, Some(snapshot))
+                            .await?;
+                    }
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// The facts of a contract bound to an Iceberg table for one snapshot, recorded now if
+    /// they were not.
+    async fn ensure_manifest_as_of(&self, name: &str, snapshot_id: i64) -> Result<Manifest> {
+        if let Some(m) = self.manifest_as_of(name, snapshot_id).await? {
+            return Ok(m);
+        }
+        Ok(self
+            .refresh_in(name, Utc::now(), None, Some(snapshot_id))
+            .await?
+            .1)
     }
 
     // ── write and validate ──────────────────────────────────────────────────
@@ -521,6 +624,12 @@ impl Engine {
     /// before the first part lands. The data is written by [`Engine::write_part`], as many times as there are parts,
     /// and the manifest is refreshed once, by [`Engine::finish_write`]; until then the
     /// manifest describes the data as it was.
+    ///
+    /// A contract bound to an Iceberg table is written to the table as it is when the write
+    /// begins: the table is created if the catalog has none, and its schema made the columns
+    /// the contract writes. Nothing is removed: [`Engine::finish_write`] commits the parts'
+    /// files as one snapshot, which for an overwrite replaces the table's files and commits
+    /// only over the snapshot current here.
     pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
         let reg = self.get(name)?;
         let Bound::Files(location) = self.bound(&reg)? else {
@@ -536,13 +645,27 @@ impl Engine {
         if let Location::Local(root) = &location {
             std::fs::create_dir_all(root)?;
         }
+        #[cfg(feature = "iceberg")]
+        let iceberg = match &location {
+            Location::Iceberg(t) => Some(
+                t.begin_write(&reg.compilation.contract, mode == WriteMode::Overwrite)
+                    .await?,
+            ),
+            _ => None,
+        };
+        #[cfg(feature = "iceberg")]
+        let clears = iceberg.is_none() && mode == WriteMode::Overwrite;
+        #[cfg(not(feature = "iceberg"))]
+        let clears = mode == WriteMode::Overwrite;
         Ok(Writing {
             reg,
             location,
             rows: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
-            overwrite: tokio::sync::Mutex::new(mode == WriteMode::Overwrite),
+            overwrite: tokio::sync::Mutex::new(clears),
             memory: None,
+            #[cfg(feature = "iceberg")]
+            iceberg,
         })
     }
 
@@ -559,6 +682,9 @@ impl Engine {
                     }
                 }
                 Location::Object(o) => o.remove_files().await?,
+                // An Iceberg overwrite removes no file; its snapshot replaces the old one.
+                #[cfg(feature = "iceberg")]
+                Location::Iceberg(_) => {}
             }
             *pending = false;
         }
@@ -579,9 +705,20 @@ impl Engine {
         let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
         let bytes: usize = batches.iter().map(|b| b.get_array_memory_size()).sum();
 
+        // An Iceberg table's files hold every column, partition columns among them.
+        #[cfg(feature = "iceberg")]
+        let keep_partitions = w.iceberg.is_some();
+        #[cfg(not(feature = "iceberg"))]
+        let keep_partitions = false;
         let ctx = match w.memory {
-            Some(memory) => self.bounded_session(memory, 1, None)?,
-            None => self.session(),
+            Some(memory) => self.bounded_session(memory, 1, None, keep_partitions)?,
+            None => self.session_with(
+                self.config_for(None).set_bool(
+                    "datafusion.execution.keep_partition_by_columns",
+                    keep_partitions,
+                ),
+                None,
+            ),
         };
         let mem = MemTable::try_new(cc.row_schema.clone(), vec![batches])?;
         let scan = LogicalPlanBuilder::scan("incoming", provider_as_source(Arc::new(mem)), None)?
@@ -601,6 +738,24 @@ impl Engine {
             select.push(d.expr.clone().alias(&d.column));
         }
         let plan = LogicalPlanBuilder::from(plan).project(select)?.build()?;
+        // An Iceberg table reads its files' columns by field id: each column is written as
+        // the table's schema has it, with its id.
+        #[cfg(feature = "iceberg")]
+        let plan = match &w.iceberg {
+            Some(iw) => {
+                let columns = iw.schema().fields().iter().map(|f| {
+                    let metadata: BTreeMap<String, String> = f
+                        .metadata()
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.clone()))
+                        .collect();
+                    datafusion::logical_expr::cast(col_ref(f.name()), f.data_type().clone())
+                        .alias_with_metadata(f.name(), Some(metadata.into()))
+                });
+                LogicalPlanBuilder::from(plan).project(columns)?.build()?
+            }
+            None => plan,
+        };
         let df = ctx
             .execute_logical_plan(parcel_core::compile::resolve(plan)?)
             .await?;
@@ -647,6 +802,12 @@ impl Engine {
         let url = match &w.location {
             Location::Local(root) => binding::local_url(root, true)?,
             Location::Object(o) => o.url(true),
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(t) => w
+                .iceberg
+                .as_ref()
+                .ok_or_else(|| PeqlError::Invalid(format!("{} was not begun as a write", t.table)))?
+                .url()?,
         };
         df.write_parquet(&url, options, Some(parquet)).await?;
         w.rows.fetch_add(rows, Ordering::SeqCst);
@@ -656,9 +817,20 @@ impl Engine {
 
     /// Finish a write begun by [`Engine::begin_write`]: the data changed, so refresh every
     /// contract bound to it, the writer's last, which validates it and writes its manifest.
+    ///
+    /// For an Iceberg table, the parts' files are committed first, as one snapshot, and every
+    /// contract bound to the table records its facts for that snapshot; the report names it.
     pub async fn finish_write(&self, w: Writing) -> Result<WriteReport> {
         self.clear_for_overwrite(&w).await?;
         let name = w.reg.name();
+        #[cfg(feature = "iceberg")]
+        let committed = match &w.iceberg {
+            Some(iw) => Some(iw.commit(&w.reg.compilation.contract).await?.1),
+            None => None,
+        };
+        #[cfg(not(feature = "iceberg"))]
+        let committed: Option<SnapshotCommit> = None;
+        let at = committed.map(|c| c.snapshot_id);
         let written_at = Utc::now();
         let key = w.location.key()?;
         for other in self.store.list() {
@@ -668,43 +840,61 @@ impl Engine {
             if let Ok(Bound::Files(r)) = self.bound(&other)
                 && r.key().ok().as_ref() == Some(&key)
             {
-                self.refresh_in(other.name(), written_at, Some(&w)).await?;
+                self.refresh_in(other.name(), written_at, Some(&w), at)
+                    .await?;
             }
         }
-        let (verdict, manifest) = self.refresh_in(name, written_at, Some(&w)).await?;
+        let (verdict, manifest) = self.refresh_in(name, written_at, Some(&w), at).await?;
         Ok(WriteReport {
             rows_written: w.rows.load(Ordering::SeqCst),
             files: manifest.files.len(),
             verdict,
+            snapshot: committed,
         })
     }
 
     /// Validate a contract over its files and save its manifest.
     async fn refresh(&self, name: &str, written_at: DateTime<Utc>) -> Result<(Verdict, Manifest)> {
-        self.refresh_in(name, written_at, None).await
+        self.refresh_in(name, written_at, None, None).await
     }
 
-    /// [`Engine::refresh`], validating inside a write's memory when it has one.
+    /// [`Engine::refresh`], validating inside a write's memory when it has one. For an Iceberg
+    /// table, of snapshot `at` (the current one when `None`), whose facts are recorded with it.
     async fn refresh_in(
         &self,
         name: &str,
         written_at: DateTime<Utc>,
         w: Option<&Writing>,
+        at: Option<i64>,
     ) -> Result<(Verdict, Manifest)> {
         let reg = self.get(name)?;
         let cc = &reg.compilation.contract;
         let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!("`{name}` has no files")));
         };
+        #[cfg(feature = "iceberg")]
+        let at = match &location {
+            Location::Iceberg(t) => Some(match at {
+                Some(s) => s,
+                None => t
+                    .load()
+                    .await?
+                    .and_then(|table| table.metadata().current_snapshot_id())
+                    .ok_or_else(|| PeqlError::NotWritten {
+                        contract: name.to_owned(),
+                    })?,
+            }),
+            _ => at,
+        };
         let plan = reg.compilation.validation.plan.clone();
         let verdict = match w.and_then(|w| w.memory.map(|m| (m, w.row_bytes()))) {
             Some((memory, row_bytes)) => {
                 // A scan holds a few batches: each is an eighth of the write's memory.
                 let batch = (memory / 8 / row_bytes).clamp(64, 8192);
-                let ctx = self.bounded_session(memory, 1, Some(batch))?;
-                self.validate_in(&ctx, name, plan).await?
+                let ctx = self.bounded_session(memory, 1, Some(batch), false)?;
+                self.validate_in(&ctx, name, plan, at).await?
             }
-            None => self.validate_with(name, plan).await?,
+            None => self.validate_in(&self.session(), name, plan, at).await?,
         };
         let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
         let files = match &location {
@@ -715,6 +905,12 @@ impl Engine {
             Location::Object(o) => {
                 o.file_entries(&o.list_files().await?, &flag_columns)
                     .await?
+            }
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(t) => {
+                let (table, snapshot) = self.iceberg_snapshot(t, name, at).await?;
+                let files = t.files(&table, snapshot).await?;
+                t.file_entries(&table, &files, &flag_columns).await?
             }
         };
         let manifest = Manifest {
@@ -729,6 +925,7 @@ impl Engine {
             data_hash: verdict.data_hash.clone(),
             row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
             files,
+            snapshot_id: verdict.snapshot_id,
         };
         match &location {
             Location::Local(root) => manifest.save(root)?,
@@ -739,11 +936,23 @@ impl Engine {
                     .expect("lock")
                     .insert(name.to_owned(), manifest.clone());
             }
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(t) => {
+                let (table, snapshot) = self.iceberg_snapshot(t, name, at).await?;
+                t.save_facts(&table, &manifest).await?;
+                if table.metadata().current_snapshot_id() == Some(snapshot) {
+                    self.iceberg_manifests
+                        .write()
+                        .expect("lock")
+                        .insert(name.to_owned(), manifest.clone());
+                }
+            }
         }
         Ok((verdict, manifest))
     }
 
-    /// Run the contract's validation plan over its data (peQL design 4.9a).
+    /// Run the contract's validation plan over its data (peQL design 4.9a). For an Iceberg
+    /// table, over its current snapshot, which the verdict names.
     pub async fn validate(&self, name: &str) -> Result<Verdict> {
         let plan = self.get(name)?.compilation.validation.plan.clone();
         self.validate_with(name, plan).await
@@ -752,37 +961,125 @@ impl Engine {
     /// Run a validation plan obtained elsewhere (e.g. decoded from a bundle) over the
     /// contract's data. This is what a certificate verifier does: same plan, same data.
     pub async fn validate_with(&self, name: &str, plan: LogicalPlan) -> Result<Verdict> {
-        self.validate_in(&self.session(), name, plan).await
+        self.validate_in(&self.session(), name, plan, None).await
     }
 
-    /// [`Engine::validate_with`] in a given session.
+    /// [`Engine::validate_with`] over one snapshot of a contract's Iceberg table: what a
+    /// verifier runs for a certificate that names the snapshot.
+    pub async fn validate_with_as_of(
+        &self,
+        name: &str,
+        plan: LogicalPlan,
+        snapshot_id: i64,
+    ) -> Result<Verdict> {
+        self.validate_in(&self.session(), name, plan, Some(snapshot_id))
+            .await
+    }
+
+    /// [`Engine::validate_with`] in a given session; for an Iceberg table, of snapshot `at`
+    /// (the current one when `None`).
     async fn validate_in(
         &self,
         session: &SessionContext,
         name: &str,
         plan: LogicalPlan,
+        at: Option<i64>,
     ) -> Result<Verdict> {
         let reg = self.get(name)?;
-        let provider = self.raw_provider(&reg).await?;
+        let bound = self.bound(&reg)?;
+        #[cfg(feature = "iceberg")]
+        if let Bound::Files(Location::Iceberg(t)) = &bound {
+            let (table, snapshot) = self.iceberg_snapshot(t, name, at).await?;
+            let provider = t
+                .provider(&table, &reg.compilation.contract, false, snapshot)
+                .await?;
+            let verdict =
+                parcel_runtime::plan::validate_in(session, &reg.compilation, plan, provider)
+                    .await?;
+            let files = t.files(&table, snapshot).await?;
+            return Ok(Verdict {
+                verdict,
+                data_hash: t.data_hash(&table, &files).await?,
+                snapshot_id: Some(snapshot),
+            });
+        }
+        if at.is_some() {
+            return Err(no_snapshots(name));
+        }
+        let provider = match &bound {
+            Bound::Table(t) => t.clone(),
+            Bound::Files(_) => {
+                self.bindings
+                    .provider(&reg.compilation.contract, false)
+                    .await?
+            }
+        };
         let verdict =
             parcel_runtime::plan::validate_in(session, &reg.compilation, plan, provider).await?;
-        let data_hash = match self.bound(&reg)? {
+        let data_hash = match bound {
             Bound::Files(Location::Local(root)) => {
                 binding::data_hash(&root, &binding::list_files(&root)?)?
             }
             Bound::Files(Location::Object(o)) => o.data_hash(&o.list_files().await?).await?,
+            #[cfg(feature = "iceberg")]
+            Bound::Files(Location::Iceberg(_)) => unreachable!("validated above"),
             Bound::Table(t) => {
                 let batches = self.session().read_table(t)?.collect().await?;
                 parcel_core::hash::sha256_hex(&crate::envelope::ipc_bytes(&batches))
             }
         };
-        Ok(Verdict { verdict, data_hash })
+        Ok(Verdict {
+            verdict,
+            data_hash,
+            snapshot_id: None,
+        })
+    }
+
+    /// A contract's Iceberg table and the snapshot `at` names (the current one when `None`).
+    #[cfg(feature = "iceberg")]
+    async fn iceberg_snapshot(
+        &self,
+        t: &crate::iceberg_table::IcebergLocation,
+        name: &str,
+        at: Option<i64>,
+    ) -> Result<(iceberg::table::Table, i64)> {
+        let not_written = || PeqlError::NotWritten {
+            contract: name.to_owned(),
+        };
+        let table = t.load().await?.ok_or_else(not_written)?;
+        let snapshot = match at {
+            Some(s) => {
+                if table.metadata().snapshot_by_id(s).is_none() {
+                    return Err(PeqlError::Invalid(format!(
+                        "{} has no snapshot {s}",
+                        t.table
+                    )));
+                }
+                s
+            }
+            None => table
+                .metadata()
+                .current_snapshot_id()
+                .ok_or_else(not_written)?,
+        };
+        Ok((table, snapshot))
     }
 
     // ── resolve, view, describe ─────────────────────────────────────────────
 
     /// Decide, check guarantees and choose shapes for one caller (peQL design 4.3).
     pub fn resolve(&self, name: &str, caller: &Caller) -> Result<(Resolution, Manifest)> {
+        self.resolve_with(name, caller, || self.manifest(name))
+    }
+
+    /// [`Engine::resolve`] over the manifest `manifest` gives, read only once the caller has
+    /// been admitted.
+    fn resolve_with(
+        &self,
+        name: &str,
+        caller: &Caller,
+        manifest: impl FnOnce() -> Result<Option<Manifest>>,
+    ) -> Result<(Resolution, Manifest)> {
         let reg = self.visible(name, caller)?;
         let c = &reg.compilation;
         let cc = &c.contract;
@@ -793,7 +1090,7 @@ impl Engine {
                 rule,
             });
         }
-        let manifest = self.manifest(name)?.ok_or_else(|| PeqlError::NotWritten {
+        let manifest = manifest()?.ok_or_else(|| PeqlError::NotWritten {
             contract: cc.name.clone(),
         })?;
         if !manifest.valid {
@@ -844,6 +1141,7 @@ impl Engine {
                 annotations,
                 shapes,
                 flags_materialised: stored,
+                snapshot_id: manifest.snapshot_id,
             },
             manifest,
         ))
@@ -863,6 +1161,13 @@ impl Engine {
         let stored = resolution.flags_materialised;
         let provider = match self.bound(&reg)? {
             Bound::Table(t) => t,
+            #[cfg(feature = "iceberg")]
+            Bound::Files(Location::Iceberg(t)) => {
+                let (table, snapshot) = self
+                    .iceberg_snapshot(&t, name, resolution.snapshot_id)
+                    .await?;
+                t.provider(&table, cc, stored, snapshot).await?
+            }
             Bound::Files(_) => self.bindings.provider(cc, stored).await?,
         };
         let bound: Arc<dyn TableProvider> = Arc::new(BoundTable {
@@ -942,6 +1247,7 @@ impl Engine {
         memory: usize,
         partitions: usize,
         batch: Option<usize>,
+        keep_partition_columns: bool,
     ) -> Result<SessionContext> {
         use datafusion::execution::memory_pool::FairSpillPool;
         use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -952,6 +1258,7 @@ impl Engine {
                 .map_err(|e| PeqlError::Invalid(e.to_string()))?;
         options.execution.objectstore_writer_buffer_size = (memory / 8).max(1 << 20);
         options.execution.sort_spill_reservation_bytes = memory / 8;
+        options.execution.keep_partition_by_columns = keep_partition_columns;
         if let Some(rows) = batch {
             options.execution.batch_size = datafusion::config::ConfigNonZeroUsize::try_new(rows)
                 .map_err(|e| PeqlError::Invalid(e.to_string()))?;
@@ -1011,6 +1318,7 @@ impl Engine {
         sql: &str,
         caller: &Caller,
         partitions: Option<usize>,
+        as_of: &AsOf,
     ) -> Result<Prepared> {
         guard::check_sql(sql)?;
         let (expanded_sql, searches) = crate::vector::expand(sql)?;
@@ -1032,8 +1340,16 @@ impl Engine {
                 return Err(PeqlError::UnknownContract(t.to_string()));
             }
             self.visible(&name, caller)?;
-            self.ensure_manifest(&name).await?;
-            let (resolution, manifest) = self.resolve(&name, caller)?;
+            let (resolution, manifest) = match as_of.get(&name) {
+                None => {
+                    self.ensure_manifest(&name).await?;
+                    self.resolve(&name, caller)?
+                }
+                Some(snapshot) => {
+                    let pinned = self.ensure_manifest_as_of(&name, snapshot).await?;
+                    self.resolve_with(&name, caller, || Ok(Some(pinned)))?
+                }
+            };
             let view = self.contract_view(&name, caller, &resolution).await?;
             ctx.register_table(t.clone(), Arc::new(ViewTable::new(view, None)))?;
             let reg = self.get(&name)?;
@@ -1043,15 +1359,23 @@ impl Engine {
             fingerprints.push((
                 name.clone(),
                 format!(
-                    "{}|{}|{:?}|{}|{}",
+                    "{}|{}|{:?}|{}|{}|{:?}",
                     resolution.compilation_hash,
                     params_fingerprint(&reg.compilation.contract, caller)?,
                     resolution.shapes,
                     manifest.data_hash,
                     manifest.written_at.timestamp_micros(),
+                    manifest.snapshot_id,
                 ),
             ));
             resolutions.push(resolution);
+        }
+        for named in as_of.0.keys() {
+            if !resolutions.iter().any(|r| &r.contract == named) {
+                return Err(PeqlError::Invalid(format!(
+                    "the read names a snapshot of `{named}`, which the query does not read"
+                )));
+            }
         }
         for search in searches {
             // A CTE cannot shadow a vector target and erase its contract resolution.
@@ -1119,7 +1443,7 @@ impl Engine {
     /// The physical plan a query would run, as text: shows pruning and pushed-down filters.
     /// For operators; callers cannot `EXPLAIN`. Nothing is charged.
     pub async fn explain(&self, sql: &str, caller: &Caller) -> Result<String> {
-        let p = self.prepare(sql, caller, None).await?;
+        let p = self.prepare(sql, caller, None, &AsOf::current()).await?;
         let physical = self.physical(&p).await?;
         Ok(datafusion::physical_plan::displayable(physical.as_ref())
             .indent(true)
@@ -1133,7 +1457,7 @@ impl Engine {
     /// the query that follows is. Nothing is charged.
     pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
         let started = Instant::now();
-        match self.prepare(sql, caller, None).await {
+        match self.prepare(sql, caller, None, &AsOf::current()).await {
             Ok(p) => Ok(Checked {
                 schema: Arc::new(p.plan.schema().as_arrow().clone()),
                 contracts: p.resolutions,
@@ -1193,6 +1517,26 @@ impl Engine {
         self.plan_for(&sql, caller, partitions).await
     }
 
+    /// [`Engine::view_for`] of a contract's Iceberg table as of one snapshot: what a host
+    /// serves for a contract version frozen at that snapshot. The contract's rules apply as
+    /// they do to the current data; the resolution names the snapshot.
+    pub async fn view_as_of(
+        &self,
+        name: &str,
+        caller: &Caller,
+        snapshot_id: i64,
+        partitions: Option<usize>,
+    ) -> Result<Planned> {
+        let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
+        self.plan_as_of(
+            &sql,
+            caller,
+            partitions,
+            &AsOf::current().with(name, snapshot_id),
+        )
+        .await
+    }
+
     /// SQL in which every table is a contract, planned for an executor that runs the plan
     /// itself: resolved, gated, shaped, and charged, exactly as [`Engine::query`] plans it.
     /// The budgets are charged once, here, for one execution of [`Planned::plan`]; the
@@ -1214,8 +1558,20 @@ impl Engine {
         caller: &Caller,
         partitions: Option<usize>,
     ) -> Result<Planned> {
+        self.plan_as_of(sql, caller, partitions, &AsOf::current())
+            .await
+    }
+
+    /// [`Engine::plan_for`] with the contracts `as_of` names read as of their snapshots.
+    pub async fn plan_as_of(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        partitions: Option<usize>,
+        as_of: &AsOf,
+    ) -> Result<Planned> {
         let started = Instant::now();
-        let out = match self.prepare(sql, caller, partitions).await {
+        let out = match self.prepare(sql, caller, partitions, as_of).await {
             Ok(p) => self.planned(p, caller).await,
             Err(e) => Err(e),
         };
@@ -1243,9 +1599,21 @@ impl Engine {
 
     /// Run SQL in which every table is a contract.
     pub async fn query(&self, sql: &str, caller: &Caller) -> Result<QueryResult> {
+        self.query_as_of(sql, caller, &AsOf::current()).await
+    }
+
+    /// [`Engine::query`] with the contracts `as_of` names read as of their snapshots: each
+    /// under its rules, over the data of that snapshot, with that snapshot's facts deciding
+    /// its guarantees. The envelope names each snapshot read.
+    pub async fn query_as_of(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        as_of: &AsOf,
+    ) -> Result<QueryResult> {
         let started = Instant::now();
         let audit_id = Uuid::new_v4();
-        let out = self.run(sql, caller, audit_id).await;
+        let out = self.run(sql, caller, audit_id, as_of).await;
         let (outcome, rows, charges, contracts) = match &out {
             Ok(r) => (
                 Outcome::Answered,
@@ -1293,7 +1661,7 @@ impl Engine {
         use futures::StreamExt;
         use sha2::{Digest, Sha256};
         use std::io::{Read, Seek, SeekFrom};
-        let prepared = self.prepare(sql, caller, None).await?;
+        let prepared = self.prepare(sql, caller, None, &AsOf::current()).await?;
         let planned = self.planned(prepared, caller).await?;
         std::fs::create_dir_all(&self.spool_root)?;
         let mut file = tempfile::tempfile_in(&self.spool_root)?;
@@ -1396,8 +1764,14 @@ impl Engine {
         })
     }
 
-    async fn run(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<QueryResult> {
-        let p = self.prepare(sql, caller, None).await?;
+    async fn run(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        audit_id: Uuid,
+        as_of: &AsOf,
+    ) -> Result<QueryResult> {
+        let p = self.prepare(sql, caller, None, as_of).await?;
         if let Some(batches) = self.cache.as_ref().and_then(|c| c.get(&p.cache_key)) {
             let rows = batches.iter().map(|b| b.num_rows()).sum();
             let envelope = Envelope {
@@ -1500,6 +1874,13 @@ struct Prepared {
     charges: Vec<(String, f64)>,
     suppress_k: Option<u64>,
     has_aggregate: bool,
+}
+
+/// What a call that names a snapshot meets for a contract whose data has none.
+fn no_snapshots(name: &str) -> PeqlError {
+    PeqlError::Invalid(format!(
+        "`{name}` is not bound to a table with snapshots; only an Iceberg binding is read as of one"
+    ))
 }
 
 /// `name@version#compilation_hash` for each contract, as the audit log names them.

@@ -4,7 +4,7 @@ Embed `peql::Engine` when your application needs to manage contracts, supply cal
 
 ## Add the dependencies
 
-peQL requires Rust 1.94 or newer. Add these dependencies to your application's `Cargo.toml`:
+peQL requires Rust 1.95 or newer. Add these dependencies to your application's `Cargo.toml`:
 
 ```toml
 [dependencies]

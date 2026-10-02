@@ -7,7 +7,7 @@
 name = "peql"
 version = "0.4.1"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.95"
 license = "Apache-2.0"
 repository = "https://github.com/griot-cloud/peql"
 description = "peQL: a query engine where every table is a parcel data contract"
@@ -22,6 +22,8 @@ flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-stream", "dep
 s3 = ["object_store/aws"]
 # Lance datasets read from a path or URI.
 lance = ["dep:lance", "dep:arrow-ipc-lance"]
+# Contracts bound to Iceberg tables, through an Iceberg catalog the caller supplies.
+iceberg = ["dep:iceberg", "dep:datafusion-iceberg"]
 
 [lib]
 name = "peql"
@@ -68,6 +70,12 @@ tokio-stream = { version = "0.1", features = ["net"], optional = true }
 # lance: its Arrow is one version behind DataFusion 55's, so batches cross by Arrow IPC.
 lance = { version = "12", default-features = false, optional = true }
 arrow-ipc-lance = { package = "arrow-ipc", version = "58", optional = true }
+
+# iceberg: exact commits. The released crates (0.10) target DataFusion 53; these are the
+# commits whose DataFusion (55) and Arrow (59) are peQL's. datafusion-iceberg pins the same
+# iceberg commit, so the two move together.
+iceberg = { git = "https://github.com/apache/iceberg-rust", rev = "8cb2adeddb4f8da1ca7bd86ca303337f011c12e2", optional = true }
+datafusion-iceberg = { git = "https://github.com/apache/datafusion-iceberg", rev = "a2bc9427d0659591b5f8122b90fec710fe2f5de6", optional = true }
 
 # The `peql` binary restores the default SIGPIPE.
 [target.'cfg(unix)'.dependencies]

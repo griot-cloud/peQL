@@ -29,6 +29,8 @@ pub const CONTRACT_HASH_KEY: &str = "parcel.contract_hash";
 pub const CONTRACT_NAME_KEY: &str = "parcel.contract";
 
 /// Turns a contract's binding into the table its view reads.
+// `async_trait` marks every method `#[must_use]`; the futures it returns already are.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait BindingResolver: Send + Sync {
     /// The data the contract binds. With `stored`, it includes the flag, derived and `_other`
@@ -52,6 +54,9 @@ pub trait BindingResolver: Send + Sync {
 pub enum Location {
     Local(PathBuf),
     Object(crate::object_binding::ObjectLocation),
+    /// A table in an Iceberg catalog (feature `iceberg`).
+    #[cfg(feature = "iceberg")]
+    Iceberg(crate::iceberg_table::IcebergLocation),
 }
 
 impl Location {
@@ -60,6 +65,8 @@ impl Location {
         match self {
             Location::Local(p) => p.is_file() || p.extension().is_some_and(|e| e == "parquet"),
             Location::Object(o) => o.is_single_file(),
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(_) => false,
         }
     }
 
@@ -68,6 +75,8 @@ impl Location {
         match self {
             Location::Local(p) => Ok(p.canonicalize()?.display().to_string()),
             Location::Object(o) => Ok(o.url(true)),
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(t) => Ok(t.key()),
         }
     }
 }
