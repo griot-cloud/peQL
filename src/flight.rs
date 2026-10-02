@@ -184,7 +184,10 @@ pub fn status(e: PeqlError) -> Status {
         PeqlError::DataFusion(
             DataFusionError::Plan(_) | DataFusionError::SQL(..) | DataFusionError::SchemaError(..),
         ) => Status::invalid_argument(msg),
+        PeqlError::Conflict(_) => Status::aborted(msg),
         PeqlError::DataFusion(_) | PeqlError::Io(_) => Status::internal(msg),
+        #[cfg(feature = "iceberg")]
+        PeqlError::Iceberg(_) => Status::internal(msg),
     }
 }
 

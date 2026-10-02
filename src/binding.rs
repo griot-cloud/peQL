@@ -52,6 +52,9 @@ pub trait BindingResolver: Send + Sync {
 pub enum Location {
     Local(PathBuf),
     Object(crate::object_binding::ObjectLocation),
+    /// A table in an Iceberg catalog (feature `iceberg`).
+    #[cfg(feature = "iceberg")]
+    Iceberg(crate::iceberg_table::IcebergLocation),
 }
 
 impl Location {
@@ -60,6 +63,8 @@ impl Location {
         match self {
             Location::Local(p) => p.is_file() || p.extension().is_some_and(|e| e == "parquet"),
             Location::Object(o) => o.is_single_file(),
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(_) => false,
         }
     }
 
@@ -68,6 +73,8 @@ impl Location {
         match self {
             Location::Local(p) => Ok(p.canonicalize()?.display().to_string()),
             Location::Object(o) => Ok(o.url(true)),
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(t) => Ok(t.key()),
         }
     }
 }

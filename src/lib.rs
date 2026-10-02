@@ -51,12 +51,19 @@ pub mod flight;
 #[cfg(feature = "signed-bundle")]
 pub mod signed_bundle;
 
+/// Contracts bound to Iceberg tables (feature `iceberg`).
+#[cfg(feature = "iceberg")]
+pub mod iceberg_table;
+
 /// Lance datasets as contract data (feature `lance`).
 #[cfg(all(unix, feature = "lance"))]
 pub mod lance_table;
 
 pub use binding::{BindingResolver, LocalParquet, Location};
-pub use engine::{Checked, Engine, Planned, QueryResult, Verdict, WriteMode, WriteReport, Writing};
+pub use engine::{
+    AsOf, Checked, Engine, Planned, QueryResult, SnapshotCommit, Verdict, WriteMode, WriteReport,
+    Writing,
+};
 pub use envelope::{Envelope, EnvelopeSigner, Resolution};
 pub use error::{PeqlError, Result};
 pub use manifest::Manifest;

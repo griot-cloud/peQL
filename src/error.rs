@@ -30,10 +30,17 @@ pub enum PeqlError {
     Signing(String),
     #[error("{0}")]
     Invalid(String),
+    /// A write that could only commit over the data it began from, which changed meanwhile.
+    #[error("write conflict: {0}")]
+    Conflict(String),
     #[error(transparent)]
     DataFusion(#[from] datafusion::error::DataFusionError),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// From the Iceberg catalog or the table's files (feature `iceberg`).
+    #[cfg(feature = "iceberg")]
+    #[error("iceberg: {0}")]
+    Iceberg(#[from] iceberg::Error),
 }
 
 impl PeqlError {

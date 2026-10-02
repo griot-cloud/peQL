@@ -49,6 +49,9 @@ pub struct Manifest {
     /// The row schema the contract was compiled against, so a restarted engine can recompile.
     pub row_schema: Vec<ColumnDef>,
     pub files: Vec<FileEntry>,
+    /// The table snapshot this describes, for data in a table with snapshots (Iceberg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
 }
 
 impl Manifest {

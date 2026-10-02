@@ -28,6 +28,9 @@ pub struct Resolution {
     pub shapes: Vec<String>,
     /// Whether flags and derived columns were read from storage (true) or evaluated live.
     pub flags_materialised: bool,
+    /// The table snapshot read, for data in a table with snapshots (Iceberg).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
 }
 
 /// What the scans of a query read.
