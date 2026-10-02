@@ -9,6 +9,19 @@ peQL is now only the engine: the platform socket clients, the worker pool shell 
 bundle fetch are gone, and what a host needs to serve it is here instead.
 
 **Added**
+- Iceberg tables (feature `iceberg`): a contract bound to an Iceberg table is read, written and
+  validated through iceberg-rust and datafusion-iceberg. `IcebergTables` maps a contract to a
+  table in the host's `iceberg::Catalog` (parcel cannot yet name the binding in the document:
+  `Binding` holds only `parquet`). `Engine::query_as_of`, `plan_as_of`, `view_as_of`,
+  `manifest_as_of` and `validate_with_as_of` read as of a snapshot; `query`, `plan` and `view`
+  read the current one. A write commits one snapshot: an append through the crate's
+  `fast_append`; an overwrite as a snapshot holding only the new files, committed against the
+  base with `RefSnapshotIdMatch` so a second overwrite from the same base is a `Conflict`
+  (its `operation` reads `append`; the summary carries `peql.write=overwrite`). The manifest's
+  facts live per contract per snapshot under `<table>/metadata/peql/<snapshot>/`;
+  `WriteReport.snapshot`, `Verdict.snapshot_id`, `Resolution.snapshot_id` and
+  `Manifest.snapshot_id` name the snapshot. `PeqlError::Conflict` and, with the feature,
+  `PeqlError::Iceberg`. Requires Rust 1.95.
 - Flight SQL (feature `flight`): `GetFlightInfo` and `CreatePreparedStatement` run every check
   and return refusals before any scan; `DoGet` streams the answer with the envelope in the first
   message's app metadata; `DoPut` bulk ingest is `Engine::write`, by the contract's owner. It
