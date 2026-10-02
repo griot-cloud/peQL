@@ -4,7 +4,7 @@ Changes to contract syntax or rule meaning belong in parcel. Workspace storage, 
 
 ## Build and check
 
-Use Rust 1.94 or newer. From the repository root:
+Use Rust 1.95 or newer. From the repository root:
 
 ```bash
 cargo fmt --all --check
