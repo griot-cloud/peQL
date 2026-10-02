@@ -1,4 +1,8 @@
 //! The v0 definition of done: write under a contract, validate, query as different callers.
+//! Every test runs on each binding: a Parquet directory, and (feature `iceberg`) an Iceberg
+//! table in a catalog.
+
+mod support;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -135,8 +139,27 @@ fn batch(rows: &[Order]) -> RecordBatch {
     .unwrap()
 }
 
-fn engine(dir: &std::path::Path) -> Engine {
+/// Where the contract's data lives.
+#[derive(Clone, Copy, Debug)]
+enum Binding {
+    Parquet,
+    #[cfg(feature = "iceberg")]
+    Iceberg,
+}
+
+async fn engine(dir: &std::path::Path, binding: Binding) -> Engine {
     let e = Engine::in_memory(dir);
+    let e = match binding {
+        Binding::Parquet => e,
+        #[cfg(feature = "iceberg")]
+        Binding::Iceberg => {
+            let catalog = support::iceberg_catalog(&dir.join("warehouse"), "sales").await;
+            e.with_bindings(Arc::new(
+                peql::iceberg_table::IcebergTables::new(catalog)
+                    .with_table("sales/orders", support::table_ident("sales", "orders")),
+            ))
+        }
+    };
     let source = CONTRACT.replace("file:///data/orders/", "orders/");
     e.register_contract(&source, &schema())
         .unwrap_or_else(|err| panic!("{err}"));
@@ -163,10 +186,9 @@ fn keyed(batches: &[RecordBatch]) -> BTreeMap<String, Vec<String>> {
     out
 }
 
-#[tokio::test]
-async fn end_to_end() {
+async fn end_to_end(binding: Binding) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path());
+    let engine = engine(dir.path(), binding).await;
     let data = orders();
 
     // Write: flags, layout, manifest, verdict.
@@ -412,10 +434,9 @@ async fn end_to_end() {
     let _ = Utc.timestamp_opt(0, 0);
 }
 
-#[tokio::test]
-async fn deny_rules_make_data_unservable() {
+async fn deny_rules_make_data_unservable(binding: Binding) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path());
+    let engine = engine(dir.path(), binding).await;
     let mut data = orders();
     data[5].order_id = None;
     let report = engine
@@ -447,10 +468,9 @@ async fn deny_rules_make_data_unservable() {
     );
 }
 
-#[tokio::test]
-async fn data_guarantee_denies() {
+async fn data_guarantee_denies(binding: Binding) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path());
+    let engine = engine(dir.path(), binding).await;
     let mut data = orders();
     for o in data.iter_mut().take(30) {
         o.customer_id = None; // 5% missing, above the 2% the contract guarantees
@@ -464,10 +484,9 @@ async fn data_guarantee_denies() {
     assert!(!report.verdict.guarantees["ids_present"]);
 }
 
-#[tokio::test]
-async fn append_accumulates() {
+async fn append_accumulates(binding: Binding) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path());
+    let engine = engine(dir.path(), binding).await;
     let data = orders();
     engine
         .write(
@@ -485,10 +504,9 @@ async fn append_accumulates() {
     assert_eq!(r.verdict.failures["amount_consistent"], 24);
 }
 
-#[tokio::test]
-async fn unwritten_contract_is_reported() {
+async fn unwritten_contract_is_reported(binding: Binding) {
     let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path());
+    let engine = engine(dir.path(), binding).await;
     let q = engine
         .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
         .await;
@@ -498,3 +516,28 @@ async fn unwritten_contract_is_reported() {
         q.err()
     );
 }
+
+/// Each test as `<test>::parquet` and, with feature `iceberg`, `<test>::iceberg`.
+macro_rules! on_every_binding {
+    ($($test:ident),* $(,)?) => {$(
+        mod $test {
+            #[tokio::test]
+            async fn parquet() {
+                super::$test(super::Binding::Parquet).await
+            }
+            #[cfg(feature = "iceberg")]
+            #[tokio::test(flavor = "multi_thread")]
+            async fn iceberg() {
+                super::$test(super::Binding::Iceberg).await
+            }
+        }
+    )*};
+}
+
+on_every_binding!(
+    end_to_end,
+    deny_rules_make_data_unservable,
+    data_guarantee_denies,
+    append_accumulates,
+    unwritten_contract_is_reported,
+);

@@ -771,10 +771,12 @@ fn emptied(table: &Table, base: i64, manifest_list: &str) -> Result<Table> {
     }
     let md: TableMetadata = serde_json::from_value(md)
         .map_err(|e| PeqlError::Invalid(format!("metadata of {}: {e}", table.identifier())))?;
+    // The crate keeps a table's runtime to itself; the copy runs on the current one.
     let mut b = Table::builder()
         .metadata(md)
         .identifier(table.identifier().clone())
-        .file_io(table.file_io().clone());
+        .file_io(table.file_io().clone())
+        .runtime(iceberg::Runtime::try_current()?);
     if let Some(loc) = table.metadata_location() {
         b = b.metadata_location(loc);
     }
@@ -873,7 +875,8 @@ impl Catalog for Pinned {
         let mut b = Table::builder()
             .metadata(self.as_base.metadata_ref())
             .identifier(table.clone())
-            .file_io(current.file_io().clone());
+            .file_io(current.file_io().clone())
+            .runtime(iceberg::Runtime::try_current()?);
         if let Some(loc) = current.metadata_location() {
             b = b.metadata_location(loc);
         }

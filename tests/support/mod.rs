@@ -111,3 +111,40 @@ pub fn owner_ids(n: i64) -> Vec<i64> {
 pub fn guest_ids(n: i64) -> Vec<i64> {
     (1..=n).filter(|i| i % 2 == 0 && i % 10 != 0).collect()
 }
+
+/// An Iceberg catalog that needs no server: iceberg-rust's in-memory catalog over a warehouse
+/// directory, with `namespace` created.
+#[cfg(feature = "iceberg")]
+pub async fn iceberg_catalog(
+    warehouse: &std::path::Path,
+    namespace: &str,
+) -> Arc<dyn iceberg::Catalog> {
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::{Catalog, CatalogBuilder};
+    std::fs::create_dir_all(warehouse).unwrap();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(iceberg::io::LocalFsStorageFactory))
+        .load(
+            "peql-test",
+            std::collections::HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.display().to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
+    catalog
+        .create_namespace(
+            &iceberg::NamespaceIdent::new(namespace.into()),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    Arc::new(catalog)
+}
+
+/// `namespace.name` in an Iceberg catalog.
+#[cfg(feature = "iceberg")]
+pub fn table_ident(namespace: &str, name: &str) -> iceberg::TableIdent {
+    iceberg::TableIdent::new(iceberg::NamespaceIdent::new(namespace.into()), name.into())
+}
