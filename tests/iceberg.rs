@@ -1027,3 +1027,75 @@ async fn compaction_replaces_small_files_with_one_snapshot_and_keeps_every_row()
             .is_none()
     );
 }
+
+/// A table whose warehouse is in another store: the write's files land under the engine's
+/// staging directory, go to the table through its `FileIO` at the commit, and the staging
+/// directory is gone after it. Appends, an overwrite and a read as of the first snapshot.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_table_in_another_store_is_written_through_its_file_io() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = iceberg_catalog_in_memory("demo").await;
+    let engine = Engine::open(dir.path())
+        .unwrap()
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    engine.register_contract(&readings(), &schema()).unwrap();
+
+    let first = engine
+        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .await
+        .unwrap();
+    let first = first.snapshot.unwrap().snapshot_id;
+    let t = table(&catalog, "readings").await;
+    assert!(
+        t.metadata().location().starts_with("memory://"),
+        "{}",
+        t.metadata().location()
+    );
+    let paths = snapshot_paths(&t, first).await;
+    assert!(!paths.is_empty());
+    for p in &paths {
+        assert!(p.starts_with("memory://warehouse/"), "{p}");
+        assert!(
+            t.file_io().exists(p).await.unwrap(),
+            "{p} is in the table's store"
+        );
+    }
+    let staging = dir.path().join("_peql/staging");
+    assert!(
+        !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
+        "nothing is left staged"
+    );
+
+    engine
+        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .await
+        .unwrap();
+    let res = engine
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(50));
+
+    engine
+        .write("demo/readings", vec![batch(1, 5)], WriteMode::Overwrite)
+        .await
+        .unwrap();
+    let res = engine
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(5));
+    let res = engine
+        .query_as_of(
+            r#"SELECT id FROM "demo/readings""#,
+            &owner(),
+            &AsOf::current().with("demo/readings", first),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(40));
+    assert!(
+        !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
+        "nothing is left staged"
+    );
+}

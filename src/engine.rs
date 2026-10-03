@@ -257,6 +257,10 @@ pub struct Engine {
     frozen: AsOf,
     #[cfg(feature = "flight")]
     spool_root: PathBuf,
+    /// Where a write to an Iceberg table that is not on this filesystem lands its data files
+    /// before they go to the table through its `FileIO`.
+    #[cfg(feature = "iceberg")]
+    staging_root: PathBuf,
 }
 
 impl Engine {
@@ -268,6 +272,8 @@ impl Engine {
         Ok(Engine {
             #[cfg(feature = "flight")]
             spool_root: root.join("_peql/flight"),
+            #[cfg(feature = "iceberg")]
+            staging_root: root.join("_peql/staging"),
             store: Arc::new(DirStore::open(root)?),
             functions: Arc::new(FunctionStore::open(root)?),
             bindings: Arc::new(LocalParquet {
@@ -294,6 +300,8 @@ impl Engine {
         Engine {
             #[cfg(feature = "flight")]
             spool_root: base.join("_peql/flight"),
+            #[cfg(feature = "iceberg")]
+            staging_root: base.join("_peql/staging"),
             store: Arc::new(MemoryStore::default()),
             functions: Arc::new(FunctionStore::in_memory()),
             bindings: Arc::new(LocalParquet { base }),
@@ -725,8 +733,12 @@ impl Engine {
         #[cfg(feature = "iceberg")]
         let iceberg = match &location {
             Location::Iceberg(t) => Some(
-                t.begin_write(&reg.compilation.contract, mode == WriteMode::Overwrite)
-                    .await?,
+                t.begin_write(
+                    &reg.compilation.contract,
+                    mode == WriteMode::Overwrite,
+                    &self.staging_root,
+                )
+                .await?,
             ),
             _ => None,
         };

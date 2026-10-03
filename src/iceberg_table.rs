@@ -338,11 +338,14 @@ impl IcebergLocation {
     /// Begin a write under `contract`: create the table if the catalog has none, and make its
     /// schema the columns the contract writes (columns the contract no longer writes are
     /// removed from the schema, not from any snapshot). The write starts from the table's
-    /// current snapshot.
+    /// current snapshot. Its data files land in the table's own directory when the table is
+    /// on this filesystem; otherwise under `staging`, and go to the table through its
+    /// `FileIO` when the write commits.
     pub(crate) async fn begin_write(
         &self,
         contract: &CompiledContract,
         overwrite: bool,
+        staging: &Path,
     ) -> Result<IcebergWrite> {
         let want = table_schema(contract);
         let table = match self.load().await? {
@@ -363,7 +366,10 @@ impl IcebergLocation {
         let location = table.metadata().location().trim_end_matches('/').to_owned();
         let dir_id = Uuid::new_v4();
         let prefix = format!("{location}/data/{dir_id}");
-        let dir = local_dir(&prefix)?;
+        let (dir, staged) = match local_dir(&prefix)? {
+            Some(dir) => (dir, false),
+            None => (staging.join(dir_id.to_string()), true),
+        };
         std::fs::create_dir_all(&dir)?;
         let schema = Arc::new(iceberg::arrow::schema_to_arrow_schema(
             table.metadata().current_schema(),
@@ -374,6 +380,7 @@ impl IcebergLocation {
             schema,
             prefix,
             dir,
+            staged,
             overwrite,
         })
     }
@@ -481,19 +488,23 @@ pub fn table_schema(contract: &CompiledContract) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// The directory a local table location names. peQL writes data files with DataFusion's
-/// writer, which writes to the local filesystem here.
-fn local_dir(location: &str) -> Result<PathBuf> {
+/// The directory a table location names on this filesystem, where DataFusion's writer writes
+/// the data files; `None` for a location in another store (`s3://`, `gs://`, ...).
+fn local_dir(location: &str) -> Result<Option<PathBuf>> {
+    if location.contains("://") && !location.starts_with("file://") {
+        return Ok(None);
+    }
     let path = location.strip_prefix("file://").unwrap_or(location);
-    if location.contains("://") && !location.starts_with("file://")
-        || !Path::new(path).is_absolute()
-    {
+    if !Path::new(path).is_absolute() {
         return Err(PeqlError::Invalid(format!(
-            "`{location}` is not a local path; peQL writes Iceberg tables on the local filesystem"
+            "`{location}` is neither an absolute path nor a store URL"
         )));
     }
-    Ok(PathBuf::from(path))
+    Ok(Some(PathBuf::from(path)))
 }
+
+/// How much of a staged file goes to the table's store per write.
+const UPLOAD_CHUNK: usize = 8 << 20;
 
 async fn footer(table: &Table, path: &str, size: u64) -> Result<ParquetMetaData> {
     let bad = |e: &dyn std::fmt::Display| PeqlError::Invalid(format!("{path}: {e}"));
@@ -528,8 +539,20 @@ pub(crate) struct IcebergWrite {
     schema: SchemaRef,
     /// Where this write's data files go, as the table records paths.
     prefix: String,
+    /// Where DataFusion's writer writes them.
     dir: PathBuf,
+    /// Whether `dir` is a staging directory, not the table's own: its files go to the table
+    /// through its `FileIO` at the commit, and the directory is removed after it.
+    staged: bool,
     overwrite: bool,
+}
+
+impl Drop for IcebergWrite {
+    fn drop(&mut self) {
+        if self.staged {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
 }
 
 impl IcebergWrite {
@@ -558,6 +581,9 @@ impl IcebergWrite {
                 PeqlError::Invalid(format!("{} was dropped", self.location.table))
             })?;
         let files = self.data_files(&table)?;
+        if self.staged {
+            self.upload(&table).await?;
+        }
         let mut summary = HashMap::from([
             (SUMMARY_CONTRACT.to_owned(), contract.name.clone()),
             (
@@ -592,6 +618,38 @@ impl IcebergWrite {
         Ok((committed, commit))
     }
 
+    /// Every staged file to where the table records it, through the table's `FileIO`.
+    async fn upload(&self, table: &Table) -> Result<()> {
+        use std::io::Read;
+        for path in binding::list_files(&self.dir)? {
+            let to = format!("{}/{}", self.prefix, self.relative(&path)?);
+            let mut writer = table.file_io().new_output(&to)?.writer().await?;
+            let mut file = std::fs::File::open(&path)?;
+            loop {
+                let mut chunk = vec![0u8; UPLOAD_CHUNK];
+                let n = file.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                chunk.truncate(n);
+                writer.write(Bytes::from(chunk)).await?;
+            }
+            writer.close().await?;
+        }
+        Ok(())
+    }
+
+    /// A data file's path under the write's directory, `/`-separated.
+    fn relative(&self, path: &Path) -> Result<String> {
+        Ok(path
+            .strip_prefix(&self.dir)
+            .map_err(|_| PeqlError::Invalid(format!("{} is outside the write", path.display())))?
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("/"))
+    }
+
     /// Every Parquet file under the write's directory, as an Iceberg data file. A file
     /// without field ids is refused: the table reads columns by id.
     fn data_files(&self, table: &Table) -> Result<Vec<DataFile>> {
@@ -614,15 +672,7 @@ impl IcebergWrite {
                     )));
                 }
             }
-            let relative = path
-                .strip_prefix(&self.dir)
-                .map_err(|_| {
-                    PeqlError::Invalid(format!("{} is outside the write", path.display()))
-                })?
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy().into_owned())
-                .collect::<Vec<_>>()
-                .join("/");
+            let relative = self.relative(&path)?;
             let file = DataFileBuilder::default()
                 .content(DataContentType::Data)
                 .file_path(format!("{}/{relative}", self.prefix))

@@ -143,6 +143,33 @@ pub async fn iceberg_catalog(
     Arc::new(catalog)
 }
 
+/// [`iceberg_catalog`] with its warehouse in a store that is not this filesystem: iceberg's
+/// in-memory storage, at `memory://warehouse`.
+#[cfg(feature = "iceberg")]
+pub async fn iceberg_catalog_in_memory(namespace: &str) -> Arc<dyn iceberg::Catalog> {
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    use iceberg::{Catalog, CatalogBuilder};
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(iceberg::io::MemoryStorageFactory))
+        .load(
+            "peql-test",
+            std::collections::HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                "memory://warehouse".to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
+    catalog
+        .create_namespace(
+            &iceberg::NamespaceIdent::new(namespace.into()),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    Arc::new(catalog)
+}
+
 /// `namespace.name` in an Iceberg catalog.
 #[cfg(feature = "iceberg")]
 pub fn table_ident(namespace: &str, name: &str) -> iceberg::TableIdent {
