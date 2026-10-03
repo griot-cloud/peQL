@@ -865,3 +865,165 @@ async fn the_catalog_refuses_an_overwrite_once_the_table_has_moved() {
         .unwrap();
     assert_eq!(ids(&res.batches), owner_ids(20));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_engine_frozen_at_a_snapshot_reads_it_in_every_read_and_writes_nothing() {
+    let s = setup().await;
+    let v1_cols = [
+        ("id", DataType::Int64),
+        ("a", DataType::Utf8),
+        ("b", DataType::Utf8),
+    ];
+    let v2_cols = [
+        ("id", DataType::Int64),
+        ("a", DataType::Utf8),
+        ("c", DataType::Int64),
+    ];
+    let v1 = plain(&v1_cols, &[]).schema();
+    s.engine.register_contract(PLAIN_V1, &v1).unwrap();
+    let s1 = s
+        .engine
+        .write(
+            "demo/plain",
+            vec![plain(&v1_cols, &[1, 2])],
+            WriteMode::Append,
+        )
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap()
+        .snapshot_id;
+    // The second version drops `b` and rewrites the table.
+    s.engine
+        .register_contract(PLAIN_V2, &plain(&v2_cols, &[]).schema())
+        .unwrap();
+    s.engine
+        .write(
+            "demo/plain",
+            vec![plain(&v2_cols, &[3, 4, 5])],
+            WriteMode::Overwrite,
+        )
+        .await
+        .unwrap();
+
+    // A host's view of the first version, frozen at the first snapshot: a plain query reads it.
+    let frozen = Engine::in_memory(s._dir.path())
+        .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())))
+        .with_as_of(AsOf::current().with("demo/plain", s1));
+    frozen.register_contract(PLAIN_V1, &v1).unwrap();
+    assert_eq!(frozen.as_of().get("demo/plain"), Some(s1));
+    let everyone = Caller::new("x", "demo", "any");
+    let res = frozen
+        .query(r#"SELECT * FROM "demo/plain" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(
+        res.schema
+            .fields()
+            .iter()
+            .map(|f| f.name().as_str())
+            .collect::<Vec<_>>(),
+        ["id", "a", "b"]
+    );
+    assert_eq!(ids(&res.batches), [1, 2]);
+    assert_eq!(res.envelope.contracts[0].snapshot_id, Some(s1));
+    let planned = frozen.view("demo/plain", &everyone).await.unwrap();
+    assert_eq!(planned.contracts[0].snapshot_id, Some(s1));
+
+    // Nothing is written under it.
+    let refused = frozen
+        .write("demo/plain", vec![plain(&v1_cols, &[9])], WriteMode::Append)
+        .await;
+    assert!(
+        matches!(&refused, Err(PeqlError::Invalid(m)) if m.contains("read as of snapshot")),
+        "{refused:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_replaces_small_files_with_one_snapshot_and_keeps_every_row() {
+    let s = setup().await;
+    let cols = [
+        ("id", DataType::Int64),
+        ("a", DataType::Utf8),
+        ("b", DataType::Utf8),
+    ];
+    s.engine
+        .register_contract(PLAIN_V1, &plain(&cols, &[]).schema())
+        .unwrap();
+    let mut last = None;
+    for ids in [[1, 2], [3, 4], [5, 6]] {
+        last = s
+            .engine
+            .write("demo/plain", vec![plain(&cols, &ids)], WriteMode::Append)
+            .await
+            .unwrap()
+            .snapshot;
+    }
+    let before = last.unwrap().snapshot_id;
+    let t = table(&s.catalog, "plain").await;
+    assert_eq!(snapshot_paths(&t, before).await.len(), 3);
+
+    // Nothing is small enough to be worth it: nothing happens.
+    assert!(
+        s.engine
+            .compact("demo/plain", 1, 2)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let report = s
+        .engine
+        .compact("demo/plain", u64::MAX, 2)
+        .await
+        .unwrap()
+        .expect("three small files are compacted");
+    let commit = report.snapshot.unwrap();
+    assert_eq!(commit.parent_snapshot_id, Some(before));
+    assert_eq!(report.rows_written, 6);
+    assert!(report.verdict.valid);
+    let t = table(&s.catalog, "plain").await;
+    assert_eq!(t.metadata().current_snapshot_id(), Some(commit.snapshot_id));
+    assert_eq!(snapshot_paths(&t, commit.snapshot_id).await.len(), 1);
+    assert_eq!(
+        t.metadata()
+            .current_snapshot()
+            .unwrap()
+            .summary()
+            .additional_properties
+            .get(SUMMARY_WRITE)
+            .map(String::as_str),
+        Some("overwrite")
+    );
+
+    let everyone = Caller::new("x", "demo", "any");
+    let now = s
+        .engine
+        .query(r#"SELECT * FROM "demo/plain" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(ids(&now.batches), [1, 2, 3, 4, 5, 6]);
+    // The snapshot before is still readable, from its own files.
+    let then = s
+        .engine
+        .query_as_of(
+            r#"SELECT * FROM "demo/plain" ORDER BY id"#,
+            &everyone,
+            &AsOf::current().with("demo/plain", before),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&then.batches), [1, 2, 3, 4, 5, 6]);
+    for path in snapshot_paths(&t, before).await {
+        assert!(std::path::Path::new(&path).exists(), "{path}");
+    }
+    // One file left: nothing more to compact.
+    assert!(
+        s.engine
+            .compact("demo/plain", u64::MAX, 2)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

@@ -537,6 +537,11 @@ impl IcebergWrite {
         &self.schema
     }
 
+    /// The snapshot current when the write began.
+    pub(crate) fn base(&self) -> Option<i64> {
+        self.base
+    }
+
     /// The directory the write's data files go to, as DataFusion's writer takes it.
     pub(crate) fn url(&self) -> Result<String> {
         binding::local_url(&self.dir, true)
