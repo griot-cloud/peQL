@@ -23,7 +23,8 @@
 //! executor that runs it out of core ([`Engine::view`] is the same for one contract);
 //! `query` runs that same plan itself. [`Engine::check`] runs every check without reading a
 //! row (what Flight SQL's `GetFlightInfo` answers), and [`Engine::write`] is the only way
-//! data lands.
+//! data lands. [`view_hash`] names a contract's view by what it is: the same contract over
+//! the same columns is the same hash, whatever rows the table holds.
 
 pub mod audit;
 pub mod binding;
@@ -42,6 +43,7 @@ pub mod shape;
 pub mod signer;
 pub mod store;
 mod vector;
+pub mod view_hash;
 
 /// Flight SQL over tonic (feature `flight`).
 #[cfg(feature = "flight")]
@@ -71,3 +73,4 @@ pub use object_binding::ObjectStoreParquet;
 /// The caller of a query, as the embedding application authenticated them.
 pub use parcel_runtime::Caller;
 pub use signer::SocketSigner;
+pub use view_hash::{compiled_view_hash, view_hash};
