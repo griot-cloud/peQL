@@ -50,6 +50,14 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
   names a binding's source in the document: `Binding.source` is `Parquet` or `Iceberg`. The
   Parquet resolvers reach only Parquet bindings; a contract bound to an Iceberg table on an
   engine given no catalog is refused with an error naming the contract and the table.
+- A workspace opens with stored bundles that no longer verify. `DirStore::open` loads every
+  bundle that recompiles to the hash it records and sets the others aside, each as a
+  `store::Stale { path, name, version, cause }` with parcel's message as the cause; a file that
+  is not a bundle is stale the same way. A stale bundle is never served (`current`, `version`
+  and `list` do not return it) and is reported by `ContractStore::stale` and `Engine::stale`,
+  and logged as a warning at open. Registering the same name and version writes over it and
+  drops it from the report; the contract's audiences are kept throughout. Before, one bundle
+  stored by an earlier parcel failed `Engine::open`.
 - A bundle signature covers `griot/bundle/v1 || 0x00 || sha256(…)` (`SIGNING_PURPOSE`); the
   `t03:parcel-bundle-signing-payload:v1` domain is no longer accepted.
 

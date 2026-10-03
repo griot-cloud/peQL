@@ -43,7 +43,7 @@ use crate::gate::{BoundTable, Gate, GateBarrier, GatedQueryPlanner, ensure_gated
 use crate::guard;
 use crate::manifest::Manifest;
 use crate::shape::SuppressExec;
-use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered};
+use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered, Stale};
 
 /// The validation verdict, with the hash of the data it describes.
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -300,6 +300,11 @@ impl Engine {
     }
     pub fn store(&self) -> &dyn ContractStore {
         self.store.as_ref()
+    }
+    /// Stored contracts that did not load when the engine opened and have not been registered
+    /// again since; none of them is served.
+    pub fn stale(&self) -> Vec<Stale> {
+        self.store.stale()
     }
 
     /// Whether views may read stored flags and derived columns (default) or must evaluate every
