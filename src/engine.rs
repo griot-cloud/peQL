@@ -179,6 +179,55 @@ impl Writing {
     }
 }
 
+/// How a write's files are laid out and stamped: the contract's partitioning, clustering and
+/// bloom filters, its hash and name in each file, page statistics, one stream per file, and,
+/// when the write bounds its memory, row groups of an eighth of it.
+fn write_options(
+    c: &parcel_core::Compilation,
+    memory: Option<usize>,
+    rows: usize,
+) -> Result<(DataFrameWriteOptions, TableParquetOptions)> {
+    let cc = &c.contract;
+    let layout = &c.write.layout;
+    let sort: Vec<SortExpr> = layout
+        .cluster_by
+        .iter()
+        .map(|c| col_ref(c).sort(false, false))
+        .collect();
+    let mut options = DataFrameWriteOptions::new().with_partition_by(layout.partition_by.clone());
+    if !sort.is_empty() {
+        options = options.with_sort_by(sort);
+    }
+    let mut parquet = TableParquetOptions::default();
+    parquet
+        .key_value_metadata
+        .insert(CONTRACT_HASH_KEY.into(), Some(cc.contract_hash.clone()));
+    parquet
+        .key_value_metadata
+        .insert(CONTRACT_NAME_KEY.into(), Some(cc.name.clone()));
+    parquet.global.statistics_enabled = Some("page".into());
+    // One stream per file: the parallel serialiser keeps every file's buffers until the
+    // process ends, a part's worth per file written (measured, DataFusion 55.1).
+    parquet.global.allow_single_file_parallelism = false;
+    if let Some(memory) = memory {
+        parquet.global.max_row_group_bytes = Some(
+            datafusion::config::MaxRowGroupBytes::try_new(memory / 8)
+                .map_err(|e| PeqlError::Invalid(e.to_string()))?,
+        );
+    }
+    for c in &layout.bloom {
+        let options = parquet
+            .column_specific_options
+            .entry(c.clone())
+            .or_default();
+        options.bloom_filter_enabled = Some(true);
+        if memory.is_some() {
+            options.bloom_filter_ndv = Some(rows.max(1) as u64);
+        }
+    }
+    Ok((options, parquet))
+}
+
 /// The least [`Writing::with_memory`] accepts: a row group of a megabyte.
 const MIN_WRITE_MEMORY: usize = 4 << 20;
 
@@ -203,6 +252,9 @@ pub struct Engine {
     #[cfg(feature = "iceberg")]
     iceberg_manifests: RwLock<HashMap<String, Manifest>>,
     signer: Option<Arc<dyn EnvelopeSigner>>,
+    /// The contracts this engine reads as of a snapshot whatever the read names: see
+    /// [`Engine::with_as_of`].
+    frozen: AsOf,
     #[cfg(feature = "flight")]
     spool_root: PathBuf,
 }
@@ -232,6 +284,7 @@ impl Engine {
             #[cfg(feature = "iceberg")]
             iceberg_manifests: RwLock::default(),
             signer: None,
+            frozen: AsOf::default(),
         })
     }
 
@@ -255,7 +308,22 @@ impl Engine {
             #[cfg(feature = "iceberg")]
             iceberg_manifests: RwLock::default(),
             signer: None,
+            frozen: AsOf::default(),
         }
+    }
+
+    /// Read every contract `as_of` names as of its snapshot, in every read this engine makes,
+    /// Flight's among them: the view a host serves for contract versions frozen at a snapshot.
+    /// A read that names another snapshot of one of them reads that one. Nothing is written
+    /// under a contract read as of a snapshot: [`Engine::begin_write`] refuses it.
+    pub fn with_as_of(mut self, as_of: AsOf) -> Engine {
+        self.frozen = as_of;
+        self
+    }
+
+    /// The contracts this engine reads as of a snapshot ([`Engine::with_as_of`]).
+    pub fn as_of(&self) -> &AsOf {
+        &self.frozen
     }
 
     pub fn with_store(mut self, store: Arc<dyn ContractStore>) -> Engine {
@@ -635,6 +703,11 @@ impl Engine {
     /// files as one snapshot, which for an overwrite replaces the table's files and commits
     /// only over the snapshot current here.
     pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
+        if let Some(snapshot) = self.frozen.get(name) {
+            return Err(PeqlError::Invalid(format!(
+                "`{name}` is read as of snapshot {snapshot}; nothing is written under it"
+            )));
+        }
         let reg = self.get(name)?;
         let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!(
@@ -765,44 +838,7 @@ impl Engine {
             .await?;
         self.clear_for_overwrite(w).await?;
 
-        let layout = &c.write.layout;
-        let sort: Vec<SortExpr> = layout
-            .cluster_by
-            .iter()
-            .map(|c| col_ref(c).sort(false, false))
-            .collect();
-        let mut options =
-            DataFrameWriteOptions::new().with_partition_by(layout.partition_by.clone());
-        if !sort.is_empty() {
-            options = options.with_sort_by(sort);
-        }
-        let mut parquet = TableParquetOptions::default();
-        parquet
-            .key_value_metadata
-            .insert(CONTRACT_HASH_KEY.into(), Some(cc.contract_hash.clone()));
-        parquet
-            .key_value_metadata
-            .insert(CONTRACT_NAME_KEY.into(), Some(cc.name.clone()));
-        parquet.global.statistics_enabled = Some("page".into());
-        // One stream per file: the parallel serialiser keeps every file's buffers until the
-        // process ends, a part's worth per file written (measured, DataFusion 55.1).
-        parquet.global.allow_single_file_parallelism = false;
-        if let Some(memory) = w.memory {
-            parquet.global.max_row_group_bytes = Some(
-                datafusion::config::MaxRowGroupBytes::try_new(memory / 8)
-                    .map_err(|e| PeqlError::Invalid(e.to_string()))?,
-            );
-        }
-        for c in &layout.bloom {
-            let options = parquet
-                .column_specific_options
-                .entry(c.clone())
-                .or_default();
-            options.bloom_filter_enabled = Some(true);
-            if w.memory.is_some() {
-                options.bloom_filter_ndv = Some(rows.max(1) as u64);
-            }
-        }
+        let (options, parquet) = write_options(c, w.memory, rows)?;
         let url = match &w.location {
             Location::Local(root) => binding::local_url(root, true)?,
             Location::Object(o) => o.url(true),
@@ -855,6 +891,72 @@ impl Engine {
             verdict,
             snapshot: committed,
         })
+    }
+
+    /// Rewrite a contract's Iceberg table into fewer, larger files: when the table's current
+    /// snapshot holds at least `min_small_files` (and at least two) data files smaller than
+    /// `small_file_bytes`, every row of it, as stored, is written again under the contract's
+    /// layout and committed as one snapshot replacing it, over that snapshot only; the facts
+    /// of the new snapshot are recorded as a write's are. The rows do not change, and no file
+    /// is deleted: the snapshot before stays readable until it is expired. `None` when there
+    /// is nothing to compact.
+    #[cfg(feature = "iceberg")]
+    pub async fn compact(
+        &self,
+        name: &str,
+        small_file_bytes: u64,
+        min_small_files: usize,
+    ) -> Result<Option<WriteReport>> {
+        let reg = self.get(name)?;
+        let Bound::Files(Location::Iceberg(t)) = self.bound(&reg)? else {
+            return Err(PeqlError::Invalid(format!(
+                "`{name}` is not bound to an Iceberg table; only an Iceberg table is compacted"
+            )));
+        };
+        let (table, snapshot) = self.iceberg_snapshot(&t, name, None).await?;
+        let files = t.files(&table, snapshot).await?;
+        let small = files.iter().filter(|f| f.bytes < small_file_bytes).count();
+        if small < min_small_files.max(2) {
+            return Ok(None);
+        }
+        let c = &reg.compilation;
+        let stored = t.provider(&table, &c.contract, true, snapshot).await?;
+        let w = self.begin_write(name, WriteMode::Overwrite).await?;
+        let iw = w.iceberg.as_ref().ok_or_else(|| {
+            PeqlError::Invalid(format!("`{name}`'s compaction was not begun on its table"))
+        })?;
+        if iw.base() != Some(snapshot) {
+            return Err(PeqlError::Conflict(format!(
+                "{} moved from snapshot {snapshot} while its compaction began",
+                t.table
+            )));
+        }
+        // One stream: the rows land in as few files as the layout allows.
+        let ctx = self.session_with(
+            self.config_for(Some(1))
+                .set_bool("datafusion.execution.keep_partition_by_columns", true)
+                .set_usize("datafusion.execution.minimum_parallel_output_files", 1),
+            None,
+        );
+        let scan = LogicalPlanBuilder::scan("stored", provider_as_source(stored), None)?
+            .repartition(datafusion::logical_expr::Partitioning::RoundRobinBatch(1))?
+            .build()?;
+        let columns = iw.schema().fields().iter().map(|f| {
+            let metadata: BTreeMap<String, String> = f
+                .metadata()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            datafusion::logical_expr::cast(col_ref(f.name()), f.data_type().clone())
+                .alias_with_metadata(f.name(), Some(metadata.into()))
+        });
+        let plan = LogicalPlanBuilder::from(scan).project(columns)?.build()?;
+        let df = ctx.execute_logical_plan(plan).await?;
+        let (options, parquet) = write_options(c, None, 0)?;
+        df.write_parquet(&iw.url()?, options, Some(parquet)).await?;
+        let mut report = self.finish_write(w).await?;
+        report.rows_written = report.verdict.verdict.row_count as usize;
+        Ok(Some(report))
     }
 
     /// Validate a contract over its files and save its manifest.
@@ -1344,7 +1446,7 @@ impl Engine {
                 return Err(PeqlError::UnknownContract(t.to_string()));
             }
             self.visible(&name, caller)?;
-            let (resolution, manifest) = match as_of.get(&name) {
+            let (resolution, manifest) = match as_of.get(&name).or_else(|| self.frozen.get(&name)) {
                 None => {
                     self.ensure_manifest(&name).await?;
                     self.resolve(&name, caller)?

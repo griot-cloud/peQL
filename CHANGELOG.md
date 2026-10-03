@@ -9,6 +9,15 @@ peQL is now only the engine: the platform socket clients, the worker pool shell 
 bundle fetch are gone, and what a host needs to serve it is here instead.
 
 **Added**
+- `Engine::with_as_of`: an engine that reads the contracts an `AsOf` names as of their
+  snapshots in every read it makes (`query`, `plan`, `view`, `check`, Flight), and refuses a
+  write under them: the view a host serves for a contract version frozen at a snapshot.
+  `Engine::as_of` returns it.
+- `Engine::compact(name, small_file_bytes, min_small_files)`: a contract's Iceberg table
+  rewritten, as stored, into as few files as its layout allows and committed as one snapshot
+  replacing the current one (over it only), with that snapshot's facts recorded; nothing is
+  deleted and the rows do not change. `None` when fewer than `min_small_files` (at least two)
+  data files are smaller than `small_file_bytes`.
 - Iceberg tables (feature `iceberg`): a contract bound to an Iceberg table is read, written and
   validated through iceberg-rust and datafusion-iceberg. `IcebergTables::new(catalog)` binds
   every contract whose document says `binding: {iceberg: <namespace>.<table>}` to that table in
