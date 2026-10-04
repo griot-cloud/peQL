@@ -253,8 +253,7 @@ async fn end_to_end(binding: Binding) {
     // A verifier holding only the bundle reproduces the verdict over the same data.
     let reg = engine.get("sales/orders").unwrap();
     let bundle =
-        parcel_runtime::bundle::Bundle::new(&reg.doc, &reg.ancestors, &schema(), &reg.compilation)
-            .unwrap();
+        parcel_runtime::bundle::Bundle::new(&reg.doc, &[], &schema(), &reg.compilation).unwrap();
     let bundle = parcel_runtime::bundle::Bundle::from_json(&bundle.to_json().unwrap()).unwrap();
     bundle.verify().unwrap();
     let plan = bundle

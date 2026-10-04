@@ -150,7 +150,15 @@ async fn user_functions_end_to_end() {
     assert!(diff.evaluations > 1500);
 
     // A bundle carries the modules; a verifier recompiles and checks it without the workspace.
-    let bundle = engine.get("kplc/tokens").unwrap().bundle().unwrap();
+    let reg = engine.get("kplc/tokens").unwrap();
+    let bundle = parcel_runtime::bundle::Bundle::with_functions(
+        &reg.doc,
+        &[],
+        &reg.schema,
+        &reg.compilation,
+        reg.functions.clone(),
+    )
+    .unwrap();
     assert_eq!(bundle.functions.len(), 3);
     parcel_runtime::bundle::Bundle::from_json(&bundle.to_json().unwrap())
         .unwrap()

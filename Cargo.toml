@@ -14,8 +14,6 @@ description = "peQL: a query engine where every table is a parcel data contract"
 
 [features]
 default = []
-# Verify parcel bundles signed by their issuer (ECDSA P-256). Signing is the issuer's.
-signed-bundle = ["dep:p256"]
 # Serve Flight SQL over tonic on a listener the caller supplies (Unix socket, TCP, ...).
 flight = ["dep:arrow-flight", "dep:tonic", "dep:prost", "dep:tokio-stream", "dep:tempfile"]
 # Bindings in Amazon S3 and S3-compatible stores (`s3://bucket/prefix/`).
@@ -35,8 +33,8 @@ path = "src/bin/peql.rs"
 
 [dependencies]
 tempfile = { version = "3", optional = true }
-parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "93322ad" }
-parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "93322ad" }
+parcel-core = { git = "https://github.com/griot-cloud/parcel", rev = "8c54742" }
+parcel-runtime = { git = "https://github.com/griot-cloud/parcel", rev = "8c54742" }
 datafusion = "55.1.0"
 tokio = { version = "1.40", features = ["full"] }
 futures = "0.3"
@@ -57,9 +55,6 @@ clap = { version = "4", features = ["derive"] }
 
 # Bindings in object stores. DataFusion 55 reads through object_store 0.13, so this is its.
 object_store = { version = "0.13", default-features = false }
-
-# signed-bundle
-p256 = { version = "0.13", features = ["ecdsa"], optional = true }
 
 # flight: the versions arrow-flight 59 (Arrow 59, DataFusion 55) is built on.
 arrow-flight = { version = "59.3", features = ["flight-sql"], optional = true }

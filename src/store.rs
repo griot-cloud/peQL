@@ -1,8 +1,9 @@
 //! The contract store (peQL design 4.2): compiled contracts by name and version. A contract
-//! is registered once, compiled by parcel then, and served from here; a query never compiles.
-//! Persisted as parcel bundles, each verified by recompiling when loaded. A stored bundle is a
-//! cache of what was registered: one that no longer verifies is set aside as [`Stale`], reported
-//! and never served, and the store opens with the rest.
+//! is compiled once, by whoever registers it, and served from here; a query never compiles.
+//! Persisted as parcel's compiled form, loaded as it was stored and never compiled again. A
+//! stored contract is a cache of what was registered: one that no longer loads (another parcel
+//! version, an unreadable file) is set aside as [`Stale`], reported and never served, and the
+//! store opens with the rest.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -11,6 +12,8 @@ use std::sync::{Arc, RwLock};
 use datafusion::arrow::datatypes::Schema;
 use parcel_core::{Compilation, ContractDoc};
 use parcel_runtime::bundle::{Bundle, BundledFunction};
+use parcel_runtime::compiled::CompiledBytes;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{PeqlError, Result};
 
@@ -21,8 +24,6 @@ pub const PUBLIC: &str = "public";
 #[derive(Debug)]
 pub struct Registered {
     pub doc: ContractDoc,
-    /// The documents it inherits from, parent first.
-    pub ancestors: Vec<ContractDoc>,
     pub schema: Schema,
     pub functions: Vec<BundledFunction>,
     pub compilation: Compilation,
@@ -37,29 +38,50 @@ impl Registered {
         self.compilation.contract.owner.as_deref()
     }
 
-    /// The portable form: what `parcel compile -o` writes and a verifier re-runs.
-    pub fn bundle(&self) -> Result<Bundle> {
-        Bundle::with_functions(
-            &self.doc,
-            &self.ancestors,
-            &self.schema,
-            &self.compilation,
-            self.functions.clone(),
-        )
-        .map_err(PeqlError::from)
-    }
-
-    /// Recompile a bundle and accept it only when it gives the same compilation hash.
+    /// Recompile a bundle and accept it only when it gives the same compilation hash: a bundle
+    /// nobody vouches for is trusted for nothing it says.
     pub fn from_bundle(bundle: &Bundle) -> Result<Registered> {
         let compilation = bundle.verify().map_err(PeqlError::Invalid)?;
         Ok(Registered {
             doc: bundle.document.clone(),
-            ancestors: bundle.ancestors.clone(),
             schema: bundle.schema().map_err(PeqlError::Invalid)?,
             functions: bundle.functions.clone(),
             compilation,
         })
     }
+
+    /// A contract as parcel compiled it ([`CompiledBytes`]), taken as given: never compiled
+    /// here. Whoever hands it over vouches that `compiled` is what `doc` compiles to.
+    pub fn from_compiled(
+        doc: ContractDoc,
+        compiled: &[u8],
+        functions: Vec<BundledFunction>,
+    ) -> Result<Registered> {
+        let compilation = Compilation::from_bytes(compiled).map_err(PeqlError::Invalid)?;
+        if compilation.contract.name != doc.contract {
+            return Err(PeqlError::Invalid(format!(
+                "the compiled contract is `{}`; its document is `{}`",
+                compilation.contract.name, doc.contract
+            )));
+        }
+        Ok(Registered {
+            doc,
+            schema: compilation.contract.row_schema.as_ref().clone(),
+            functions,
+            compilation,
+        })
+    }
+}
+
+/// How the directory store keeps one registered version: its document, the functions it is
+/// pinned to, and its compiled form exactly as parcel wrote it.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StoredContract {
+    document: ContractDoc,
+    functions: Vec<BundledFunction>,
+    /// [`CompiledBytes`], which are UTF-8.
+    compiled: String,
 }
 
 /// Where compiled contracts live. Visibility is the engine's decision, from `owner` and
@@ -79,8 +101,7 @@ pub trait ContractStore: Send + Sync {
     fn stale(&self) -> Vec<Stale>;
 }
 
-/// A stored bundle that did not load: unreadable as a bundle, or recompiling it no longer gives
-/// the compilation it records (the compiler changed since it was stored).
+/// A stored contract that did not load: unreadable, or compiled by another version of parcel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Stale {
     pub path: PathBuf,
@@ -158,9 +179,9 @@ impl ContractStore for MemoryStore {
     }
 }
 
-/// On disk: `<root>/_peql/contracts/<name>/v<version>.parcel.json` and `published.json`.
-/// Every bundle is verified when the store opens; one that does not verify is [`Stale`] until a
-/// bundle of the same name and version is put over it.
+/// On disk: `<root>/_peql/contracts/<name>/v<version>.peql.json` and `published.json`.
+/// Every stored contract is loaded when the store opens; one that does not load is [`Stale`]
+/// until a contract of the same name and version is put over it.
 #[derive(Debug)]
 pub struct DirStore {
     dir: PathBuf,
@@ -184,7 +205,7 @@ impl DirStore {
             }
             let mut files: Vec<PathBuf> = std::fs::read_dir(&contract_dir)?
                 .filter_map(|e| e.ok().map(|e| e.path()))
-                .filter(|p| p.to_string_lossy().ends_with(".parcel.json"))
+                .filter(|p| p.to_string_lossy().ends_with(STORED))
                 .collect();
             files.sort();
             let name = decode(&contract_dir);
@@ -236,19 +257,25 @@ impl DirStore {
     }
 }
 
-/// A stored bundle, verified; the error is the cause it is stale.
+/// A stored contract, loaded as stored; the error is the cause it is stale.
 fn load(path: &Path) -> std::result::Result<Registered, String> {
     let bytes = std::fs::read(path).map_err(|e| e.to_string())?;
-    let json = std::str::from_utf8(&bytes).map_err(|e| e.to_string())?;
-    let bundle = Bundle::from_json(json).map_err(|e| e.to_string())?;
-    Registered::from_bundle(&bundle).map_err(|e| e.to_string())
+    let stored: StoredContract = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    Registered::from_compiled(
+        stored.document,
+        stored.compiled.as_bytes(),
+        stored.functions,
+    )
+    .map_err(|e| e.to_string())
 }
 
-/// The version in `v<version>.parcel.json`.
+const STORED: &str = ".peql.json";
+
+/// The version in `v<version>.peql.json`.
 fn file_version(path: &Path) -> Option<u32> {
     path.file_name()?
         .to_str()?
-        .strip_suffix(".parcel.json")?
+        .strip_suffix(STORED)?
         .strip_prefix('v')?
         .parse()
         .ok()
@@ -264,14 +291,15 @@ impl ContractStore for DirStore {
     fn put(&self, c: Arc<Registered>) -> Result<()> {
         let dir = self.contract_dir(c.name());
         std::fs::create_dir_all(&dir)?;
-        let json = c
-            .bundle()?
-            .to_json()
-            .map_err(|e| PeqlError::Invalid(e.to_string()))?;
-        let path = dir.join(format!(
-            "v{:010}.parcel.json",
-            c.compilation.contract.version
-        ));
+        let compiled = c.compilation.to_bytes().map_err(PeqlError::Invalid)?;
+        let stored = StoredContract {
+            document: c.doc.clone(),
+            functions: c.functions.clone(),
+            compiled: String::from_utf8(compiled)
+                .map_err(|e| PeqlError::Invalid(format!("the compiled contract: {e}")))?,
+        };
+        let json = serde_json::to_string(&stored).map_err(|e| PeqlError::Invalid(e.to_string()))?;
+        let path = dir.join(format!("v{:010}{STORED}", c.compilation.contract.version));
         crate::atomic::write(&path, json)?;
         self.stale
             .write()

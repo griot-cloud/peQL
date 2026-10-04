@@ -50,10 +50,6 @@ pub mod view_hash;
 #[cfg(feature = "flight")]
 pub mod flight;
 
-/// Parcel bundles signed by their issuer, verified (feature `signed-bundle`).
-#[cfg(feature = "signed-bundle")]
-pub mod signed_bundle;
-
 /// Contracts bound to Iceberg tables (feature `iceberg`).
 #[cfg(feature = "iceberg")]
 pub mod iceberg_table;

@@ -52,7 +52,7 @@ Call `register_contract(source, &schema)` with YAML/JSON text and an Arrow schem
 
 The binding methods validate the supplied table and keep its manifest in memory. They do not write Parquet. `write` requires a file binding that points to a directory, rather than a single file or a bound table.
 
-Use `register_bundle(&bundle)` for a compiled parcel bundle. Use `publish(name, tenant)` when callers from another tenant need to discover an owned contract.
+Use `register_bundle(&bundle)` for a parcel bundle, which peQL recompiles to its hash, or `register_compiled(document, &compiled, &functions)` for a contract the application compiled and vouches for, which peQL never compiles. Use `publish(name, tenant)` when callers from another tenant need to discover an owned contract.
 
 ## Configure the engine
 

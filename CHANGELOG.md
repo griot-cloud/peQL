@@ -5,10 +5,18 @@ based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]: the engine cut for a guest
 
+**Removed**
+- The `signed-bundle` feature (`peql::signed_bundle`, `p256`): who vouches for a compiled
+  contract, and how, is the embedding application's.
+
 peQL is now only the engine: the platform socket clients, the worker pool shell and the HTTP
 bundle fetch are gone, and what a host needs to serve it is here instead.
 
 **Added**
+- `Engine::register_compiled(document, compiled, functions)`: a contract parcel already
+  compiled (`Compilation::to_bytes`) registered as given, never compiled. `view_hash` takes
+  the same bytes, and the directory store keeps and reloads them (`v<n>.peql.json`) without
+  compiling; a contract compiled by another parcel version is refused and reported stale.
 - `Engine::with_as_of`: an engine that reads the contracts an `AsOf` names as of their
   snapshots in every read it makes (`query`, `plan`, `view`, `check`, Flight), and refuses a
   write under them: the view a host serves for a contract version frozen at a snapshot.

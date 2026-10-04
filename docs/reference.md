@@ -128,7 +128,7 @@ Keep the workspace state and dataset files together when moving or backing up a 
 
 ## Build features
 
-The default Rust build has no optional features enabled. `flight` adds the Flight SQL service, `signed-bundle` verification of signed bundles, and `s3` the S3 store for object-store bindings. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build.
+The default Rust build has no optional features enabled. `flight` adds the Flight SQL service and `s3` the S3 store for object-store bindings. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build.
 
 See {doc}`platform` for integration behaviour.
 

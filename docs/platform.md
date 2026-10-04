@@ -2,9 +2,9 @@
 
 The standard engine works with local Parquet and needs no platform services. Rust applications can add the integrations below when their deployment needs them.
 
-## Signed contract bundles
+## Contracts compiled elsewhere
 
-Enable the `signed-bundle` Cargo feature to accept bundles signed with ECDSA P-256 by their issuer. peQL only verifies; signing belongs to the issuer. `SignedBundle::register(&engine, &key)` checks the signature and then registers the bundle, which recompiles it to its compilation hash. `signing_payload()` returns the exact bytes the issuer signs.
+An application that compiles contracts itself hands peQL the result with `Engine::register_compiled(document, &compiled, &functions)`: `compiled` is parcel's compiled form (`Compilation::to_bytes`), and peQL registers it as given, without compiling it. The application vouches for the bytes; checking who produced them, for example by a signature, is the application's. A contract compiled by another version of parcel is refused.
 
 ## Custom functions
 
