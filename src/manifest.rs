@@ -75,12 +75,10 @@ impl Manifest {
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let p = Self::path(root, &self.contract);
         std::fs::create_dir_all(p.parent().expect("manifest dir"))?;
-        let tmp = p.with_extension("json.tmp");
-        std::fs::write(
-            &tmp,
+        crate::atomic::write(
+            &p,
             serde_json::to_string_pretty(self).map_err(std::io::Error::other)?,
-        )?;
-        std::fs::rename(tmp, p)
+        )
     }
 
     /// True when every file was written under this contract hash, so stored flags and

@@ -26,6 +26,7 @@
 //! data lands. [`view_hash`] names a contract's view by what it is: the same contract over
 //! the same columns is the same hash, whatever rows the table holds.
 
+mod atomic;
 pub mod audit;
 pub mod binding;
 pub mod budget;

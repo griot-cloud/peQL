@@ -109,12 +109,10 @@ impl BudgetStore {
 
     fn save(&self, l: &Ledger) -> Result<()> {
         if let Some(path) = &self.file {
-            let tmp = path.with_extension("tmp");
-            std::fs::write(
-                &tmp,
+            crate::atomic::write(
+                path,
                 serde_json::to_string_pretty(l).map_err(|e| PeqlError::Invalid(e.to_string()))?,
             )?;
-            std::fs::rename(tmp, path)?;
         }
         Ok(())
     }
