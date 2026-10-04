@@ -11,7 +11,7 @@ use std::sync::{Arc, RwLock};
 
 use datafusion::arrow::datatypes::Schema;
 use parcel_core::{Compilation, ContractDoc};
-use parcel_runtime::bundle::{Bundle, BundledFunction};
+use parcel_runtime::compiled::BundledFunction;
 use parcel_runtime::compiled::CompiledBytes;
 use serde::{Deserialize, Serialize};
 
@@ -36,18 +36,6 @@ impl Registered {
 
     pub fn owner(&self) -> Option<&str> {
         self.compilation.contract.owner.as_deref()
-    }
-
-    /// Recompile a bundle and accept it only when it gives the same compilation hash: a bundle
-    /// nobody vouches for is trusted for nothing it says.
-    pub fn from_bundle(bundle: &Bundle) -> Result<Registered> {
-        let compilation = bundle.verify().map_err(PeqlError::Invalid)?;
-        Ok(Registered {
-            doc: bundle.document.clone(),
-            schema: bundle.schema().map_err(PeqlError::Invalid)?,
-            functions: bundle.functions.clone(),
-            compilation,
-        })
     }
 
     /// A contract as parcel compiled it ([`CompiledBytes`]), taken as given: never compiled

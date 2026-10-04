@@ -36,7 +36,7 @@ Contracts are written in **parcel**, which uses YAML or JSON for the document an
 
 A **workspace** is the directory peQL operates in. It contains registered contracts and engine state under `_peql/`. Relative data paths, such as `data/orders/`, are resolved from that directory. The CLI uses your current directory unless you select another with `--root`.
 
-**Registration** makes a contract available to the engine. peQL checks its rules against the data's column names and types and stores the compiled result. You can register a contract document or a compiled parcel bundle. Registration alone does not copy or write the dataset.
+**Registration** makes a contract available to the engine. peQL checks its rules against the data's column names and types and stores the compiled result. You can register a contract document, which peQL compiles, or a contract parcel already compiled, which peQL loads as given. Registration alone does not copy or write the dataset.
 
 The contract's name is what queries use in SQL. Its data can come from local Parquet or, in a Rust application, a table supplied by the application.
 

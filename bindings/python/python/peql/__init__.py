@@ -66,9 +66,9 @@ class Engine:
             schema = schema.schema
         return self._native.register(contract, _ipc(schema))
 
-    def register_bundle(self, bundle: str) -> str:
-        """Register a bundle from `parcel compile -o` (its JSON text)."""
-        return self._native.register_bundle(bundle)
+    def register_compiled(self, contract: str, compiled: bytes) -> str:
+        """Register a contract parcel already compiled (`parcel compile -o`), as given."""
+        return self._native.register_compiled(contract, compiled)
 
     def write(self, name: str, data, append: bool = False) -> dict:
         """Write a pyarrow Table under a contract; returns the report with its verdict."""

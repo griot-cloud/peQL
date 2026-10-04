@@ -24,7 +24,7 @@ use parcel_core::document::{AssertOnFail, GuaranteeOnFail};
 use parcel_core::registry::{FunctionEntry, FunctionManifest};
 use parcel_core::{ContractDoc, compile_with};
 use parcel_runtime::Caller;
-use parcel_runtime::bundle::{Bundle, BundledFunction};
+use parcel_runtime::compiled::BundledFunction;
 use parcel_runtime::plan::{col_ref, conform, dataset_value, enrich_plan, param_values};
 use parcel_runtime::reference::{self, Scope};
 use serde::Serialize;
@@ -428,17 +428,6 @@ impl Engine {
         Ok(reg)
     }
 
-    /// Register what `parcel compile -o` produced, after recompiling it to the same hash.
-    pub fn register_bundle(&self, bundle: &Bundle) -> Result<Arc<Registered>> {
-        self.functions.adopt(&bundle.functions)?;
-        for a in &bundle.ancestors {
-            self.add_document(a.clone());
-        }
-        let reg = Arc::new(Registered::from_bundle(bundle)?);
-        self.store.put(reg.clone())?;
-        Ok(reg)
-    }
-
     /// Register a contract parcel already compiled, as given: `compiled` is its
     /// [`parcel_runtime::compiled::CompiledBytes`] form, `doc` the document it was compiled
     /// from, `functions` the modules it is pinned to. Nothing is compiled; the caller vouches
@@ -535,7 +524,7 @@ impl Engine {
                 breached: verdict.verdict.breached.clone(),
                 stats: verdict.verdict.stats.clone(),
                 data_hash: verdict.data_hash.clone(),
-                row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
+                row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
                 files: Vec::new(),
                 snapshot_id: None,
             },
@@ -1051,7 +1040,7 @@ impl Engine {
             breached: verdict.verdict.breached.clone(),
             stats: verdict.verdict.stats.clone(),
             data_hash: verdict.data_hash.clone(),
-            row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
+            row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
             files,
             snapshot_id: verdict.snapshot_id,
         };

@@ -5416,7 +5416,7 @@ dependencies = [
 [[package]]
 name = "parcel-core"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=8c54742#8c5474255a7eafd5b3057fbae908bfcb1bf5a176"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 dependencies = [
  "cel",
  "chrono",
@@ -5439,7 +5439,7 @@ dependencies = [
 [[package]]
 name = "parcel-runtime"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=8c54742#8c5474255a7eafd5b3057fbae908bfcb1bf5a176"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 dependencies = [
  "cel",
  "chrono",
@@ -5461,7 +5461,7 @@ dependencies = [
 [[package]]
 name = "parcel-udf"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=8c54742#8c5474255a7eafd5b3057fbae908bfcb1bf5a176"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 
 [[package]]
 name = "parking"

@@ -437,11 +437,8 @@ async fn register(
     types: &TypeHints,
 ) -> Result<Arc<peql::store::Registered>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if let Ok(bundle) = parcel_runtime::bundle::Bundle::from_json(&text) {
-        return engine.register_bundle(&bundle).map_err(s);
-    }
-    let schema_from = schema
-        .ok_or("a contract document needs --schema (a Parquet or CSV sample); a bundle does not")?;
+    let schema_from =
+        schema.ok_or("a contract document needs --schema (a Parquet or CSV sample)")?;
     let (schema, _) = read_data(schema_from, types).await?;
     engine.register_contract(&text, &schema).map_err(s)
 }

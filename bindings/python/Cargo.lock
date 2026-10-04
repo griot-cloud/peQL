@@ -2671,7 +2671,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 [[package]]
 name = "parcel-core"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=8c54742#8c5474255a7eafd5b3057fbae908bfcb1bf5a176"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 dependencies = [
  "cel",
  "chrono",
@@ -2694,7 +2694,7 @@ dependencies = [
 [[package]]
 name = "parcel-runtime"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=8c54742#8c5474255a7eafd5b3057fbae908bfcb1bf5a176"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 dependencies = [
  "cel",
  "chrono",
@@ -2716,7 +2716,7 @@ dependencies = [
 [[package]]
 name = "parcel-udf"
 version = "0.0.3"
-source = "git+https://github.com/griot-cloud/parcel?rev=8c54742#8c5474255a7eafd5b3057fbae908bfcb1bf5a176"
+source = "git+https://github.com/griot-cloud/parcel?rev=0af4c09#0af4c091d4417991920fc3159d74646b0579942f"
 
 [[package]]
 name = "parking_lot"
@@ -2813,7 +2813,7 @@ name = "peql-python"
 version = "0.4.2"
 dependencies = [
  "datafusion",
- "parcel-runtime",
+ "parcel-core",
  "peql",
  "pyo3",
  "serde_json",

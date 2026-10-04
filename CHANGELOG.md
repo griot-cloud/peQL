@@ -8,6 +8,8 @@ based on [Keep a Changelog](https://keepachangelog.com/).
 **Removed**
 - The `signed-bundle` feature (`peql::signed_bundle`, `p256`): who vouches for a compiled
   contract, and how, is the embedding application's.
+- `Engine::register_bundle`, `Registered::from_bundle`, `peql register BUNDLE` and Python's
+  `register_bundle`: parcel has no bundle any more. Python gains `register_compiled`.
 
 peQL is now only the engine: the platform socket clients, the worker pool shell and the HTTP
 bundle fetch are gone, and what a host needs to serve it is here instead.

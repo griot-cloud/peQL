@@ -13,7 +13,6 @@ peql [--root DIR] COMMAND
 | Command | Purpose |
 | --- | --- |
 | `register FILE --schema SAMPLE` | Register a YAML/JSON contract against a CSV or Parquet sample. |
-| `register BUNDLE` | Register a parcel bundle; no schema argument needed. |
 | `write NAME_OR_FILE --input FILE` | Write CSV/Parquet under a contract; replaces existing data by default. |
 | `validate NAME` | Print the validation verdict as JSON. |
 | `query SQL` | Execute one read-only SQL query. |
@@ -118,7 +117,7 @@ In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotSer
 
 | Location | Contents |
 | --- | --- |
-| `<root>/_peql/contracts/` | Versioned parcel bundles and publication records. |
+| `<root>/_peql/contracts/` | Versioned contracts (document, functions and compiled bytes) and publication records. |
 | `<root>/_peql/functions/` | Registered WebAssembly modules and metadata. |
 | `<root>/_peql/budgets.json` | Budget limits and spending. |
 | `<root>/_peql/audit.jsonl` | Query-attempt records, one JSON object per line. |

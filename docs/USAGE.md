@@ -103,16 +103,6 @@ Edit the contract, increase its `version`, and register it again against the dat
 
 If the change affects quality checks, derived values or stored data layout, rewrite the data from the source through the updated contract. This refreshes the validation manifest and stored rule calculations.
 
-## Use a compiled bundle
-
-A parcel bundle packages a contract with its schema and compiled rules. If another tool or team provides one, register it directly:
-
-```text
-peql register orders.parcel.json
-```
-
-No `--schema` is needed because the bundle carries it. peQL verifies the bundle before registration. The bundle does not contain the dataset; its data binding must resolve in the workspace.
-
 ## Use peQL in an application
 
 Choose the interface that fits your application:

@@ -105,10 +105,14 @@ impl Engine {
         Ok(reg.name().to_owned())
     }
 
-    /// Register a parcel bundle (JSON, from `parcel compile -o`).
-    fn register_bundle(&self, bundle_json: String) -> PyResult<String> {
-        let bundle = parcel_runtime::bundle::Bundle::from_json(&bundle_json).map_err(err)?;
-        let reg = self.inner.register_bundle(&bundle).map_err(to_py)?;
+    /// Register a contract parcel already compiled (the bytes `parcel compile -o` writes), as
+    /// given, beside the document it was compiled from. Nothing is compiled.
+    fn register_compiled(&self, source: String, compiled: &[u8]) -> PyResult<String> {
+        let doc = parcel_core::ContractDoc::parse(&source).map_err(err)?;
+        let reg = self
+            .inner
+            .register_compiled(doc, compiled, &[])
+            .map_err(to_py)?;
         Ok(reg.name().to_owned())
     }
 

@@ -250,16 +250,15 @@ async fn end_to_end(binding: Binding) {
     assert_eq!(again.data_hash, v.data_hash);
     assert_eq!(again.failures, v.failures);
 
-    // A verifier holding only the bundle reproduces the verdict over the same data.
+    // A verifier holding only the compiled bytes reproduces the verdict over the same data.
     let reg = engine.get("sales/orders").unwrap();
-    let bundle =
-        parcel_runtime::bundle::Bundle::new(&reg.doc, &[], &schema(), &reg.compilation).unwrap();
-    let bundle = parcel_runtime::bundle::Bundle::from_json(&bundle.to_json().unwrap()).unwrap();
-    bundle.verify().unwrap();
-    let plan = bundle
-        .validation_plan(&parcel_runtime::bundle::session().task_ctx())
+    use parcel_runtime::compiled::CompiledBytes;
+    let back = parcel_core::compile::Compilation::from_bytes(&reg.compilation.to_bytes().unwrap())
         .unwrap();
-    let verified = engine.validate_with("sales/orders", plan).await.unwrap();
+    let verified = engine
+        .validate_with("sales/orders", back.validation.plan.clone())
+        .await
+        .unwrap();
     assert_eq!(
         (verified.valid, &verified.failures, &verified.data_hash),
         (v.valid, &v.failures, &v.data_hash)

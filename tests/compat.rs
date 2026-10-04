@@ -398,35 +398,6 @@ async fn every_query_is_audited() {
 }
 
 #[tokio::test]
-async fn a_bundle_is_the_handoff() {
-    let dir = tempfile::tempdir().unwrap();
-    let e = engine(dir.path(), Arc::default()).await;
-    let reg = e.get("sales/orders").unwrap();
-    let json = parcel_runtime::bundle::Bundle::new(&reg.doc, &[], &reg.schema, &reg.compilation)
-        .unwrap()
-        .to_json()
-        .unwrap();
-    // A second engine over the same files, fed only the bundle.
-    let other = Engine::in_memory(dir.path());
-    other
-        .register_bundle(&parcel_runtime::bundle::Bundle::from_json(&json).unwrap())
-        .unwrap();
-    other.publish("sales/orders", "globex").unwrap();
-    let sql = r#"SELECT order_id, email FROM "sales/orders" ORDER BY order_id"#;
-    let a = rows(&e.query(sql, &globex()).await.unwrap().batches);
-    let b = rows(&other.query(sql, &globex()).await.unwrap().batches);
-    assert_eq!(a, b);
-    // A tampered bundle is refused: its artifacts no longer match its hash.
-    let tampered = json.replace(
-        "ctx.purpose in ['analytics']",
-        "ctx.purpose in ['analytics', 'marketing']",
-    );
-    assert_ne!(tampered, json);
-    let bad = parcel_runtime::bundle::Bundle::from_json(&tampered).unwrap();
-    assert!(Engine::in_memory(dir.path()).register_bundle(&bad).is_err());
-}
-
-#[tokio::test]
 async fn a_compiled_contract_is_served_as_given_and_never_compiled() {
     use parcel_runtime::compiled::CompiledBytes;
     let dir = tempfile::tempdir().unwrap();
