@@ -272,9 +272,7 @@ impl ContractStore for DirStore {
             "v{:010}.parcel.json",
             c.compilation.contract.version
         ));
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, json)?;
-        std::fs::rename(tmp, &path)?;
+        crate::atomic::write(&path, json)?;
         self.stale
             .write()
             .expect("store lock")
