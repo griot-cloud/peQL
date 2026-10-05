@@ -32,7 +32,7 @@ jobs:
       - name: Examples, including the parcel handoff
         run: |
           cargo build --bin peql
-          cargo install --locked --git https://github.com/griot-cloud/parcel parcel-cli
+          cargo install --locked --git https://github.com/griot-cloud/parcel --rev 0af4c09 parcel-cli
           PEQL=$PWD/target/debug/peql PARCEL=parcel examples/run-all.sh
 
   lance:

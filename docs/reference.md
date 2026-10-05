@@ -13,6 +13,7 @@ peql [--root DIR] COMMAND
 | Command | Purpose |
 | --- | --- |
 | `register FILE --schema SAMPLE` | Register a YAML/JSON contract against a CSV or Parquet sample. |
+| `register FILE --compiled COMPILED` | Register a YAML/JSON contract as parcel compiled it (`parcel compile -o`), without compiling it. |
 | `write NAME_OR_FILE --input FILE` | Write CSV/Parquet under a contract; replaces existing data by default. |
 | `validate NAME` | Print the validation verdict as JSON. |
 | `query SQL` | Execute one read-only SQL query. |
