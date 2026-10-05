@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use parcel_runtime::compiled::CompiledBytes;
 use peql::{Engine, compiled_view_hash, view_hash};
 
 const ORDERS: &str = r#"
@@ -24,22 +25,24 @@ fn table() -> Schema {
     ])
 }
 
-fn bundle(doc: &str) -> parcel_runtime::bundle::Bundle {
+/// The contract compiled, in parcel's compiled form.
+fn compiled(doc: &str) -> Vec<u8> {
     let dir = tempfile::tempdir().unwrap();
     Engine::in_memory(dir.path())
         .register_contract(doc, &table())
         .unwrap()
-        .bundle()
+        .compilation
+        .to_bytes()
         .unwrap()
 }
 
 #[test]
 fn the_same_contract_over_the_same_columns_is_the_same_view() {
-    let b = bundle(ORDERS);
+    let b = compiled(ORDERS);
     let first = view_hash(&b, &table()).unwrap();
     assert!(first.starts_with("sha256:") && first.len() == 71, "{first}");
-    assert_eq!(view_hash(&bundle(ORDERS), &table()).unwrap(), first);
-    // The registered compilation names the same view as its bundle.
+    assert_eq!(view_hash(&compiled(ORDERS), &table()).unwrap(), first);
+    // The registered compilation names the same view as its compiled form.
     let dir = tempfile::tempdir().unwrap();
     let registered = Engine::in_memory(dir.path())
         .register_contract(ORDERS, &table())
@@ -52,7 +55,7 @@ fn the_same_contract_over_the_same_columns_is_the_same_view() {
 
 #[test]
 fn schema_metadata_is_not_the_view() {
-    let b = bundle(ORDERS);
+    let b = compiled(ORDERS);
     let renumbered = table().with_metadata(HashMap::from([("schema-id".into(), "4".into())]));
     let fields: Vec<Field> = table()
         .fields()
@@ -75,7 +78,7 @@ fn schema_metadata_is_not_the_view() {
 
 #[test]
 fn another_column_type_rule_or_exposed_column_is_another_view() {
-    let b = bundle(ORDERS);
+    let b = compiled(ORDERS);
     let same = view_hash(&b, &table()).unwrap();
     let retyped = Schema::new(vec![
         Field::new("order_id", DataType::Int32, false),
@@ -89,10 +92,14 @@ fn another_column_type_rule_or_exposed_column_is_another_view() {
     ]);
     assert_ne!(view_hash(&b, &widened).unwrap(), same, "a column added");
     let rule = ORDERS.replace("row.amount > 0.0", "row.amount > 1.0");
-    assert_ne!(view_hash(&bundle(&rule), &table()).unwrap(), same, "a rule");
+    assert_ne!(
+        view_hash(&compiled(&rule), &table()).unwrap(),
+        same,
+        "a rule"
+    );
     let exposed = ORDERS.replace("  - {name: amount, type: float64}\n", "");
     assert_ne!(
-        view_hash(&bundle(&exposed), &table()).unwrap(),
+        view_hash(&compiled(&exposed), &table()).unwrap(),
         same,
         "the exposed columns"
     );

@@ -149,12 +149,13 @@ async fn user_functions_end_to_end() {
     );
     assert!(diff.evaluations > 1500);
 
-    // A bundle carries the modules; a verifier recompiles and checks it without the workspace.
-    let bundle = engine.get("kplc/tokens").unwrap().bundle().unwrap();
-    assert_eq!(bundle.functions.len(), 3);
-    parcel_runtime::bundle::Bundle::from_json(&bundle.to_json().unwrap())
-        .unwrap()
-        .verify()
+    // The compiled bytes and the modules they pin are registered elsewhere as given.
+    let reg = engine.get("kplc/tokens").unwrap();
+    assert_eq!(reg.functions.len(), 3);
+    let compiled = parcel_runtime::compiled::CompiledBytes::to_bytes(&reg.compilation).unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    Engine::in_memory(elsewhere.path())
+        .register_compiled(reg.doc.clone(), &compiled, &reg.functions)
         .unwrap();
 
     // A reopened workspace reloads the functions from storage.

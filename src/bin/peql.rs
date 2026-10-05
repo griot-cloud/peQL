@@ -26,13 +26,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Register a contract: a parcel bundle (from `parcel compile -o`), or a YAML/JSON contract
-    /// compiled here against a sample's schema.
+    /// Register a YAML/JSON contract: compiled by parcel (`parcel compile -o`) and registered
+    /// as those bytes with `--compiled`, or compiled here against a sample's schema with
+    /// `--schema`.
     Register {
         contract: PathBuf,
-        /// A Parquet or CSV file with the data's schema (for a YAML/JSON contract).
-        #[arg(long)]
+        /// A Parquet or CSV file with the data's schema, to compile the contract against.
+        #[arg(
+            long,
+            conflicts_with = "compiled",
+            required_unless_present = "compiled"
+        )]
         schema: Option<PathBuf>,
+        /// The contract as parcel compiled it (`parcel compile -o`), registered as given.
+        #[arg(long)]
+        compiled: Option<PathBuf>,
         #[command(flatten)]
         types: TypeHints,
     },
@@ -221,9 +229,13 @@ async fn run(cli: Cli) -> R {
         Command::Register {
             contract,
             schema,
+            compiled,
             types,
         } => {
-            let reg = register(&engine, &contract, schema.as_deref(), &types).await?;
+            let reg = match compiled {
+                Some(compiled) => register_compiled(&engine, &contract, &compiled)?,
+                None => register(&engine, &contract, schema.as_deref(), &types).await?,
+            };
             let cc = &reg.compilation.contract;
             println!(
                 "registered {} v{} ({})",
@@ -437,13 +449,30 @@ async fn register(
     types: &TypeHints,
 ) -> Result<Arc<peql::store::Registered>, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if let Ok(bundle) = parcel_runtime::bundle::Bundle::from_json(&text) {
-        return engine.register_bundle(&bundle).map_err(s);
-    }
-    let schema_from = schema
-        .ok_or("a contract document needs --schema (a Parquet or CSV sample); a bundle does not")?;
+    let schema_from =
+        schema.ok_or("a contract document needs --schema (a Parquet or CSV sample)")?;
     let (schema, _) = read_data(schema_from, types).await?;
     engine.register_contract(&text, &schema).map_err(s)
+}
+
+/// A contract document and the bytes parcel compiled it to, registered as given, with the
+/// workspace's function modules the compiled contract pins.
+fn register_compiled(
+    engine: &Engine,
+    path: &Path,
+    compiled: &Path,
+) -> Result<Arc<peql::store::Registered>, String> {
+    use parcel_runtime::compiled::CompiledBytes;
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc =
+        parcel_core::ContractDoc::parse(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+    let bytes = std::fs::read(compiled).map_err(|e| format!("{}: {e}", compiled.display()))?;
+    let compilation = parcel_core::Compilation::from_bytes(&bytes)
+        .map_err(|e| format!("{}: {e}", compiled.display()))?;
+    let functions = engine
+        .functions()
+        .modules_for(&compilation.contract.functions);
+    engine.register_compiled(doc, &bytes, &functions).map_err(s)
 }
 
 fn emit(batches: &[RecordBatch], format: Output, out: Option<&Path>) -> Result<(), String> {

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use parcel_runtime::bundle::ColumnDef;
+use parcel_runtime::compiled::ColumnDef;
 use serde::{Deserialize, Serialize};
 
 /// Manifests live here under the binding root, one per contract bound to the data.

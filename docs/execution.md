@@ -16,7 +16,7 @@ Joins and subqueries use the same contract views. A query cannot introduce a raw
 
 Parcel owns the contract language and the meaning of its rules. It produces expressions for querying, a validation plan and a write plan. Its runtime library also supplies rule evaluation and result-shaping operations.
 
-peQL uses those artifacts to manage a workspace, find the data, build caller-specific views, execute SQL, charge budgets and record results. It can compile a contract directly through parcel's libraries or receive a compiled bundle. A bundle is verified by recompiling its document and comparing its hash and executable artifacts.
+peQL uses those artifacts to manage a workspace, find the data, build caller-specific views, execute SQL, charge budgets and record results. It can compile a contract directly through parcel's libraries or receive one parcel already compiled (`Compilation::to_bytes`), which it loads as given and never compiles; whoever hands it the bytes vouches for them.
 
 The [parcel documentation](https://griot-cloud.github.io/parcel/) covers contract syntax, expressions, custom functions and compilation.
 

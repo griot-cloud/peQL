@@ -7,7 +7,7 @@ use std::sync::RwLock;
 
 use parcel_core::Registry;
 use parcel_core::registry::{FunctionEntry, FunctionManifest};
-use parcel_runtime::bundle::BundledFunction;
+use parcel_runtime::compiled::BundledFunction;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{PeqlError, Result};

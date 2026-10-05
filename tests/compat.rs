@@ -398,34 +398,75 @@ async fn every_query_is_audited() {
 }
 
 #[tokio::test]
-async fn a_bundle_is_the_handoff() {
+async fn a_compiled_contract_is_served_as_given_and_never_compiled() {
+    use parcel_runtime::compiled::CompiledBytes;
     let dir = tempfile::tempdir().unwrap();
     let e = engine(dir.path(), Arc::default()).await;
-    let json = e
-        .get("sales/orders")
+    let reg = e.get("sales/orders").unwrap();
+    let compiled = reg.compilation.to_bytes().unwrap();
+    // A document no compiler accepts (it exposes a column the table lacks). Compiling it, at
+    // registration or when the store reopens, would fail: serving proves nothing compiled it.
+    let mut doc = reg.doc.clone();
+    doc.expose
+        .as_mut()
         .unwrap()
-        .bundle()
-        .unwrap()
-        .to_json()
-        .unwrap();
-    // A second engine over the same files, fed only the bundle.
-    let other = Engine::in_memory(dir.path());
+        .push(parcel_core::document::ExposeColumn {
+            name: "no_such_column".into(),
+            type_name: "int64".into(),
+        });
+    assert!(
+        parcel_core::compile(&doc, &reg.schema, &parcel_core::Registry::builtin()).is_err(),
+        "the document must not compile"
+    );
+
+    let other = Engine::open(dir.path()).unwrap();
     other
-        .register_bundle(&parcel_runtime::bundle::Bundle::from_json(&json).unwrap())
+        .register_compiled(doc.clone(), &compiled, &[])
         .unwrap();
     other.publish("sales/orders", "globex").unwrap();
     let sql = r#"SELECT order_id, email FROM "sales/orders" ORDER BY order_id"#;
-    let a = rows(&e.query(sql, &globex()).await.unwrap().batches);
-    let b = rows(&other.query(sql, &globex()).await.unwrap().batches);
-    assert_eq!(a, b);
-    // A tampered bundle is refused: its artifacts no longer match its hash.
-    let tampered = json.replace(
-        "ctx.purpose in ['analytics']",
-        "ctx.purpose in ['analytics', 'marketing']",
+    let want = rows(&e.query(sql, &globex()).await.unwrap().batches);
+    assert!(!want.is_empty());
+    assert_eq!(
+        rows(&other.query(sql, &globex()).await.unwrap().batches),
+        want
     );
-    assert_ne!(tampered, json);
-    let bad = parcel_runtime::bundle::Bundle::from_json(&tampered).unwrap();
-    assert!(Engine::in_memory(dir.path()).register_bundle(&bad).is_err());
+    assert_eq!(
+        peql::view_hash(&compiled, &reg.schema).unwrap(),
+        peql::compiled_view_hash(&reg.compilation, &reg.schema).unwrap()
+    );
+    drop(other);
+
+    // The store reloads what was stored, as stored.
+    let reopened = Engine::open(dir.path()).unwrap();
+    assert!(reopened.stale().is_empty(), "{:?}", reopened.stale());
+    assert_eq!(reopened.get("sales/orders").unwrap().doc, doc);
+    assert_eq!(
+        rows(&reopened.query(sql, &globex()).await.unwrap().batches),
+        want
+    );
+}
+
+#[tokio::test]
+async fn a_contract_compiled_by_another_parcel_is_refused() {
+    use parcel_runtime::compiled::CompiledBytes;
+    let dir = tempfile::tempdir().unwrap();
+    let e = engine(dir.path(), Arc::default()).await;
+    let reg = e.get("sales/orders").unwrap();
+    let mut v: serde_json::Value =
+        serde_json::from_slice(&reg.compilation.to_bytes().unwrap()).unwrap();
+    v["parcel_version"] = "0.0.0".into();
+    let compiled = serde_json::to_vec(&v).unwrap();
+    let err = Engine::in_memory(dir.path())
+        .register_compiled(reg.doc.clone(), &compiled, &[])
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("parcel 0.0.0")
+            && err.contains(&format!("parcel {}", parcel_core::compile::PARCEL_VERSION)),
+        "{err}"
+    );
+    assert!(peql::view_hash(&compiled, &reg.schema).is_err());
 }
 
 #[tokio::test]

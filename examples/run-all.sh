@@ -41,8 +41,8 @@ if [ -n "${PARCEL:-}" ]; then
   work=$(mktemp -d)
   trap 'rm -rf "$work"' EXIT
   "$PARCEL" check contracts/orders.yaml --data incoming/orders.csv --type msisdn=utf8 --json > "$work/check.json"
-  "$PARCEL" compile contracts/orders.yaml --schema incoming/orders.csv --type msisdn=utf8 -o "$work/orders.parcel.json" > /dev/null
-  "$P" --root "$work" register "$work/orders.parcel.json"
+  "$PARCEL" compile contracts/orders.yaml --schema incoming/orders.csv --type msisdn=utf8 -o "$work/orders.compiled" > /dev/null
+  "$P" --root "$work" register contracts/orders.yaml --compiled "$work/orders.compiled"
   mkdir -p "$work/data" && cp -r data/orders "$work/data/"
   "$P" --root "$work" publish sales/orders --to globex
   "$P" --root "$work" query 'SELECT COUNT(*) AS n FROM "sales/orders"' --caller callers/globex-analyst.yaml

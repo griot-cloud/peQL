@@ -25,14 +25,14 @@ jobs:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --features flight,signed-bundle,s3 -- -D warnings
-      - run: cargo test --features flight,signed-bundle,s3
+      - run: cargo clippy --all-targets --features flight,s3 -- -D warnings
+      - run: cargo test --features flight,s3
       - name: The default build, with no optional feature
         run: cargo build --lib
       - name: Examples, including the parcel handoff
         run: |
           cargo build --bin peql
-          cargo install --locked --git https://github.com/griot-cloud/parcel parcel-cli
+          cargo install --locked --git https://github.com/griot-cloud/parcel --rev 0af4c09 parcel-cli
           PEQL=$PWD/target/debug/peql PARCEL=parcel examples/run-all.sh
 
   lance:

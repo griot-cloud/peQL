@@ -13,7 +13,7 @@ peql [--root DIR] COMMAND
 | Command | Purpose |
 | --- | --- |
 | `register FILE --schema SAMPLE` | Register a YAML/JSON contract against a CSV or Parquet sample. |
-| `register BUNDLE` | Register a parcel bundle; no schema argument needed. |
+| `register FILE --compiled COMPILED` | Register a YAML/JSON contract as parcel compiled it (`parcel compile -o`), without compiling it. |
 | `write NAME_OR_FILE --input FILE` | Write CSV/Parquet under a contract; replaces existing data by default. |
 | `validate NAME` | Print the validation verdict as JSON. |
 | `query SQL` | Execute one read-only SQL query. |
@@ -118,7 +118,7 @@ In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotSer
 
 | Location | Contents |
 | --- | --- |
-| `<root>/_peql/contracts/` | Versioned parcel bundles and publication records. |
+| `<root>/_peql/contracts/` | Versioned contracts (document, functions and compiled bytes) and publication records. |
 | `<root>/_peql/functions/` | Registered WebAssembly modules and metadata. |
 | `<root>/_peql/budgets.json` | Budget limits and spending. |
 | `<root>/_peql/audit.jsonl` | Query-attempt records, one JSON object per line. |
@@ -128,7 +128,7 @@ Keep the workspace state and dataset files together when moving or backing up a 
 
 ## Build features
 
-The default Rust build has no optional features enabled. `flight` adds the Flight SQL service, `signed-bundle` verification of signed bundles, and `s3` the S3 store for object-store bindings. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build.
+The default Rust build has no optional features enabled. `flight` adds the Flight SQL service and `s3` the S3 store for object-store bindings. `lance` adds the Lance dependencies; the provider is exposed on Unix and needs `protoc` to build.
 
 See {doc}`platform` for integration behaviour.
 

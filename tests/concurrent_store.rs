@@ -1,5 +1,5 @@
 //! Engines on one disk registering the same contract version at the same time each succeed:
-//! several processes may open one workspace's disk and register the same bundle at once.
+//! several processes may open one workspace's disk and register the same contract at once.
 
 use std::sync::{Arc, Barrier};
 
@@ -43,7 +43,7 @@ fn engines_on_one_disk_register_the_same_version_at_once() {
     let leftovers: Vec<_> = std::fs::read_dir(dir.path().join("_peql/contracts/acme__orders"))
         .unwrap()
         .map(|d| d.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| !n.ends_with(".parcel.json"))
+        .filter(|n| !n.ends_with(".peql.json"))
         .collect();
     assert!(
         leftovers.is_empty(),

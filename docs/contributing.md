@@ -8,8 +8,8 @@ Use Rust 1.95 or newer. From the repository root:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --all-targets --features flight,signed-bundle,s3 -- -D warnings
-cargo test --features flight,signed-bundle,s3
+cargo clippy --all-targets --features flight,s3 -- -D warnings
+cargo test --features flight,s3
 cargo build --bin peql
 PEQL="$PWD/target/debug/peql" examples/run-all.sh
 ```

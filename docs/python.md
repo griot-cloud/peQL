@@ -73,7 +73,7 @@ engine.publish("sales/orders", "globex")
 | `Engine.open(root)` | Open a persistent workspace. |
 | `Engine.in_memory(base=".")` | Keep engine state in memory; relative data paths still resolve under `base`. |
 | `register(source, schema)` | Register YAML/JSON contract text against an Arrow schema or table. |
-| `register_bundle(bundle)` | Register a bundle supplied as JSON text. |
+| `register_compiled(contract, compiled)` | Register a contract parcel already compiled (`parcel compile -o` bytes), as given; nothing is compiled. |
 | `write(name, data, append=False)` | Write an Arrow table or batch; return a report dictionary. |
 | `validate(name)` | Return a verdict dictionary. |
 | `query(sql, caller)` | Return an Arrow table. |

@@ -23,7 +23,7 @@ use datafusion::datasource::{empty::EmptyTable, provider_as_source};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use parcel_core::compile::Compilation;
 use parcel_core::document::AssertOnFail;
-use parcel_runtime::bundle::Bundle;
+use parcel_runtime::compiled::CompiledBytes;
 use sha2::Digest as _;
 
 use crate::error::{PeqlError, Result};
@@ -81,10 +81,11 @@ pub fn compiled_view_hash(compilation: &Compilation, table: &Schema) -> Result<S
     ))
 }
 
-/// [`compiled_view_hash`] of the contract `bundle` carries, recompiled from
-/// its documents as [`crate::Engine::register_bundle`] registers it. The
-/// bundle's signature, when it has one, is its caller's to have checked.
-pub fn view_hash(bundle: &Bundle, table: &Schema) -> Result<String> {
-    let compilation = bundle.verify().map_err(PeqlError::Invalid)?;
+/// [`compiled_view_hash`] of a contract in parcel's compiled form
+/// ([`CompiledBytes`]), as [`crate::Engine::register_compiled`] registers it:
+/// taken as given, never compiled. Whoever hands over the bytes vouches for
+/// them.
+pub fn view_hash(compiled: &[u8], table: &Schema) -> Result<String> {
+    let compilation = Compilation::from_bytes(compiled).map_err(PeqlError::Invalid)?;
     compiled_view_hash(&compilation, table)
 }

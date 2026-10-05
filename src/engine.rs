@@ -24,7 +24,7 @@ use parcel_core::document::{AssertOnFail, GuaranteeOnFail};
 use parcel_core::registry::{FunctionEntry, FunctionManifest};
 use parcel_core::{ContractDoc, compile_with};
 use parcel_runtime::Caller;
-use parcel_runtime::bundle::Bundle;
+use parcel_runtime::compiled::BundledFunction;
 use parcel_runtime::plan::{col_ref, conform, dataset_value, enrich_plan, param_values};
 use parcel_runtime::reference::{self, Scope};
 use serde::Serialize;
@@ -417,19 +417,9 @@ impl Engine {
         let registry = self.functions.registry_for(owner.as_deref());
         let compilation =
             compile_with(&doc, schema, &registry, &lookup).map_err(PeqlError::Compile)?;
-        let mut ancestors = Vec::new();
-        let mut next = doc.inherits.clone();
-        while let Some(p) = next {
-            let parent = self
-                .document(&p)
-                .ok_or_else(|| PeqlError::UnknownContract(p.clone()))?;
-            next = parent.inherits.clone();
-            ancestors.push(parent);
-        }
         let functions = self.functions.modules_for(&compilation.contract.functions);
         let reg = Arc::new(Registered {
             doc,
-            ancestors,
             schema: schema.clone(),
             functions,
             compilation,
@@ -438,13 +428,22 @@ impl Engine {
         Ok(reg)
     }
 
-    /// Register what `parcel compile -o` produced, after recompiling it to the same hash.
-    pub fn register_bundle(&self, bundle: &Bundle) -> Result<Arc<Registered>> {
-        self.functions.adopt(&bundle.functions)?;
-        for a in &bundle.ancestors {
-            self.add_document(a.clone());
-        }
-        let reg = Arc::new(Registered::from_bundle(bundle)?);
+    /// Register a contract parcel already compiled, as given: `compiled` is its
+    /// [`parcel_runtime::compiled::CompiledBytes`] form, `doc` the document it was compiled
+    /// from, `functions` the modules it is pinned to. Nothing is compiled; the caller vouches
+    /// that the bytes are what was compiled.
+    pub fn register_compiled(
+        &self,
+        doc: ContractDoc,
+        compiled: &[u8],
+        functions: &[BundledFunction],
+    ) -> Result<Arc<Registered>> {
+        self.functions.adopt(functions)?;
+        let reg = Arc::new(Registered::from_compiled(
+            doc,
+            compiled,
+            functions.to_vec(),
+        )?);
         self.store.put(reg.clone())?;
         Ok(reg)
     }
@@ -525,7 +524,7 @@ impl Engine {
                 breached: verdict.verdict.breached.clone(),
                 stats: verdict.verdict.stats.clone(),
                 data_hash: verdict.data_hash.clone(),
-                row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
+                row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
                 files: Vec::new(),
                 snapshot_id: None,
             },
@@ -1041,7 +1040,7 @@ impl Engine {
             breached: verdict.verdict.breached.clone(),
             stats: verdict.verdict.stats.clone(),
             data_hash: verdict.data_hash.clone(),
-            row_schema: parcel_runtime::bundle::schema_to_defs(&cc.row_schema),
+            row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
             files,
             snapshot_id: verdict.snapshot_id,
         };
