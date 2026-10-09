@@ -1,6 +1,8 @@
 # Reference
 
-Use this page to look up commands, caller fields, result metadata and common failures. For complete examples, see {doc}`quickstart`, {doc}`python` and {doc}`rust`.
+Use these pages to look up the Python API, commands, caller fields, result metadata and common failures. For complete examples, see {doc}`quickstart`, {doc}`python` and {doc}`rust`.
+
+[Python API reference](python-api.md) lists every public Python class and method with its parameters, return values and errors.
 
 ## Commands
 
@@ -134,7 +136,9 @@ See {doc}`platform` for integration behaviour.
 
 ```{toctree}
 :hidden:
+:maxdepth: 2
 
+python-api
 contributing
 changelog
 ```
