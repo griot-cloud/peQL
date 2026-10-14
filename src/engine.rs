@@ -710,6 +710,23 @@ impl Engine {
     /// files as one snapshot, which for an overwrite replaces the table's files and commits
     /// only over the snapshot current here.
     pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
+        self.begin(
+            name,
+            mode,
+            #[cfg(feature = "iceberg")]
+            None,
+        )
+        .await
+    }
+
+    /// [`Engine::begin_write`]; with `rewrite`, a write to an Iceberg table that replaces the
+    /// files of that snapshot with its own, which hold the same rows (a compaction).
+    async fn begin(
+        &self,
+        name: &str,
+        mode: WriteMode,
+        #[cfg(feature = "iceberg")] rewrite: Option<i64>,
+    ) -> Result<Writing> {
         if let Some(snapshot) = self.frozen.get(name) {
             return Err(PeqlError::Invalid(format!(
                 "`{name}` is read as of snapshot {snapshot}; nothing is written under it"
@@ -731,15 +748,27 @@ impl Engine {
         }
         #[cfg(feature = "iceberg")]
         let iceberg = match &location {
-            Location::Iceberg(t) => Some(
-                t.begin_write(
-                    &reg.compilation.contract,
-                    mode == WriteMode::Overwrite,
-                    &self.staging_root,
+            Location::Iceberg(t) => {
+                use crate::iceberg_table::WriteKind;
+                let kind = match (rewrite, mode) {
+                    (Some(of), _) => WriteKind::Rewrite(of),
+                    (None, WriteMode::Overwrite) => WriteKind::Overwrite,
+                    (None, WriteMode::Append) => WriteKind::Append,
+                };
+                Some(
+                    t.begin_write(&reg.compilation.contract, kind, &self.staging_root)
+                        .await?,
                 )
-                .await?,
-            ),
-            _ => None,
+            }
+            _ => {
+                if rewrite.is_some() {
+                    return Err(PeqlError::Invalid(format!(
+                        "`{name}` is not bound to an Iceberg table; only an Iceberg table's \
+                         snapshot is rewritten"
+                    )));
+                }
+                None
+            }
         };
         #[cfg(feature = "iceberg")]
         let clears = iceberg.is_none() && mode == WriteMode::Overwrite;
@@ -907,10 +936,17 @@ impl Engine {
     /// Rewrite a contract's Iceberg table into fewer, larger files: when the table's current
     /// snapshot holds at least `min_small_files` (and at least two) data files smaller than
     /// `small_file_bytes`, every row of it, as stored, is written again under the contract's
-    /// layout and committed as one snapshot replacing it, over that snapshot only; the facts
-    /// of the new snapshot are recorded as a write's are. The rows do not change, and no file
-    /// is deleted: the snapshot before stays readable until it is expired. `None` when there
-    /// is nothing to compact.
+    /// layout and committed as one snapshot that replaces that snapshot's files and keeps
+    /// every file appended to the table since, so a table written to while it is compacted is
+    /// still compacted; the facts of the new snapshot are recorded as a write's are, and the
+    /// report counts the rows rewritten. The rows do not change, and no file is deleted: the
+    /// snapshot before stays readable until it is expired. `None` when there is nothing to
+    /// compact.
+    ///
+    /// Refused with [`PeqlError::Conflict`] when, since the snapshot it read, an overwrite, a
+    /// delete or another compaction replaced or removed that snapshot's files, or delete files
+    /// were added; when the table keeps moving through every attempt to carry forward what
+    /// was appended, likewise.
     #[cfg(feature = "iceberg")]
     pub async fn compact(
         &self,
@@ -932,16 +968,12 @@ impl Engine {
         }
         let c = &reg.compilation;
         let stored = t.provider(&table, &c.contract, true, snapshot).await?;
-        let w = self.begin_write(name, WriteMode::Overwrite).await?;
+        let w = self
+            .begin(name, WriteMode::Overwrite, Some(snapshot))
+            .await?;
         let iw = w.iceberg.as_ref().ok_or_else(|| {
             PeqlError::Invalid(format!("`{name}`'s compaction was not begun on its table"))
         })?;
-        if iw.base() != Some(snapshot) {
-            return Err(PeqlError::Conflict(format!(
-                "{} moved from snapshot {snapshot} while its compaction began",
-                t.table
-            )));
-        }
         // One stream: the rows land in as few files as the layout allows.
         let ctx = self.session_with(
             self.config_for(Some(1))
@@ -964,10 +996,9 @@ impl Engine {
         let plan = LogicalPlanBuilder::from(scan).project(columns)?.build()?;
         let df = ctx.execute_logical_plan(plan).await?;
         let (options, parquet) = write_options(c, None, 0)?;
-        df.write_parquet(&iw.url()?, options, Some(parquet)).await?;
-        let mut report = self.finish_write(w).await?;
-        report.rows_written = report.verdict.verdict.row_count as usize;
-        Ok(Some(report))
+        let counts = df.write_parquet(&iw.url()?, options, Some(parquet)).await?;
+        w.rows.fetch_add(written_rows(&counts)?, Ordering::SeqCst);
+        Ok(Some(self.finish_write(w).await?))
     }
 
     /// Validate a contract over its files and save its manifest.
@@ -2024,4 +2055,26 @@ pub(crate) struct SpoolResult {
     pub batches: Option<datafusion::arrow::ipc::reader::StreamReader<std::fs::File>>,
     pub envelope: Envelope,
     pub signature: Option<String>,
+}
+
+/// The rows a DataFusion write reports it wrote: one `count` column of `UInt64`.
+#[cfg(feature = "iceberg")]
+fn written_rows(counts: &[RecordBatch]) -> Result<usize> {
+    let mut rows = 0;
+    for b in counts {
+        let count = b
+            .column_by_name("count")
+            .and_then(|c| {
+                c.as_any()
+                    .downcast_ref::<datafusion::arrow::array::UInt64Array>()
+            })
+            .ok_or_else(|| {
+                PeqlError::Invalid(format!(
+                    "a write reported {:?}, not a count of the rows it wrote",
+                    b.schema()
+                ))
+            })?;
+        rows += count.iter().flatten().sum::<u64>() as usize;
+    }
+    Ok(rows)
 }

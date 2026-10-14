@@ -717,12 +717,41 @@ async fn a_parquet_binding_is_not_read_through_a_catalog() {
     }
 }
 
-/// A catalog that, once armed, lets another writer commit just before the next commit it is
-/// handed: the race an overwrite's requirements exist for.
-#[derive(Debug)]
+/// What another writer does just before a commit: see [`Interleaved`].
+type Hook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+
+/// A catalog that lets another writer act just before the commits it is handed: each queued
+/// hook runs, in order, before one commit, and reaches the catalog behind this one. The races
+/// a write's requirements exist for, made to happen.
 struct Interleaved {
     inner: Arc<dyn Catalog>,
-    armed: std::sync::atomic::AtomicBool,
+    hooks: std::sync::Mutex<std::collections::VecDeque<Hook>>,
+}
+
+impl std::fmt::Debug for Interleaved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Interleaved").finish_non_exhaustive()
+    }
+}
+
+impl Interleaved {
+    fn new(inner: Arc<dyn Catalog>) -> Arc<Interleaved> {
+        Arc::new(Interleaved {
+            inner,
+            hooks: Default::default(),
+        })
+    }
+
+    /// Run `hook` just before the next commit that has none yet.
+    fn before_commit<F>(&self, hook: impl FnOnce() -> F + Send + 'static)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.hooks
+            .lock()
+            .unwrap()
+            .push_back(Box::new(move || Box::pin(hook())));
+    }
 }
 
 #[async_trait::async_trait]
@@ -805,18 +834,9 @@ impl Catalog for Interleaved {
         &self,
         commit: iceberg::TableCommit,
     ) -> iceberg::Result<iceberg::table::Table> {
-        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
-            use iceberg::transaction::{ApplyTransactionAction, Transaction};
-            let t = self.inner.load_table(commit.identifier()).await?;
-            let tx = Transaction::new(&t);
-            tx.fast_append()
-                .set_snapshot_properties(std::collections::HashMap::from([(
-                    "writer".to_owned(),
-                    "another".to_owned(),
-                )]))
-                .apply(tx)?
-                .commit(self.inner.as_ref())
-                .await?;
+        let hook = self.hooks.lock().unwrap().pop_front();
+        if let Some(hook) = hook {
+            hook().await;
         }
         self.inner.update_table(commit).await
     }
@@ -825,10 +845,7 @@ impl Catalog for Interleaved {
 #[tokio::test(flavor = "multi_thread")]
 async fn the_catalog_refuses_an_overwrite_once_the_table_has_moved() {
     let dir = tempfile::tempdir().unwrap();
-    let catalog = Arc::new(Interleaved {
-        inner: iceberg_catalog(&dir.path().join("warehouse"), "demo").await,
-        armed: std::sync::atomic::AtomicBool::new(false),
-    });
+    let catalog = Interleaved::new(iceberg_catalog(&dir.path().join("warehouse"), "demo").await);
     let engine =
         Engine::in_memory(dir.path()).with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
     engine.register_contract(&readings(), &schema()).unwrap();
@@ -840,9 +857,25 @@ async fn the_catalog_refuses_an_overwrite_once_the_table_has_moved() {
         .unwrap();
 
     // Another writer commits between the overwrite's last look at the table and its commit.
-    catalog
-        .armed
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let inner = catalog.inner.clone();
+    catalog.before_commit(move || async move {
+        use iceberg::transaction::{ApplyTransactionAction, Transaction};
+        let t = inner
+            .load_table(&table_ident("demo", "readings"))
+            .await
+            .unwrap();
+        let tx = Transaction::new(&t);
+        tx.fast_append()
+            .set_snapshot_properties(std::collections::HashMap::from([(
+                "writer".to_owned(),
+                "another".to_owned(),
+            )]))
+            .apply(tx)
+            .unwrap()
+            .commit(inner.as_ref())
+            .await
+            .unwrap();
+    });
     let lost = engine
         .write("demo/readings", vec![batch(201, 210)], WriteMode::Overwrite)
         .await;
@@ -994,7 +1027,7 @@ async fn compaction_replaces_small_files_with_one_snapshot_and_keeps_every_row()
             .additional_properties
             .get(SUMMARY_WRITE)
             .map(String::as_str),
-        Some("overwrite")
+        Some("rewrite")
     );
 
     let everyone = Caller::new("x", "demo", "any");
@@ -1098,4 +1131,369 @@ async fn a_table_in_another_store_is_written_through_its_file_io() {
         !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
         "nothing is left staged"
     );
+}
+
+/// An engine over `catalog` with `contract` registered: another writer to the same tables.
+fn other_writer(
+    dir: &std::path::Path,
+    catalog: Arc<dyn Catalog>,
+    contract: &str,
+    schema: SchemaRef,
+) -> Arc<Engine> {
+    let engine = Engine::in_memory(dir).with_bindings(Arc::new(IcebergTables::new(catalog)));
+    engine.register_contract(contract, &schema).unwrap();
+    Arc::new(engine)
+}
+
+const PLAIN_COLUMNS: [(&str, DataType); 3] = [
+    ("id", DataType::Int64),
+    ("a", DataType::Utf8),
+    ("b", DataType::Utf8),
+];
+
+/// `demo/plain` written three times, two rows each, through a catalog that lets another
+/// writer act before a commit; the other writer, and the snapshot the three writes made.
+async fn three_small_files(dir: &std::path::Path) -> (Arc<Interleaved>, Engine, Arc<Engine>, i64) {
+    let catalog = Interleaved::new(iceberg_catalog(&dir.join("warehouse"), "demo").await);
+    let engine = Engine::in_memory(dir.join("one"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    let schema = plain(&PLAIN_COLUMNS, &[]).schema();
+    engine.register_contract(PLAIN_V1, &schema).unwrap();
+    let other = other_writer(&dir.join("two"), catalog.inner.clone(), PLAIN_V1, schema);
+    let mut last = None;
+    for ids in [[1, 2], [3, 4], [5, 6]] {
+        last = engine
+            .write(
+                "demo/plain",
+                vec![plain(&PLAIN_COLUMNS, &ids)],
+                WriteMode::Append,
+            )
+            .await
+            .unwrap()
+            .snapshot;
+    }
+    (catalog, engine, other, last.unwrap().snapshot_id)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_commits_over_appends_that_land_while_it_runs_and_keeps_their_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, other, read) = three_small_files(dir.path()).await;
+
+    // Another writer appends just before the compaction's commit, and again just before the
+    // commit it makes once it has carried the first append forward.
+    let appended = Arc::new(std::sync::Mutex::new(Vec::new()));
+    for ids in [[7, 8], [9, 10]] {
+        let (other, appended) = (other.clone(), appended.clone());
+        catalog.before_commit(move || async move {
+            let r = other
+                .write(
+                    "demo/plain",
+                    vec![plain(&PLAIN_COLUMNS, &ids)],
+                    WriteMode::Append,
+                )
+                .await
+                .unwrap();
+            appended
+                .lock()
+                .unwrap()
+                .push(r.snapshot.unwrap().snapshot_id);
+        });
+    }
+    let report = engine
+        .compact("demo/plain", u64::MAX, 2)
+        .await
+        .unwrap()
+        .expect("three small files are compacted");
+    let appended = appended.lock().unwrap().clone();
+    assert_eq!(
+        appended.len(),
+        2,
+        "both appends landed during the compaction"
+    );
+    let commit = report.snapshot.unwrap();
+    assert_eq!(commit.parent_snapshot_id, Some(appended[1]));
+    assert_eq!(report.rows_written, 6, "the rows of the snapshot read");
+    assert!(report.verdict.valid);
+    assert_eq!(report.verdict.verdict.row_count, 10);
+
+    let t = table(&catalog.inner, "plain").await;
+    assert_eq!(t.metadata().current_snapshot_id(), Some(commit.snapshot_id));
+    let snap = t.metadata().current_snapshot().unwrap();
+    assert_eq!(
+        snap.summary()
+            .additional_properties
+            .get(SUMMARY_WRITE)
+            .map(String::as_str),
+        Some("rewrite")
+    );
+    assert_eq!(
+        snap.summary()
+            .additional_properties
+            .get("total-records")
+            .map(String::as_str),
+        Some("10")
+    );
+    assert_eq!(
+        snap.summary()
+            .additional_properties
+            .get("total-data-files")
+            .map(String::as_str),
+        Some("3")
+    );
+    // One file for the six rows read, and each append's own file, carried forward.
+    let now = snapshot_paths(&t, commit.snapshot_id).await;
+    assert_eq!(now.len(), 3, "{now:?}");
+    let last_append = snapshot_paths(&t, appended[1]).await;
+    for read_file in snapshot_paths(&t, read).await {
+        assert!(!now.contains(&read_file), "{read_file} was rewritten");
+    }
+    for appended_file in last_append.iter().filter(|p| !now.contains(p)) {
+        assert!(
+            snapshot_paths(&t, read).await.contains(appended_file),
+            "{appended_file} was appended and is gone"
+        );
+    }
+
+    let everyone = Caller::new("x", "demo", "any");
+    let rows = engine
+        .query(r#"SELECT * FROM "demo/plain" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(ids(&rows.batches), (1..=10).collect::<Vec<_>>());
+    assert_eq!(
+        strings(&rows.batches, "b"),
+        (1..=10).map(|i| Some(format!("b{i}"))).collect::<Vec<_>>()
+    );
+    // The snapshot read is still readable, from its own files.
+    let then = engine
+        .query_as_of(
+            r#"SELECT id FROM "demo/plain" ORDER BY id"#,
+            &everyone,
+            &AsOf::current().with("demo/plain", read),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&then.batches), [1, 2, 3, 4, 5, 6]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_the_table_moves_under_at_every_commit_gives_up_and_keeps_every_row() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, other, _) = three_small_files(dir.path()).await;
+    const MOVES: i64 = 40;
+    for i in 0..MOVES {
+        let other = other.clone();
+        catalog.before_commit(move || async move {
+            other
+                .write(
+                    "demo/plain",
+                    vec![plain(&PLAIN_COLUMNS, &[100 + i])],
+                    WriteMode::Append,
+                )
+                .await
+                .unwrap();
+        });
+    }
+    let refused = engine.compact("demo/plain", u64::MAX, 2).await;
+    match refused {
+        Err(PeqlError::Conflict(m)) => assert!(m.contains("attempts"), "{m}"),
+        other => panic!("{:?}", other.map(|r| r.map(|r| r.snapshot))),
+    }
+    let left = catalog.hooks.lock().unwrap().len() as i64;
+    assert!(left > 0, "the compaction stopped trying");
+    let everyone = Caller::new("x", "demo", "any");
+    let rows = engine
+        .query(r#"SELECT id FROM "demo/plain" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    let mut want: Vec<i64> = (1..=6).collect();
+    want.extend(100..100 + MOVES - left);
+    assert_eq!(ids(&rows.batches), want);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_is_refused_once_an_overwrite_replaced_the_files_it_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, other, read) = three_small_files(dir.path()).await;
+
+    let overwrote = Arc::new(std::sync::Mutex::new(None));
+    {
+        let (other, overwrote) = (other.clone(), overwrote.clone());
+        catalog.before_commit(move || async move {
+            let r = other
+                .write(
+                    "demo/plain",
+                    vec![plain(&PLAIN_COLUMNS, &[100, 101])],
+                    WriteMode::Overwrite,
+                )
+                .await
+                .unwrap();
+            *overwrote.lock().unwrap() = Some(r.snapshot.unwrap().snapshot_id);
+        });
+    }
+    let refused = engine.compact("demo/plain", u64::MAX, 2).await;
+    let overwrote = overwrote.lock().unwrap().expect("the overwrite landed");
+    match refused {
+        Err(PeqlError::Conflict(m)) => {
+            assert!(m.contains("replaced or removed"), "{m}");
+            assert!(m.contains(&format!("since snapshot {read}")), "{m}");
+            assert!(m.contains(&format!("{overwrote} (overwrite)")), "{m}");
+        }
+        other => panic!("{:?}", other.map(|r| r.map(|r| r.snapshot))),
+    }
+    let t = table(&catalog.inner, "plain").await;
+    assert_eq!(t.metadata().current_snapshot_id(), Some(overwrote));
+    let everyone = Caller::new("x", "demo", "any");
+    let rows = engine
+        .query(r#"SELECT id FROM "demo/plain" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(ids(&rows.batches), [100, 101]);
+}
+
+/// `demo/plain` with a column `c` of `ty` beside the first version's.
+fn plain_with_c(ty: &str) -> String {
+    let doc = PLAIN_V1.replace("version: 1", "version: 2").replace(
+        "  - {name: b, type: utf8}\n",
+        &format!("  - {{name: b, type: utf8}}\n  - {{name: c, type: {ty}}}\n"),
+    );
+    assert!(doc.contains("name: c"), "{doc}");
+    doc
+}
+
+/// `demo/plain` written once at its first version, through a catalog that lets another writer
+/// act before a commit; both writers then hold `demo/plain` with a column `c`, of the types
+/// given, as one engine and the other.
+async fn two_writers_adding_c(
+    dir: &std::path::Path,
+    ours: (&str, DataType),
+    theirs: (&str, DataType),
+) -> (Arc<Interleaved>, Engine, Arc<Engine>) {
+    let catalog = Interleaved::new(iceberg_catalog(&dir.join("warehouse"), "demo").await);
+    let engine = Engine::in_memory(dir.join("one"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    engine
+        .register_contract(PLAIN_V1, &plain(&PLAIN_COLUMNS, &[]).schema())
+        .unwrap();
+    engine
+        .write(
+            "demo/plain",
+            vec![plain(&PLAIN_COLUMNS, &[1, 2])],
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+    let with = |ty: DataType| {
+        let mut cols = PLAIN_COLUMNS.to_vec();
+        cols.push(("c", ty));
+        plain(&cols, &[]).schema()
+    };
+    engine
+        .register_contract(&plain_with_c(ours.0), &with(ours.1))
+        .unwrap();
+    let other = other_writer(
+        &dir.join("two"),
+        catalog.inner.clone(),
+        &plain_with_c(theirs.0),
+        with(theirs.1),
+    );
+    (catalog, engine, other)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_writers_adding_one_column_at_once_both_write_and_the_schema_changes_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, other) = two_writers_adding_c(
+        dir.path(),
+        ("int64", DataType::Int64),
+        ("int64", DataType::Int64),
+    )
+    .await;
+    let cols = [
+        ("id", DataType::Int64),
+        ("a", DataType::Utf8),
+        ("b", DataType::Utf8),
+        ("c", DataType::Int64),
+    ];
+    // The other writer adds `c` and writes, just before this writer's schema change commits.
+    {
+        let (other, cols) = (other.clone(), cols.clone());
+        catalog.before_commit(move || async move {
+            other
+                .write("demo/plain", vec![plain(&cols, &[3])], WriteMode::Append)
+                .await
+                .unwrap();
+        });
+    }
+    engine
+        .write("demo/plain", vec![plain(&cols, &[4])], WriteMode::Append)
+        .await
+        .unwrap();
+
+    let t = table(&catalog.inner, "plain").await;
+    assert_eq!(
+        t.metadata().schemas_iter().count(),
+        2,
+        "the first schema and the one change"
+    );
+    let current: Vec<String> = t
+        .metadata()
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect();
+    assert_eq!(current, ["id", "a", "b", "c"]);
+    let everyone = Caller::new("x", "demo", "any");
+    let rows = engine
+        .query(r#"SELECT id, c FROM "demo/plain" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(ids(&rows.batches), [1, 2, 3, 4]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_column_another_writer_added_with_another_type_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, other) = two_writers_adding_c(
+        dir.path(),
+        ("int64", DataType::Int64),
+        ("utf8", DataType::Utf8),
+    )
+    .await;
+    {
+        let other = other.clone();
+        catalog.before_commit(move || async move {
+            let cols = [
+                ("id", DataType::Int64),
+                ("a", DataType::Utf8),
+                ("b", DataType::Utf8),
+                ("c", DataType::Utf8),
+            ];
+            other
+                .write("demo/plain", vec![plain(&cols, &[3])], WriteMode::Append)
+                .await
+                .unwrap();
+        });
+    }
+    let cols = [
+        ("id", DataType::Int64),
+        ("a", DataType::Utf8),
+        ("b", DataType::Utf8),
+        ("c", DataType::Int64),
+    ];
+    let refused = engine
+        .write("demo/plain", vec![plain(&cols, &[4])], WriteMode::Append)
+        .await;
+    match refused {
+        Err(PeqlError::Invalid(m)) => {
+            assert!(m.contains("column `c`"), "{m}");
+            assert!(m.contains("is Utf8; the contract writes Int64"), "{m}");
+        }
+        other => panic!("{:?}", other.map(|r| r.snapshot)),
+    }
+    let t = table(&catalog.inner, "plain").await;
+    assert_eq!(t.metadata().schemas_iter().count(), 2);
 }
