@@ -25,9 +25,15 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
   `Engine::as_of` returns it.
 - `Engine::compact(name, small_file_bytes, min_small_files)`: a contract's Iceberg table
   rewritten, as stored, into as few files as its layout allows and committed as one snapshot
-  replacing the current one (over it only), with that snapshot's facts recorded; nothing is
-  deleted and the rows do not change. `None` when fewer than `min_small_files` (at least two)
-  data files are smaller than `small_file_bytes`.
+  (`peql.write=rewrite`) that replaces the files of the snapshot it read and carries forward
+  every file appended since, recomputed a bounded number of times while the table keeps
+  moving; a `Conflict` only when an overwrite, a delete or another compaction replaced or
+  removed the files it read. That snapshot's facts are recorded; nothing is deleted and the
+  rows do not change. `None` when fewer than `min_small_files` (at least two) data files are
+  smaller than `small_file_bytes`.
+- A write that changes an Iceberg table's schema computes the change again over the table as
+  another writer left it, a bounded number of times; a table that already has the columns is
+  not changed again, and a column another writer gave a different type is refused by name.
 - Iceberg tables (feature `iceberg`): a contract bound to an Iceberg table is read, written and
   validated through iceberg-rust and datafusion-iceberg. `IcebergTables::new(catalog)` binds
   every contract whose document says `binding: {iceberg: <namespace>.<table>}` to that table in

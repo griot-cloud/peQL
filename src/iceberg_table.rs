@@ -7,7 +7,9 @@
 //! names ([`crate::Engine::query_as_of`]). A write lands its data files as the Parquet binding
 //! lands them, then commits one snapshot through the catalog: an append is the catalog crate's
 //! own; an overwrite replaces the table's files in a snapshot that may only commit over the
-//! snapshot the write began from, so two overwrites begun from one snapshot cannot both commit.
+//! snapshot the write began from, so two overwrites begun from one snapshot cannot both commit;
+//! a rewrite (a compaction) replaces one snapshot's files with files holding the same rows and
+//! keeps every file appended since, so appends landing while it runs do not refuse it.
 //! No write deletes a file, and every earlier snapshot stays readable until it is expired.
 //!
 //! What peQL knows about a snapshot's data ([`Manifest`]: the verdict, statistics, data hash
@@ -27,7 +29,7 @@
 //! # Ok(()) }
 //! ```
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -42,11 +44,11 @@ use datafusion::parquet::file::FOOTER_SIZE;
 use datafusion::parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader};
 use datafusion_iceberg::IcebergStaticTableProvider;
 use iceberg::spec::{
-    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestListWriter,
-    TableMetadata,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestContentType,
+    ManifestFile, ManifestListWriter, TableMetadata,
 };
 use iceberg::table::Table;
-use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction};
+use iceberg::transaction::{AddColumn, ApplyTransactionAction, Transaction, UpdateSchemaAction};
 use iceberg::{
     Catalog, ErrorKind, Namespace, NamespaceIdent, TableCommit, TableCreation, TableIdent,
 };
@@ -344,7 +346,7 @@ impl IcebergLocation {
     pub(crate) async fn begin_write(
         &self,
         contract: &CompiledContract,
-        overwrite: bool,
+        kind: WriteKind,
         staging: &Path,
     ) -> Result<IcebergWrite> {
         let want = table_schema(contract);
@@ -381,43 +383,101 @@ impl IcebergLocation {
             prefix,
             dir,
             staged,
-            overwrite,
+            kind,
         })
     }
 
     /// Make the table's current schema the columns in `want`, by name. A column whose type
     /// changed is refused: the table would read its old files as something they are not.
+    ///
+    /// The change is computed over the table as it is, and committed; when another writer
+    /// changed the schema first, it is computed again over the table as that writer left it
+    /// and committed again, at most [`COMMIT_ATTEMPTS`] times. A table that already has the
+    /// columns (by name, of the same types) is left as it is, with no commit, so of writers
+    /// making one change at once, one commits it and the others find it made. A column another
+    /// writer gave a different type is refused, naming both types.
     async fn evolve(&self, table: Table, want: &Schema) -> Result<Table> {
-        let current = iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())?;
-        let wanted = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(want)?;
-        let mut update = None;
+        let mut table = table;
+        let mut refused = None;
+        for _ in 0..COMMIT_ATTEMPTS {
+            let tx = Transaction::new(&table);
+            let Some(update) = self.schema_change(&table, want, &tx, refused.is_some())? else {
+                return Ok(table);
+            };
+            match update.apply(tx)?.commit(self.catalog.as_ref()).await {
+                // Committed: the loop finds nothing left to change, unless the crate's own
+                // retry applied the change over a schema another writer had changed again.
+                Ok(committed) => table = committed,
+                Err(e) => {
+                    let now = self.load().await?.ok_or_else(|| {
+                        PeqlError::Invalid(format!(
+                            "{} was dropped while its schema was changed: {e}",
+                            self.table
+                        ))
+                    })?;
+                    let (was, is) = (table.metadata(), now.metadata());
+                    if is.uuid() == was.uuid()
+                        && is.current_schema_id() == was.current_schema_id()
+                        && is.current_schema() == was.current_schema()
+                    {
+                        // Nobody changed the schema: the refusal is the change's own.
+                        return Err(e.into());
+                    }
+                    refused = Some(e);
+                    table = now;
+                }
+            }
+        }
         let tx = Transaction::new(&table);
+        match self.schema_change(&table, want, &tx, true)? {
+            None => Ok(table),
+            Some(_) => Err(PeqlError::Conflict(format!(
+                "the schema of {} changed under each of {COMMIT_ATTEMPTS} attempts to make it \
+                 the contract's columns; the last refusal: {}",
+                self.table,
+                refused.map_or_else(|| "none".to_owned(), |e| e.to_string())
+            ))),
+        }
+    }
+
+    /// The change that makes `table`'s current schema the columns in `want`, or `None` when
+    /// it has them. `raced` says the schema was changed by another writer since this write
+    /// first looked, for the refusal of a column whose type differs.
+    fn schema_change(
+        &self,
+        table: &Table,
+        want: &Schema,
+        tx: &Transaction,
+        raced: bool,
+    ) -> Result<Option<UpdateSchemaAction>> {
+        let schema = table.metadata().current_schema();
+        let current = iceberg::arrow::schema_to_arrow_schema(schema)?;
+        let wanted = iceberg::arrow::arrow_schema_to_schema_auto_assign_ids(want)?;
+        let mut update: Option<UpdateSchemaAction> = None;
         for f in want.fields() {
+            let w = wanted.field_by_name(f.name()).expect("converted from want");
             match current.field_with_name(f.name()) {
                 Ok(have) => {
-                    let w = wanted.field_by_name(f.name()).expect("converted from want");
-                    let h = table
-                        .metadata()
-                        .current_schema()
+                    let h = schema
                         .field_by_name(f.name())
                         .expect("converted from the schema");
                     if !same_type(&h.field_type, &w.field_type) {
                         return Err(PeqlError::Invalid(format!(
-                            "column `{}` of {} is {:?}; the contract writes {:?}",
+                            "column `{}` of {} is {:?}; the contract writes {:?}{}",
                             f.name(),
                             self.table,
                             have.data_type(),
-                            f.data_type()
+                            f.data_type(),
+                            if raced {
+                                " (another writer changed the table's schema meanwhile)"
+                            } else {
+                                ""
+                            }
                         )));
                     }
                 }
                 Err(_) => {
-                    let ty = wanted
-                        .field_by_name(f.name())
-                        .expect("converted from want")
-                        .field_type
-                        .as_ref()
-                        .clone();
+                    let ty = w.field_type.as_ref().clone();
                     update = Some(
                         update
                             .unwrap_or_else(|| tx.update_schema())
@@ -435,10 +495,7 @@ impl IcebergLocation {
                 );
             }
         }
-        match update {
-            None => Ok(table),
-            Some(u) => Ok(u.apply(tx)?.commit(self.catalog.as_ref()).await?),
-        }
+        Ok(update)
     }
 }
 
@@ -529,6 +586,22 @@ async fn footer(table: &Table, path: &str, size: u64) -> Result<ParquetMetaData>
 /// The snapshot a write committed, and the one before it.
 pub use crate::engine::SnapshotCommit;
 
+/// How many times a commit is computed again over a table another writer moved meanwhile:
+/// a schema change, or a rewrite's carrying forward of what was appended since its snapshot.
+const COMMIT_ATTEMPTS: usize = 8;
+
+/// What a write's snapshot does to the table's files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WriteKind {
+    /// Adds its files to the table's.
+    Append,
+    /// Replaces the table's files with its own, over the snapshot the write began from only.
+    Overwrite,
+    /// Replaces the files of this snapshot with its own, which hold the same rows, and keeps
+    /// every file added since: see [`IcebergWrite::commit_rewrite`].
+    Rewrite(i64),
+}
+
 /// A write in progress to one Iceberg table.
 #[derive(Debug)]
 pub(crate) struct IcebergWrite {
@@ -544,7 +617,7 @@ pub(crate) struct IcebergWrite {
     /// Whether `dir` is a staging directory, not the table's own: its files go to the table
     /// through its `FileIO` at the commit, and the directory is removed after it.
     staged: bool,
-    overwrite: bool,
+    kind: WriteKind,
 }
 
 impl Drop for IcebergWrite {
@@ -558,11 +631,6 @@ impl Drop for IcebergWrite {
 impl IcebergWrite {
     pub(crate) fn schema(&self) -> &SchemaRef {
         &self.schema
-    }
-
-    /// The snapshot current when the write began.
-    pub(crate) fn base(&self) -> Option<i64> {
-        self.base
     }
 
     /// The directory the write's data files go to, as DataFusion's writer takes it.
@@ -595,18 +663,25 @@ impl IcebergWrite {
                 contract.compilation_hash.clone(),
             ),
         ]);
-        let committed = if self.overwrite {
-            summary.insert(SUMMARY_WRITE.to_owned(), "overwrite".to_owned());
-            self.commit_overwrite(&table, files, summary).await?
-        } else {
-            summary.insert(SUMMARY_WRITE.to_owned(), "append".to_owned());
-            let tx = Transaction::new(&table);
-            tx.fast_append()
-                .add_data_files(files)
-                .set_snapshot_properties(summary)
-                .apply(tx)?
-                .commit(self.location.catalog.as_ref())
-                .await?
+        let committed = match self.kind {
+            WriteKind::Append => {
+                summary.insert(SUMMARY_WRITE.to_owned(), "append".to_owned());
+                let tx = Transaction::new(&table);
+                tx.fast_append()
+                    .add_data_files(files)
+                    .set_snapshot_properties(summary)
+                    .apply(tx)?
+                    .commit(self.location.catalog.as_ref())
+                    .await?
+            }
+            WriteKind::Overwrite => {
+                summary.insert(SUMMARY_WRITE.to_owned(), "overwrite".to_owned());
+                self.commit_overwrite(&table, files, summary).await?
+            }
+            WriteKind::Rewrite(of) => {
+                summary.insert(SUMMARY_WRITE.to_owned(), "rewrite".to_owned());
+                self.commit_rewrite(table, files, summary, of).await?
+            }
         };
         let snapshot = committed.metadata().current_snapshot().ok_or_else(|| {
             PeqlError::Invalid(format!("{} committed no snapshot", self.location.table))
@@ -719,6 +794,7 @@ impl IcebergWrite {
                 table: self.location.table.clone(),
                 base: None,
                 as_base: table.clone(),
+                write: "overwrite",
             };
             let tx = Transaction::new(table);
             return tx
@@ -752,12 +828,13 @@ impl IcebergWrite {
         writer.add_manifests(std::iter::empty())?;
         writer.close().await?;
         let result = async {
-            let as_base = emptied(table, base, &empty)?;
+            let as_base = listing(table, base, &empty, &Totals::default())?;
             let pinned = Pinned {
                 inner: catalog,
                 table: self.location.table.clone(),
                 base: Some(base),
                 as_base: as_base.clone(),
+                write: "overwrite",
             };
             let tx = Transaction::new(&as_base);
             tx.fast_append()
@@ -774,6 +851,108 @@ impl IcebergWrite {
         result
     }
 
+    /// Replace the files of snapshot `of` with `files`, which hold its rows, and keep every
+    /// data file added to the table since: the commit a rewrite (a compaction) makes, which
+    /// a table appended to while it was rewritten still takes.
+    ///
+    /// The snapshot is produced as an overwrite's is (see [`IcebergWrite::commit_overwrite`]),
+    /// over a base whose current snapshot lists, instead of its own manifests, only those
+    /// added since `of`: so it holds `files` and every file appended since, and commits only
+    /// while the table is still at the snapshot it was produced over. When another writer
+    /// moves the table first, what is carried forward is computed again over the table as
+    /// that writer left it, at most [`COMMIT_ATTEMPTS`] times.
+    ///
+    /// Refused ([`PeqlError::Conflict`]) when, since `of`, a snapshot replaced or removed any
+    /// of `of`'s files (an overwrite, a delete, another rewrite), added delete files (they
+    /// could delete rows of `files` that they no longer reach), or when `of` is no longer an
+    /// ancestor of the table's current snapshot.
+    async fn commit_rewrite(
+        &self,
+        table: Table,
+        files: Vec<DataFile>,
+        summary: HashMap<String, String>,
+        of: i64,
+    ) -> Result<Table> {
+        let mut table = table;
+        let md = table.metadata();
+        if md.format_version() != FormatVersion::V2 {
+            return Err(PeqlError::Invalid(format!(
+                "{} is Iceberg format {:?}; peQL rewrites format 2 tables",
+                self.location.table,
+                md.format_version()
+            )));
+        }
+        let rewritten = Rewritten::of(&self.location, &table, of).await?;
+        let mut refused = None;
+        for attempt in 0..COMMIT_ATTEMPTS {
+            if attempt > 0 {
+                table = self.location.load().await?.ok_or_else(|| {
+                    PeqlError::Invalid(format!(
+                        "{} was dropped while snapshot {of} was rewritten",
+                        self.location.table
+                    ))
+                })?;
+            }
+            let now = table.metadata().current_snapshot_id().ok_or_else(|| {
+                PeqlError::Conflict(format!(
+                    "{} has no current snapshot; snapshot {of} was being rewritten",
+                    self.location.table
+                ))
+            })?;
+            let (carried, totals) = rewritten.carried(&self.location, &table, now).await?;
+            let md = table.metadata();
+            let list = format!(
+                "{}/peql-rewrite-base-{}.avro",
+                md.metadata_location()?,
+                Uuid::new_v4()
+            );
+            let mut writer = ManifestListWriter::v2(
+                table.file_io().new_output(&list)?.writer().await?,
+                now,
+                table
+                    .metadata()
+                    .snapshot_by_id(now)
+                    .and_then(|s| s.parent_snapshot_id()),
+                md.last_sequence_number(),
+            );
+            writer.add_manifests(carried.into_iter())?;
+            writer.close().await?;
+            let result = async {
+                let as_base = listing(&table, now, &list, &totals)?;
+                let pinned = Pinned {
+                    inner: self.location.catalog.clone(),
+                    table: self.location.table.clone(),
+                    base: Some(now),
+                    as_base: as_base.clone(),
+                    write: "rewrite",
+                };
+                let tx = Transaction::new(&as_base);
+                Ok::<_, PeqlError>(
+                    tx.fast_append()
+                        .with_check_duplicate(false)
+                        .add_data_files(files.clone())
+                        .set_snapshot_properties(summary.clone())
+                        .apply(tx)?
+                        .commit(&pinned)
+                        .await,
+                )
+            }
+            .await;
+            table.file_io().delete(&list).await?;
+            match result? {
+                Ok(committed) => return Ok(committed),
+                Err(e) if e.kind() == ErrorKind::CatalogCommitConflicts => refused = Some(e),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Err(PeqlError::Conflict(format!(
+            "{} moved under each of {COMMIT_ATTEMPTS} attempts to commit the rewrite of \
+             snapshot {of}; the last refusal: {}",
+            self.location.table,
+            refused.map_or_else(|| "none".to_owned(), |e| e.to_string())
+        )))
+    }
+
     fn conflict(&self, now: Option<i64>) -> PeqlError {
         PeqlError::Conflict(format!(
             "{} is at snapshot {now:?}; the overwrite began from {:?}",
@@ -782,10 +961,142 @@ impl IcebergWrite {
     }
 }
 
-/// `table` with snapshot `base` listing the manifests in `manifest_list` (none) and counting
-/// nothing: the base an overwrite is produced over. The table's metadata is changed only in
-/// this copy, through its serialised form; the catalog never sees it.
-fn emptied(table: &Table, base: i64, manifest_list: &str) -> Result<Table> {
+/// The snapshot a rewrite replaces the files of: its manifests, and the data files alive in
+/// them.
+struct Rewritten {
+    snapshot: i64,
+    manifests: HashSet<String>,
+    files: HashSet<String>,
+}
+
+/// What a snapshot's data files add up to, as its summary counts them.
+#[derive(Default)]
+struct Totals {
+    records: u64,
+    files: u64,
+    bytes: u64,
+}
+
+impl Rewritten {
+    async fn of(location: &IcebergLocation, table: &Table, snapshot: i64) -> Result<Rewritten> {
+        let snap = table
+            .metadata()
+            .snapshot_by_id(snapshot)
+            .ok_or_else(|| location.no_snapshot(snapshot))?;
+        let list = table.manifest_list_reader(snap).load().await?;
+        let mut manifests = HashSet::new();
+        let mut files = HashSet::new();
+        for m in list.entries() {
+            manifests.insert(m.manifest_path.clone());
+            for e in table.manifest_reader().read(m).await?.entries() {
+                if e.is_alive() && e.content_type() == DataContentType::Data {
+                    files.insert(e.file_path().to_owned());
+                }
+            }
+        }
+        Ok(Rewritten {
+            snapshot,
+            manifests,
+            files,
+        })
+    }
+
+    /// The manifests of `table`'s snapshot `now` that the rewrite keeps, every one added
+    /// since the rewritten snapshot, and what their data files add up to; refused when
+    /// anything since replaced or removed the rewritten snapshot's files, or could delete
+    /// rows of them.
+    async fn carried(
+        &self,
+        location: &IcebergLocation,
+        table: &Table,
+        now: i64,
+    ) -> Result<(Vec<ManifestFile>, Totals)> {
+        let md = table.metadata();
+        let of = self.snapshot;
+        // The snapshots since, newest first, as `<id> (<what it did>)`.
+        let mut since = Vec::new();
+        let mut at = Some(now);
+        while at != Some(of) {
+            let Some(snap) = at.and_then(|id| md.snapshot_by_id(id)) else {
+                return Err(PeqlError::Conflict(format!(
+                    "{}: snapshot {of}, being rewritten, is no longer an ancestor of the \
+                     current snapshot {now}",
+                    location.table
+                )));
+            };
+            let summary = snap.summary();
+            let did = summary
+                .additional_properties
+                .get(SUMMARY_WRITE)
+                .map_or_else(|| summary.operation.as_str().to_owned(), String::clone);
+            since.push(format!("{} ({did})", snap.snapshot_id()));
+            at = snap.parent_snapshot_id();
+        }
+        let refused = |why: String| {
+            PeqlError::Conflict(format!(
+                "{}: {why} since snapshot {of}, whose files were being rewritten (snapshots \
+                 since: {})",
+                location.table,
+                since.join(", ")
+            ))
+        };
+        let snap = md
+            .snapshot_by_id(now)
+            .ok_or_else(|| location.no_snapshot(now))?;
+        let list = table.manifest_list_reader(snap).load().await?;
+        let listed: HashSet<&str> = list
+            .entries()
+            .iter()
+            .map(|m| m.manifest_path.as_str())
+            .collect();
+        if let Some(gone) = self.manifests.iter().find(|m| !listed.contains(m.as_str())) {
+            return Err(refused(format!(
+                "its files were replaced or removed (manifest {gone} is no longer listed)"
+            )));
+        }
+        let mut carried = Vec::new();
+        let mut totals = Totals::default();
+        for m in list.entries() {
+            if self.manifests.contains(&m.manifest_path) {
+                continue;
+            }
+            if m.content != ManifestContentType::Data {
+                return Err(refused(format!(
+                    "snapshot {} added delete files",
+                    m.added_snapshot_id
+                )));
+            }
+            for e in table.manifest_reader().read(m).await?.entries() {
+                if self.files.contains(e.file_path()) {
+                    return Err(refused(format!(
+                        "snapshot {} listed its file {} again",
+                        m.added_snapshot_id,
+                        e.file_path()
+                    )));
+                }
+                if e.is_alive() {
+                    if e.content_type() != DataContentType::Data {
+                        return Err(refused(format!(
+                            "snapshot {} added delete files",
+                            m.added_snapshot_id
+                        )));
+                    }
+                    totals.records += e.data_file().record_count();
+                    totals.files += 1;
+                    totals.bytes += e.data_file().file_size_in_bytes();
+                }
+            }
+            carried.push(m.clone());
+        }
+        Ok((carried, totals))
+    }
+}
+
+/// `table` with snapshot `base` listing the manifests in `manifest_list`, whose data files
+/// add up to `totals`: the base an overwrite (no manifests) or a rewrite (those it carries
+/// forward) is produced over. The table's metadata is changed only in this copy, through its
+/// serialised form; the catalog never sees it.
+fn listing(table: &Table, base: i64, manifest_list: &str, totals: &Totals) -> Result<Table> {
     let mut md = serde_json::to_value(table.metadata())
         .map_err(|e| PeqlError::Invalid(format!("metadata of {}: {e}", table.identifier())))?;
     let snapshots = md
@@ -801,15 +1112,15 @@ fn emptied(table: &Table, base: i64, manifest_list: &str) -> Result<Table> {
     snap["manifest-list"] = serde_json::Value::String(manifest_list.to_owned());
     if let Some(summary) = snap.get_mut("summary").and_then(|s| s.as_object_mut()) {
         summary.retain(|k, _| !k.starts_with("total-"));
-        for k in [
-            "total-records",
-            "total-files-size",
-            "total-data-files",
-            "total-delete-files",
-            "total-position-deletes",
-            "total-equality-deletes",
+        for (k, v) in [
+            ("total-records", totals.records),
+            ("total-files-size", totals.bytes),
+            ("total-data-files", totals.files),
+            ("total-delete-files", 0),
+            ("total-position-deletes", 0),
+            ("total-equality-deletes", 0),
         ] {
-            summary.insert(k.to_owned(), serde_json::Value::String("0".into()));
+            summary.insert(k.to_owned(), serde_json::Value::String(v.to_string()));
         }
     }
     let md: TableMetadata = serde_json::from_value(md)
@@ -826,24 +1137,27 @@ fn emptied(table: &Table, base: i64, manifest_list: &str) -> Result<Table> {
     Ok(b.build()?)
 }
 
-/// The catalog an overwrite commits through: the caller's, except that loading the table
-/// gives the overwrite's base, and only while the table's current snapshot is still the one
-/// the overwrite began from. A commit the catalog refuses is retried by the crate after a
-/// load, which this refuses; so a refused overwrite is never rebased onto another snapshot.
+/// The catalog an overwrite or a rewrite commits through: the caller's, except that loading
+/// the table gives the write's base, and only while the table's current snapshot is still the
+/// one the base was made over. A commit the catalog refuses is retried by the crate after a
+/// load, which this refuses; so a refused commit is never rebased onto another snapshot by
+/// the crate (a rewrite computes its base again itself).
 #[derive(Debug)]
 struct Pinned {
     inner: Arc<dyn Catalog>,
     table: TableIdent,
     base: Option<i64>,
     as_base: Table,
+    /// `overwrite` or `rewrite`, for the refusal.
+    write: &'static str,
 }
 
 impl Pinned {
     fn refused(&self, e: iceberg::Error) -> PeqlError {
         if e.kind() == ErrorKind::CatalogCommitConflicts {
             PeqlError::Conflict(format!(
-                "{}: the table moved since the overwrite began from snapshot {:?}: {e}",
-                self.table, self.base
+                "{}: the table moved since the {} was made over snapshot {:?}: {e}",
+                self.table, self.write, self.base
             ))
         } else {
             e.into()
@@ -902,15 +1216,15 @@ impl Catalog for Pinned {
             return Err(iceberg::Error::new(
                 ErrorKind::CatalogCommitConflicts,
                 format!(
-                    "{table} is at snapshot {now:?}; the overwrite began from {:?}",
-                    self.base
+                    "{table} is at snapshot {now:?}; the {} was made over {:?}",
+                    self.write, self.base
                 ),
             ));
         }
         if current.metadata().uuid() != self.as_base.metadata().uuid() {
             return Err(iceberg::Error::new(
                 ErrorKind::CatalogCommitConflicts,
-                format!("{table} was replaced since the overwrite began"),
+                format!("{table} was replaced since the {} was made", self.write),
             ));
         }
         // The base, at the catalog's current metadata location: the commit is made against
