@@ -31,6 +31,10 @@ pub struct Resolution {
     /// The table snapshot read, for data in a table with snapshots (Iceberg).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot_id: Option<i64>,
+    /// Rows of the contract's data its view left out because they break a row rule, by rule:
+    /// as the data's facts count them, whatever else the query filtered. A row that breaks
+    /// two rules is counted under both.
+    pub excluded: BTreeMap<String, u64>,
 }
 
 /// What the scans of a query read.

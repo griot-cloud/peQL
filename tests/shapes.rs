@@ -8,7 +8,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use paths::{Answer, BOTH, answer};
-use peql::{Caller, Engine, PeqlError as EngineError, WriteMode};
+use peql::{Caller, Engine, OnWriteViolation, PeqlError as EngineError, WriteMode};
 
 const HR: &str = r#"
 contract: hr/salaries
@@ -75,9 +75,14 @@ async fn engine(dir: &std::path::Path) -> Engine {
     let e = Engine::in_memory(dir);
     e.register_contract(HR, &schema()).unwrap();
     e.register_contract(PREVIEW, &schema()).unwrap();
-    e.write("hr/salaries", vec![batch()], WriteMode::Overwrite)
-        .await
-        .unwrap();
+    e.write(
+        "hr/salaries",
+        vec![batch()],
+        WriteMode::Overwrite,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     e
 }
 

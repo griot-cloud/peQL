@@ -12,7 +12,7 @@
 //! pins), the table's columns, and the plan the engine stands in for the
 //! contract before any caller's parameters are bound: the scan of the
 //! contract's row columns with its enrichers, the filter of its admits and
-//! drop-level asserts, and the projection of its exposed columns, each node
+//! the asserts a row can break (drop- and deny-level), and the projection of its exposed columns, each node
 //! with its schema. The gate and the parameter values, which are one
 //! caller's, are not part of it.
 
@@ -22,7 +22,6 @@ use datafusion::arrow::datatypes::{Field, Schema};
 use datafusion::datasource::{empty::EmptyTable, provider_as_source};
 use datafusion::logical_expr::{Expr, LogicalPlanBuilder};
 use parcel_core::compile::Compilation;
-use parcel_core::document::AssertOnFail;
 use parcel_runtime::compiled::CompiledBytes;
 use sha2::Digest as _;
 
@@ -40,10 +39,8 @@ pub fn unbound_view(compilation: &Compilation) -> Result<String> {
     .build()?;
     let scan = parcel_runtime::plan::enrich_plan(scan, cc)?;
     let mut filters: Vec<Expr> = cc.admits.iter().map(|(_, e)| e.clone()).collect();
-    for f in &cc.flags {
-        if f.on_fail == AssertOnFail::Drop {
-            filters.push(f.expr.clone());
-        }
+    for f in crate::violation::enforced_flags(&cc.flags) {
+        filters.push(f.expr.clone());
     }
     let mut builder = LogicalPlanBuilder::from(scan);
     if let Some(f) = filters.into_iter().reduce(Expr::and) {

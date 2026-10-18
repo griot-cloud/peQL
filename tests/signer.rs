@@ -6,7 +6,7 @@ mod support;
 use std::path::Path;
 use std::sync::Arc;
 
-use peql::{Engine, PeqlError, SocketSigner, WriteMode};
+use peql::{Engine, OnWriteViolation, PeqlError, SocketSigner, WriteMode};
 use support::*;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 
@@ -54,9 +54,14 @@ fn refuser(_: &serde_json::Value) -> serde_json::Value {
 async fn engine(dir: &Path) -> Engine {
     let e = Engine::open(dir).unwrap();
     e.register_contract(READINGS, &schema()).unwrap();
-    e.write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
-        .await
-        .unwrap();
+    e.write(
+        "demo/readings",
+        vec![batch(1, 20)],
+        WriteMode::Append,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     e
 }
 

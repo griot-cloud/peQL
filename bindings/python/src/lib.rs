@@ -12,7 +12,7 @@ use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 
 use peql::format::{ResultFormat, ResultFormatter};
-use peql::{PeqlError, WriteMode};
+use peql::{OnReadViolation, OnWriteViolation, PeqlError, WriteMode};
 
 /// Who runs a query, as the application authenticated them.
 #[pyclass]
@@ -116,31 +116,43 @@ impl Engine {
         Ok(reg.name().to_owned())
     }
 
-    /// Write an Arrow IPC stream under a contract; returns the report as JSON.
-    #[pyo3(signature = (name, data_ipc, append=false))]
-    fn write(
+    /// Write an Arrow IPC stream under a contract, with rows that break a row rule refused,
+    /// set aside (`exclude`) or committed (`warn`); returns the report as JSON, and the rows
+    /// set aside, with the rules each broke, as Arrow IPC file bytes.
+    #[pyo3(signature = (name, data_ipc, append=false, on_violation="refuse"))]
+    fn write<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         name: String,
         data_ipc: &[u8],
         append: bool,
-    ) -> PyResult<String> {
+        on_violation: &str,
+    ) -> PyResult<(String, Option<Bound<'py, PyBytes>>)> {
         let (_, batches) = read_ipc(data_ipc)?;
         let mode = if append {
             WriteMode::Append
         } else {
             WriteMode::Overwrite
         };
-        let report = py
-            .detach(|| self.rt.block_on(self.inner.write(&name, batches, mode)))
+        let on_violation: OnWriteViolation = on_violation.parse().map_err(to_py)?;
+        let outcome = py
+            .detach(|| {
+                self.rt
+                    .block_on(self.inner.write(&name, batches, mode, on_violation))
+            })
             .map_err(to_py)?;
-        serde_json::to_string(&serde_json::json!({
-            "rows_written": report.rows_written,
-            "files": report.files,
-            "verdict": report.verdict,
-            "table": report.table,
-        }))
-        .map_err(err)
+        let excluded = match &outcome.excluded {
+            Some(rows) => Some(PyBytes::new(
+                py,
+                &ResultFormatter::format_results(std::slice::from_ref(rows), ResultFormat::Arrow)
+                    .map_err(err)?,
+            )),
+            None => None,
+        };
+        Ok((
+            serde_json::to_string(&outcome.report).map_err(err)?,
+            excluded,
+        ))
     }
 
     /// The validation verdict as JSON.
@@ -151,16 +163,28 @@ impl Engine {
         serde_json::to_string(&v).map_err(err)
     }
 
-    /// Run `sql` as `caller`: the result as Arrow IPC file bytes, and the envelope as JSON.
+    /// Run `sql` as `caller`, with rows that break a row rule left out (`exclude`, counted in
+    /// the envelope) or refused (`refuse`): the result as Arrow IPC file bytes, and the
+    /// envelope as JSON.
+    #[pyo3(signature = (sql, caller, on_violation="exclude"))]
     fn query<'py>(
         &self,
         py: Python<'py>,
         sql: String,
         caller: &Caller,
+        on_violation: &str,
     ) -> PyResult<(Bound<'py, PyBytes>, String)> {
         let caller = caller.inner.clone();
+        let on_violation: OnReadViolation = on_violation.parse().map_err(to_py)?;
         let res = py
-            .detach(|| self.rt.block_on(self.inner.query(&sql, &caller)))
+            .detach(|| {
+                self.rt.block_on(self.inner.query_as_of(
+                    &sql,
+                    &caller,
+                    &peql::AsOf::current(),
+                    on_violation,
+                ))
+            })
             .map_err(to_py)?;
         let ipc =
             ResultFormatter::format_results(&res.batches, ResultFormat::Arrow).map_err(err)?;

@@ -15,8 +15,10 @@ use arrow_flight::sql::{
 use datafusion::arrow::array::RecordBatch;
 use futures::StreamExt;
 use hyper_util::rt::TokioIo;
-use peql::flight::{CALLER_HEADER, FlightSql, caller_header, serve_unix};
-use peql::{Caller, Engine, SocketSigner};
+use peql::flight::{
+    CALLER_HEADER, FlightSql, ON_VIOLATION_HEADER, ON_VIOLATION_OPTION, caller_header, serve_unix,
+};
+use peql::{Caller, Engine, OnWriteViolation, SocketSigner};
 use support::*;
 use tonic::transport::{Channel, Endpoint, Uri};
 
@@ -45,25 +47,44 @@ async fn client(sock: &Path, caller: Option<&Caller>) -> FlightSqlServiceClient<
     c
 }
 
-fn ingest(mode: TableExistsOption) -> CommandStatementIngest {
+/// An ingest into `demo/readings`, with an `on_violation` option when given.
+fn ingest(mode: TableExistsOption, on_violation: Option<&str>) -> CommandStatementIngest {
     CommandStatementIngest {
         table_definition_options: Some(TableDefinitionOptions {
             if_not_exist: TableNotExistOption::Fail as i32,
             if_exists: mode as i32,
         }),
         table: "demo/readings".into(),
+        options: on_violation
+            .map(|v| (ON_VIOLATION_OPTION.to_owned(), v.to_owned()))
+            .into_iter()
+            .collect(),
         ..Default::default()
     }
 }
 
+/// An ingest that commits the rows that break a row rule, as the readings every tenth of
+/// which is negative need.
 async fn put(
     c: &mut FlightSqlServiceClient<Channel>,
     mode: TableExistsOption,
     batch: RecordBatch,
 ) -> Result<i64, String> {
-    c.execute_ingest(ingest(mode), futures::stream::iter(vec![Ok(batch)]))
-        .await
-        .map_err(|e| e.to_string())
+    put_with(c, mode, Some("warn"), batch).await
+}
+
+async fn put_with(
+    c: &mut FlightSqlServiceClient<Channel>,
+    mode: TableExistsOption,
+    on_violation: Option<&str>,
+    batch: RecordBatch,
+) -> Result<i64, String> {
+    c.execute_ingest(
+        ingest(mode, on_violation),
+        futures::stream::iter(vec![Ok(batch)]),
+    )
+    .await
+    .map_err(|e| e.to_string())
 }
 
 /// GetFlightInfo, then DoGet on its ticket: the batches and the first message's app metadata.
@@ -254,7 +275,7 @@ async fn refusals_come_back_before_any_scan() {
         .await
         .unwrap_err();
     assert!(err.contains("append or replace"), "{err}");
-    let mut other = ingest(TableExistsOption::Append);
+    let mut other = ingest(TableExistsOption::Append, None);
     other.table = "demo/absent".into();
     let err = ana
         .execute_ingest(other, futures::stream::iter(vec![Ok(batch(1, 2))]))
@@ -288,9 +309,14 @@ async fn one_fixed_caller_and_a_signed_envelope() {
         }
     });
     let e = engine(dir.path()).with_signer(Arc::new(SocketSigner::unix(&signer_sock)));
-    e.write("demo/readings", vec![batch(1, 20)], peql::WriteMode::Append)
-        .await
-        .unwrap();
+    e.write(
+        "demo/readings",
+        vec![batch(1, 20)],
+        peql::WriteMode::Append,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     let sock = dir.path().join("flight.sock");
     serve(FlightSql::for_caller(Arc::new(e), guest()), &sock).await;
 
@@ -319,6 +345,7 @@ async fn a_multi_batch_answer_streams_from_disk_and_cleans_up() {
         "demo/readings",
         vec![batch(1, 100_000)],
         peql::WriteMode::Append,
+        OnWriteViolation::Warn,
     )
     .await
     .unwrap();
@@ -360,9 +387,14 @@ async fn signing_failure_releases_no_flight_frames_and_removes_the_spool() {
     }
     let dir = tempfile::tempdir().unwrap();
     let e = engine(dir.path()).with_signer(Arc::new(Refuse));
-    e.write("demo/readings", vec![batch(1, 20)], peql::WriteMode::Append)
-        .await
-        .unwrap();
+    e.write(
+        "demo/readings",
+        vec![batch(1, 20)],
+        peql::WriteMode::Append,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     let sock = dir.path().join("flight.sock");
     serve(FlightSql::for_caller(Arc::new(e), owner()), &sock).await;
     let mut c = client(&sock, None).await;
@@ -381,4 +413,74 @@ async fn signing_failure_releases_no_flight_frames_and_removes_the_spool() {
             .count(),
         0
     );
+}
+
+/// An ingest refuses rows that break a row rule unless it asks to commit them, and cannot set
+/// them aside; a read leaves them out and counts them in the envelope, or, with
+/// `x-peql-on-violation: refuse`, is refused at GetFlightInfo.
+#[tokio::test]
+async fn rows_that_break_a_rule_are_refused_by_an_ingest_and_left_out_of_a_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("flight.sock");
+    let e = Arc::new(engine(dir.path()));
+    serve(FlightSql::new(e.clone()), &sock).await;
+    let mut ana = client(&sock, Some(&owner())).await;
+
+    // No option: refused, naming the rule and the count; nothing is committed.
+    let err = put_with(&mut ana, TableExistsOption::Append, None, batch(1, 20))
+        .await
+        .unwrap_err();
+    assert!(err.contains("non_negative (2 rows)"), "{err}");
+    assert!(e.manifest("demo/readings").unwrap().is_none());
+    let err = put_with(
+        &mut ana,
+        TableExistsOption::Append,
+        Some("exclude"),
+        batch(1, 20),
+    )
+    .await
+    .unwrap_err();
+    assert!(err.contains("nowhere to hand them back"), "{err}");
+    assert_eq!(
+        put_with(
+            &mut ana,
+            TableExistsOption::Append,
+            Some("refuse"),
+            batch(1, 9)
+        )
+        .await,
+        Ok(9)
+    );
+    assert_eq!(
+        put_with(
+            &mut ana,
+            TableExistsOption::Append,
+            Some("warn"),
+            batch(10, 20)
+        )
+        .await,
+        Ok(11)
+    );
+
+    // A read leaves the two negative readings out and says so.
+    let (batches, meta) = get(&mut ana, r#"SELECT id FROM "demo/readings""#)
+        .await
+        .unwrap();
+    assert_eq!(ids(&batches), owner_ids(20));
+    assert_eq!(
+        meta["envelope"]["contracts"][0]["excluded"],
+        serde_json::json!({"non_negative": 2})
+    );
+
+    // Asked to refuse them, it is refused before any scan.
+    ana.set_header(ON_VIOLATION_HEADER, "refuse");
+    let err = get(&mut ana, r#"SELECT id FROM "demo/readings""#)
+        .await
+        .unwrap_err();
+    assert!(err.contains("non_negative (2 rows)"), "{err}");
+    ana.set_header(ON_VIOLATION_HEADER, "warn");
+    let err = get(&mut ana, r#"SELECT id FROM "demo/readings""#)
+        .await
+        .unwrap_err();
+    assert!(err.contains("exclude or refuse"), "{err}");
 }

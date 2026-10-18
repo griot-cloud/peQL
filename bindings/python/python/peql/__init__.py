@@ -27,7 +27,8 @@ from ._native import Caller, Engine as _NativeEngine
 __all__ = ["Engine", "Caller", "Refused"]
 __version__ = "0.4.2"
 
-# A query refused by policy (denied, not servable, budget spent, unknown contract).
+# A query refused by policy (denied, not servable, rows that break a rule, budget spent,
+# unknown contract), or a write refused for rows that break a rule.
 Refused = PermissionError
 
 
@@ -70,20 +71,35 @@ class Engine:
         """Register a contract parcel already compiled (`parcel compile -o`), as given."""
         return self._native.register_compiled(contract, compiled)
 
-    def write(self, name: str, data, append: bool = False) -> dict:
-        """Write a pyarrow Table under a contract; returns the report with its verdict."""
-        return json.loads(self._native.write(name, _ipc(data), append))
+    def write(self, name: str, data, append: bool = False, on_violation: str = "refuse") -> dict:
+        """Write a pyarrow Table under a contract; returns the report with its verdict.
+
+        Rows that break a row rule are refused (``"refuse"``, raising :class:`Refused`), set
+        aside (``"exclude"``: the report's ``"excluded"`` is a table of them, with the rules
+        each broke in ``_violations``), or committed (``"warn"``).
+        """
+        report, excluded = self._native.write(name, _ipc(data), append, on_violation)
+        report = json.loads(report)
+        report["excluded"] = (
+            _pa.ipc.open_file(_pa.py_buffer(excluded)).read_all() if excluded else None
+        )
+        return report
 
     def validate(self, name: str) -> dict:
         return json.loads(self._native.validate(name))
 
-    def query(self, sql: str, caller: Caller) -> _pa.Table:
-        """Run SQL as ``caller``. Raises :class:`Refused` when policy refuses it."""
-        return self.query_with_envelope(sql, caller)[0]
+    def query(self, sql: str, caller: Caller, on_violation: str = "exclude") -> _pa.Table:
+        """Run SQL as ``caller``. Raises :class:`Refused` when policy refuses it.
 
-    def query_with_envelope(self, sql: str, caller: Caller):
-        """The result and its envelope: contracts applied, scan statistics, attestation."""
-        ipc, envelope = self._native.query(sql, caller)
+        Rows that break a row rule are left out (``"exclude"``) or refuse the query
+        (``"refuse"``).
+        """
+        return self.query_with_envelope(sql, caller, on_violation)[0]
+
+    def query_with_envelope(self, sql: str, caller: Caller, on_violation: str = "exclude"):
+        """The result and its envelope: contracts applied (with the rows each left out for
+        breaking a rule), scan statistics, attestation."""
+        ipc, envelope = self._native.query(sql, caller, on_violation)
         table = _pa.ipc.open_file(_pa.py_buffer(ipc)).read_all() if ipc else _pa.table({})
         return table, json.loads(envelope)
 

@@ -6,7 +6,7 @@ use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use parcel_core::registry::FunctionManifest;
 use parcel_runtime::differential::differential;
-use peql::{Caller, Engine, PeqlError as EngineError, WriteMode};
+use peql::{Caller, Engine, OnWriteViolation, PeqlError as EngineError, WriteMode};
 
 const MODULE: &[u8] = include_bytes!("fixtures/meter_serial.wasm");
 
@@ -113,9 +113,15 @@ async fn user_functions_end_to_end() {
     assert!(comp.contract.functions.iter().all(|p| p.hash.len() == 64));
 
     let report = engine
-        .write("kplc/tokens", vec![batch()], WriteMode::Overwrite)
+        .write(
+            "kplc/tokens",
+            vec![batch()],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let invalid_meters = (0..240).filter(|i| i % 9 <= 1).count() as i64;
     assert_eq!(report.verdict.failures["valid_meter"], invalid_meters);
     assert_eq!(

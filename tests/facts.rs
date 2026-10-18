@@ -11,7 +11,7 @@ use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
 use object_store::{ObjectStoreExt, PutPayload};
-use peql::{Engine, ObjectStoreParquet, PeqlError, WriteMode};
+use peql::{Engine, ObjectStoreParquet, OnWriteViolation, PeqlError, WriteMode};
 use support::*;
 
 const EARLIER: &[u8] = include_bytes!("fixtures/facts-b9002f7/parquet-manifest.json");
@@ -22,7 +22,12 @@ async fn a_manifest_of_an_earlier_peql_beside_local_files_is_rebuilt_by_a_read()
     let engine = Engine::in_memory(dir.path());
     engine.register_contract(READINGS, &schema()).unwrap();
     engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let path = dir
@@ -34,9 +39,15 @@ async fn a_manifest_of_an_earlier_peql_beside_local_files_is_rebuilt_by_a_read()
     engine.register_contract(READINGS, &schema()).unwrap();
     assert!(engine.manifest("demo/readings").unwrap().is_none());
     let r = engine
-        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(41, 50)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     assert_eq!(r.verdict.row_count, 10);
     assert_eq!(r.table, None);
     assert!(engine.manifest("demo/readings").unwrap().is_none());
@@ -79,7 +90,12 @@ async fn a_manifest_of_an_earlier_peql_in_an_object_store_is_rebuilt_by_a_read()
         e
     };
     open()
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let path = ObjectPath::from("tenant-a/readings/_peql/manifests/demo__readings.json");
@@ -90,7 +106,12 @@ async fn a_manifest_of_an_earlier_peql_in_an_object_store_is_rebuilt_by_a_read()
 
     let engine = open();
     engine
-        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(41, 50)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     assert!(engine.manifest("demo/readings").unwrap().is_none());

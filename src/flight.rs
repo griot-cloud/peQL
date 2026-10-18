@@ -6,6 +6,11 @@
 //! | `DoGet` | [`Engine::query`]; the envelope (and its signature, when the engine has a signer) is the JSON `app_metadata` of the first message |
 //! | `DoPut` (bulk ingest) | [`Engine::write`] under the contract named by the ingest's `table`, by its owner only |
 //!
+//! A read leaves out the rows that break a contract's row rules and counts them in the
+//! envelope; a request whose [`ON_VIOLATION_HEADER`] is `refuse` is refused instead when there
+//! are any. An ingest refuses rows that break a row rule unless its `on_violation` option is
+//! `warn`; `exclude` is refused, since `DoPut` has nowhere to hand the set-aside rows back.
+//!
 //! Every request names its caller. By default the caller is the `x-peql-caller` header: a
 //! [`parcel_runtime::Caller`] as base64 JSON ([`caller_header`] makes one). The header is
 //! believed, so the listener must be reachable only by whoever authenticated the caller (the
@@ -52,11 +57,32 @@ use tonic::{Request, Response, Status};
 
 use crate::engine::{Engine, WriteMode};
 use crate::error::PeqlError;
+use crate::violation::{OnReadViolation, OnWriteViolation};
 
 type DoGetStream = <FlightSql as FlightService>::DoGetStream;
 
 /// The request header that names the caller: a [`Caller`] as base64 JSON.
 pub const CALLER_HEADER: &str = "x-peql-caller";
+
+/// The request header that says what a read does with rows that break a row rule: `exclude`
+/// (when absent) or `refuse` ([`OnReadViolation`]).
+pub const ON_VIOLATION_HEADER: &str = "x-peql-on-violation";
+
+/// The ingest option that says what a write does with rows that break a row rule: `refuse`
+/// (when absent) or `warn` ([`OnWriteViolation`]).
+pub const ON_VIOLATION_OPTION: &str = "on_violation";
+
+/// What a request's [`ON_VIOLATION_HEADER`] asks for.
+fn on_violation(metadata: &MetadataMap) -> Result<OnReadViolation, Status> {
+    match metadata.get(ON_VIOLATION_HEADER) {
+        None => Ok(OnReadViolation::default()),
+        Some(v) => v
+            .to_str()
+            .map_err(|e| Status::invalid_argument(format!("`{ON_VIOLATION_HEADER}`: {e}")))?
+            .parse()
+            .map_err(status),
+    }
+}
 
 /// The value of [`CALLER_HEADER`] for a caller.
 pub fn caller_header(caller: &Caller) -> String {
@@ -123,7 +149,12 @@ impl FlightSql {
         request: Request<FlightDescriptor>,
     ) -> Result<Response<FlightInfo>, Status> {
         let caller = self.caller(request.metadata())?;
-        let checked = self.engine.check(sql, &caller).await.map_err(status)?;
+        let on_violation = on_violation(request.metadata())?;
+        let checked = self
+            .engine
+            .check(sql, &caller, on_violation)
+            .await
+            .map_err(status)?;
         let info = FlightInfo::new()
             .try_with_schema(&checked.schema)
             .map_err(|e| Status::internal(e.to_string()))?
@@ -144,7 +175,7 @@ impl FlightSql {
             .map_err(|_| Status::invalid_argument("the ticket is not UTF-8 SQL"))?;
         let res = self
             .engine
-            .query_spooled(sql, &caller)
+            .query_spooled(sql, &caller, on_violation(metadata)?)
             .await
             .map_err(status)?;
         let app_metadata = serde_json::to_vec(&serde_json::json!({
@@ -176,6 +207,7 @@ pub fn status(e: PeqlError) -> Status {
         | PeqlError::Refused { .. }
         | PeqlError::GuaranteeFailed { .. }
         | PeqlError::NotServable { .. }
+        | PeqlError::Violated { .. }
         | PeqlError::Ungated(_) => Status::permission_denied(msg),
         PeqlError::BudgetExhausted { .. } => Status::resource_exhausted(msg),
         PeqlError::NotWritten { .. } => Status::failed_precondition(msg),
@@ -245,7 +277,7 @@ impl FlightSqlService for FlightSql {
         let caller = self.caller(request.metadata())?;
         let checked = self
             .engine
-            .check(&query.query, &caller)
+            .check(&query.query, &caller, on_violation(request.metadata())?)
             .await
             .map_err(status)?;
         let options = IpcWriteOptions::default();
@@ -300,6 +332,16 @@ impl FlightSqlService for FlightSql {
                 )));
             }
         };
+        let on_violation = match command.options.get(ON_VIOLATION_OPTION) {
+            None => OnWriteViolation::default(),
+            Some(v) => v.parse().map_err(status)?,
+        };
+        if on_violation == OnWriteViolation::Exclude {
+            return Err(Status::invalid_argument(format!(
+                "`{ON_VIOLATION_OPTION}: exclude` sets rows aside for the writer, and an ingest has \
+                 nowhere to hand them back: ingest with refuse or warn"
+            )));
+        }
         let batches: Vec<_> = FlightRecordBatchStream::new_from_flight_data(
             request.into_inner().map_err(FlightError::from),
         )
@@ -308,9 +350,10 @@ impl FlightSqlService for FlightSql {
         .map_err(Status::from)?;
         let report = self
             .engine
-            .write(&name, batches, mode)
+            .write(&name, batches, mode, on_violation)
             .await
-            .map_err(status)?;
+            .map_err(status)?
+            .report;
         Ok(report.rows_written as i64)
     }
 

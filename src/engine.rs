@@ -5,7 +5,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
@@ -20,7 +20,7 @@ use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, SortExpr};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{SessionConfig, SessionContext};
-use parcel_core::document::{AssertOnFail, GuaranteeOnFail};
+use parcel_core::document::GuaranteeOnFail;
 use parcel_core::registry::{FunctionEntry, FunctionManifest};
 use parcel_core::{ContractDoc, compile_with};
 use parcel_runtime::Caller;
@@ -45,6 +45,7 @@ use crate::guard;
 use crate::manifest::{self, FileEntry, Manifest, TableStats};
 use crate::shape::SuppressExec;
 use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered, Stale};
+use crate::violation::{self, OnReadViolation, OnWriteViolation};
 
 /// The validation verdict, with the hash of the data it describes: the whole data, for a
 /// validation; the rows written and the files they were written to, for a write.
@@ -65,11 +66,20 @@ impl std::ops::Deref for Verdict {
     }
 }
 
-/// What one write did: the rows it wrote, the files it added, and the verdict of the
-/// contract's row rules over those rows, whose hash is over those files.
+/// What one write did: the rows it wrote, the files it added, the verdict of the contract's
+/// row rules over those rows, whose hash is over those files, and what it did with the rows
+/// it was given that break those rules.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WriteReport {
     pub rows_written: usize,
+    /// What the writer asked to be done with rows that break the contract's row rules.
+    pub on_violation: OnWriteViolation,
+    /// Rows the write was given that break each row rule, by rule: committed under
+    /// [`OnWriteViolation::Warn`], set aside under [`OnWriteViolation::Exclude`]. A row that
+    /// breaks two rules is counted under both.
+    pub violations: BTreeMap<String, u64>,
+    /// Rows set aside rather than committed ([`OnWriteViolation::Exclude`]).
+    pub rows_excluded: usize,
     /// The data files the write added, by path under the binding (an Iceberg table's
     /// location), with their rows, flags and hashes.
     pub files: Vec<FileEntry>,
@@ -81,6 +91,23 @@ pub struct WriteReport {
     /// the write left them (an Iceberg snapshot's, for the snapshot committed); `None` when
     /// those facts are not recorded, as for data whose facts are to be rebuilt.
     pub table: Option<TableStats>,
+}
+
+/// What [`Engine::write`] did: its report, and the rows it set aside under
+/// [`OnWriteViolation::Exclude`], with the rules each broke ([`violation::VIOLATIONS_COLUMN`]).
+#[derive(Clone, Debug)]
+pub struct WriteOutcome {
+    pub report: WriteReport,
+    pub excluded: Option<RecordBatch>,
+}
+
+/// What [`Engine::write_part`] did with one part: the rows it wrote, and the rows it set
+/// aside under [`OnWriteViolation::Exclude`], with the rules each broke
+/// ([`violation::VIOLATIONS_COLUMN`]), for the writer to keep: the write holds none of them.
+#[derive(Clone, Debug)]
+pub struct Part {
+    pub rows_written: usize,
+    pub excluded: Option<RecordBatch>,
 }
 
 /// The snapshot a write committed to a table with snapshots, and the one it followed.
@@ -146,7 +173,11 @@ pub struct Writing {
     reg: Arc<Registered>,
     location: Location,
     written: Written,
+    on_violation: OnWriteViolation,
     rows: AtomicUsize,
+    /// Rows set aside so far, and how many broke each rule ([`OnWriteViolation::Exclude`]).
+    rows_excluded: AtomicUsize,
+    excluded: Mutex<BTreeMap<String, u64>>,
     /// The in-memory bytes of the parts written so far, for the width of a row.
     bytes: AtomicUsize,
     /// What one part may hold while it is written, when the writer bounds it.
@@ -175,6 +206,10 @@ impl Writing {
     pub fn contract(&self) -> &str {
         self.reg.name()
     }
+    /// What the write does with rows that break the contract's row rules.
+    pub fn on_violation(&self) -> OnWriteViolation {
+        self.on_violation
+    }
     /// Rows written so far.
     pub fn rows(&self) -> usize {
         self.rows.load(Ordering::SeqCst)
@@ -199,6 +234,15 @@ impl Writing {
     fn row_bytes(&self) -> usize {
         let rows = self.rows.load(Ordering::SeqCst).max(1);
         (self.bytes.load(Ordering::SeqCst) / rows).max(1)
+    }
+
+    /// Remove the files this write wrote, none of which is published.
+    fn discard(&self) -> Result<()> {
+        let dir = self.dir()?;
+        if dir.exists() {
+            std::fs::remove_dir_all(dir)?;
+        }
+        Ok(())
     }
 
     /// The local directory this write's files land in, and only its files.
@@ -697,17 +741,22 @@ impl Engine {
 
     /// Write batches under a contract (parcel design 10): enrich, compute flags and derived
     /// columns, cluster and partition, stamp the contract hash, validate the rows written,
-    /// publish them and record what the contract now knows of its data.
+    /// publish them and record what the contract now knows of its data. Rows that break the
+    /// contract's row rules are refused, set aside or committed as `on_violation` says.
     /// One [`Engine::begin_write`], one [`Engine::write_part`], one [`Engine::finish_write`].
     pub async fn write(
         &self,
         name: &str,
         batches: Vec<RecordBatch>,
         mode: WriteMode,
-    ) -> Result<WriteReport> {
-        let w = self.begin_write(name, mode).await?;
-        self.write_part(&w, batches).await?;
-        self.finish_write(w).await
+        on_violation: OnWriteViolation,
+    ) -> Result<WriteOutcome> {
+        let w = self.begin_write(name, mode, on_violation).await?;
+        let part = self.write_part(&w, batches).await?;
+        Ok(WriteOutcome {
+            report: self.finish_write(w).await?,
+            excluded: part.excluded,
+        })
     }
 
     /// Start a write under a contract that arrives in parts, as an out-of-core writer (Moruna's
@@ -721,8 +770,19 @@ impl Engine {
     /// the contract writes. [`Engine::finish_write`] commits the parts' files as one snapshot,
     /// which for an overwrite replaces the table's files and commits only over the snapshot
     /// current here.
-    pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
-        self.begin(name, mode, None).await
+    ///
+    /// Rows that break the contract's row rules are dealt with as `on_violation` says: under
+    /// [`OnWriteViolation::Refuse`] [`Engine::finish_write`] commits nothing when any part held
+    /// one; under [`OnWriteViolation::Exclude`] each part writes only the rows that pass and
+    /// hands the others back; under [`OnWriteViolation::Warn`] every row is written and the
+    /// verdict marks the write invalid.
+    pub async fn begin_write(
+        &self,
+        name: &str,
+        mode: WriteMode,
+        on_violation: OnWriteViolation,
+    ) -> Result<Writing> {
+        self.begin(name, mode, None, on_violation).await
     }
 
     /// [`Engine::begin_write`]; with `rewrite`, a write to an Iceberg table that replaces the
@@ -733,6 +793,7 @@ impl Engine {
         name: &str,
         mode: WriteMode,
         rewrite: Option<(i64, Vec<String>)>,
+        on_violation: OnWriteViolation,
     ) -> Result<Writing> {
         if let Some(snapshot) = self.frozen.get(name) {
             return Err(PeqlError::Invalid(format!(
@@ -801,7 +862,10 @@ impl Engine {
             reg,
             location,
             written,
+            on_violation,
             rows: AtomicUsize::new(0),
+            rows_excluded: AtomicUsize::new(0),
+            excluded: Mutex::default(),
             bytes: AtomicUsize::new(0),
             memory: None,
             staged,
@@ -814,8 +878,10 @@ impl Engine {
     /// Write one part of a write begun by [`Engine::begin_write`]: conform it to the row
     /// schema, enrich, compute flags and derived columns, cluster and partition, and write
     /// Parquet files stamped with the contract hash into the write's directory. Parts may be
-    /// written concurrently; each lands in files of its own. Returns the rows written.
-    pub async fn write_part(&self, w: &Writing, batches: Vec<RecordBatch>) -> Result<usize> {
+    /// written concurrently; each lands in files of its own. Under
+    /// [`OnWriteViolation::Exclude`] only the rows that break none of the contract's row rules
+    /// are written, and the others are returned with the rules each broke.
+    pub async fn write_part(&self, w: &Writing, batches: Vec<RecordBatch>) -> Result<Part> {
         let c = &w.reg.compilation;
         let cc = &c.contract;
         let batches = batches
@@ -858,6 +924,40 @@ impl Engine {
             select.push(d.expr.clone().alias(&d.column));
         }
         let plan = LogicalPlanBuilder::from(plan).project(select)?.build()?;
+        // Under `exclude`, the rows are flagged once, here, and only those that break no rule
+        // go on to be written.
+        let enforced = violation::enforced_flags(&c.write.flags);
+        let (plan, rows, bytes, excluded) = if w.on_violation == OnWriteViolation::Exclude
+            && !enforced.is_empty()
+        {
+            let df = ctx
+                .execute_logical_plan(parcel_core::compile::resolve(plan)?)
+                .await?;
+            let schema: SchemaRef = Arc::new(df.schema().as_arrow().clone());
+            let split = violation::split(&df.collect().await?, &enforced, &cc.row_schema)?;
+            if !split.counts.is_empty() {
+                let mut counts = w.excluded.lock().expect("lock");
+                for (rule, n) in &split.counts {
+                    *counts.entry(rule.clone()).or_default() += n;
+                }
+            }
+            w.rows_excluded
+                .fetch_add(rows - split.passing_rows, Ordering::SeqCst);
+            let kept = split.passing_rows;
+            // The batches as the plan has them: their own schema may differ from it in
+            // nullability.
+            let passing = split
+                .passing
+                .into_iter()
+                .map(|b| RecordBatch::try_new(schema.clone(), b.columns().to_vec()))
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let table = MemTable::try_new(schema, vec![passing])?;
+            let plan = LogicalPlanBuilder::scan("kept", provider_as_source(Arc::new(table)), None)?
+                .build()?;
+            (plan, kept, bytes * kept / rows.max(1), split.breaking)
+        } else {
+            (plan, rows, bytes, None)
+        };
         // An Iceberg table reads its files' columns by field id: each column is written as
         // the table's schema has it, with its id.
         #[cfg(feature = "iceberg")]
@@ -884,7 +984,10 @@ impl Engine {
             .await?;
         w.rows.fetch_add(rows, Ordering::SeqCst);
         w.bytes.fetch_add(bytes, Ordering::SeqCst);
-        Ok(rows)
+        Ok(Part {
+            rows_written: rows,
+            excluded,
+        })
     }
 
     /// Finish a write begun by [`Engine::begin_write`]. Every contract bound to the data the
@@ -896,9 +999,11 @@ impl Engine {
     /// table manifest, and no other row is validated.
     ///
     /// The report is the write's own: the rows written, the files added, the verdict of the
-    /// writer's row rules over those rows with the hash of those files, and the snapshot
-    /// committed. A write whose rows break a deny-level rule is published all the same; its
-    /// verdict says so, and so do the facts readers are refused by.
+    /// writer's row rules over those rows with the hash of those files, the snapshot
+    /// committed, and the rows that broke each row rule. Under [`OnWriteViolation::Refuse`] a
+    /// write whose rows break a row rule is refused with [`PeqlError::Violated`], naming each
+    /// rule and how many rows broke it, and nothing it wrote is published; under
+    /// [`OnWriteViolation::Warn`] it is published, and its verdict and the facts say so.
     pub async fn finish_write(&self, w: Writing) -> Result<WriteReport> {
         let name = w.reg.name();
         let key = w.location.key()?;
@@ -916,15 +1021,36 @@ impl Engine {
         let mut facts = Vec::with_capacity(bound.len());
         for reg in &bound {
             let (v, f) = self.write_facts(&w, reg, written_at).await?;
+            if verdict.is_none() && w.on_violation == OnWriteViolation::Refuse {
+                let broken = violation::broken(&w.reg.compilation.contract.flags, &v.failures);
+                if !broken.is_empty() {
+                    w.discard()?;
+                    return Err(PeqlError::Violated {
+                        contract: name.to_owned(),
+                        violations: broken,
+                    });
+                }
+            }
             verdict.get_or_insert(v);
             facts.push(f);
         }
         let verdict = verdict.expect("the writer's contract is bound");
+        let violations: BTreeMap<String, u64> = match w.on_violation {
+            OnWriteViolation::Exclude => w.excluded.lock().expect("lock").clone(),
+            OnWriteViolation::Warn | OnWriteViolation::Refuse => {
+                violation::broken(&w.reg.compilation.contract.flags, &verdict.failures)
+                    .into_iter()
+                    .collect()
+            }
+        };
         let (snapshot, table) = self.publish_write(&w, &bound, &facts, written_at).await?;
         let own = facts.swap_remove(0).facts;
         let columns = w.reg.compilation.contract.row_schema.clone();
         Ok(WriteReport {
             rows_written: w.rows.load(Ordering::SeqCst),
+            on_violation: w.on_violation,
+            violations,
+            rows_excluded: w.rows_excluded.load(Ordering::SeqCst),
             files: own.files,
             verdict: Verdict {
                 verdict,
@@ -1238,7 +1364,13 @@ impl Engine {
         let stored = t.provider(&table, &c.contract, true, snapshot).await?;
         let replaced = files.into_iter().map(|f| f.relative).collect();
         let w = self
-            .begin(name, WriteMode::Overwrite, Some((snapshot, replaced)))
+            // The rows are rewritten as stored: a compaction neither refuses nor sets aside any.
+            .begin(
+                name,
+                WriteMode::Overwrite,
+                Some((snapshot, replaced)),
+                OnWriteViolation::Warn,
+            )
             .await?;
         let iw = w.iceberg.as_ref().ok_or_else(|| {
             PeqlError::Invalid(format!("`{name}`'s compaction was not begun on its table"))
@@ -1491,9 +1623,16 @@ impl Engine {
 
     // ── resolve, view, describe ─────────────────────────────────────────────
 
-    /// Decide, check guarantees and choose shapes for one caller (peQL design 4.3).
-    pub fn resolve(&self, name: &str, caller: &Caller) -> Result<(Resolution, Manifest)> {
-        self.resolve_with(name, caller, || self.manifest(name))
+    /// Decide, check guarantees and choose shapes for one caller (peQL design 4.3), and count
+    /// the rows that break the contract's row rules: refused under
+    /// [`OnReadViolation::Refuse`], left out by the view otherwise.
+    pub fn resolve(
+        &self,
+        name: &str,
+        caller: &Caller,
+        on_violation: OnReadViolation,
+    ) -> Result<(Resolution, Manifest)> {
+        self.resolve_with(name, caller, on_violation, || self.manifest(name))
     }
 
     /// [`Engine::resolve`] over the manifest `manifest` gives, read only once the caller has
@@ -1502,6 +1641,7 @@ impl Engine {
         &self,
         name: &str,
         caller: &Caller,
+        on_violation: OnReadViolation,
         manifest: impl FnOnce() -> Result<Option<Manifest>>,
     ) -> Result<(Resolution, Manifest)> {
         let reg = self.visible(name, caller)?;
@@ -1517,10 +1657,26 @@ impl Engine {
         let manifest = manifest()?.ok_or_else(|| PeqlError::NotWritten {
             contract: cc.name.clone(),
         })?;
-        if !manifest.valid {
+        // A deny-level guarantee that did not hold when last decided makes the data not
+        // servable. Rows that break a row rule do not: the view leaves them out, or the read
+        // that asked to be refused them is.
+        let guarantees: Vec<String> = manifest
+            .breached
+            .iter()
+            .filter(|b| cc.guarantees.iter().any(|g| &g.id == *b))
+            .cloned()
+            .collect();
+        if !guarantees.is_empty() {
             return Err(PeqlError::NotServable {
                 contract: cc.name.clone(),
-                breached: manifest.breached.clone(),
+                breached: guarantees,
+            });
+        }
+        let broken = violation::broken(&cc.flags, &manifest.failures);
+        if on_violation == OnReadViolation::Refuse && !broken.is_empty() {
+            return Err(PeqlError::Violated {
+                contract: cc.name.clone(),
+                violations: broken,
             });
         }
         let ctx = reference::context(&Scope {
@@ -1577,6 +1733,7 @@ impl Engine {
                 shapes,
                 flags_materialised: stored,
                 snapshot_id: manifest.snapshot_id,
+                excluded: broken.into_iter().collect(),
             },
             manifest,
         ))
@@ -1622,14 +1779,13 @@ impl Engine {
             (&cc.admits, &cc.projection)
         };
         let mut filters: Vec<Expr> = admits.iter().map(|(_, e)| e.clone()).collect();
-        for f in &cc.flags {
-            if f.on_fail == AssertOnFail::Drop {
-                filters.push(if stored {
-                    col_ref(&f.column)
-                } else {
-                    f.expr.clone()
-                });
-            }
+        // No row that breaks a row rule leaves the view.
+        for f in violation::enforced_flags(&cc.flags) {
+            filters.push(if stored {
+                col_ref(&f.column)
+            } else {
+                f.expr.clone()
+            });
         }
         let mut b = LogicalPlanBuilder::from(scan);
         if let Some(f) = filters.into_iter().reduce(Expr::and) {
@@ -1754,6 +1910,7 @@ impl Engine {
         caller: &Caller,
         partitions: Option<usize>,
         as_of: &AsOf,
+        on_violation: OnReadViolation,
     ) -> Result<Prepared> {
         guard::check_sql(sql)?;
         let (expanded_sql, searches) = crate::vector::expand(sql)?;
@@ -1778,11 +1935,11 @@ impl Engine {
             let (resolution, manifest) = match as_of.get(&name).or_else(|| self.frozen.get(&name)) {
                 None => {
                     self.ensure_manifest(&name).await?;
-                    self.resolve(&name, caller)?
+                    self.resolve(&name, caller, on_violation)?
                 }
                 Some(snapshot) => {
                     let pinned = self.ensure_manifest_as_of(&name, snapshot).await?;
-                    self.resolve_with(&name, caller, || Ok(Some(pinned)))?
+                    self.resolve_with(&name, caller, on_violation, || Ok(Some(pinned)))?
                 }
             };
             let view = self.contract_view(&name, caller, &resolution).await?;
@@ -1878,7 +2035,15 @@ impl Engine {
     /// The physical plan a query would run, as text: shows pruning and pushed-down filters.
     /// For operators; callers cannot `EXPLAIN`. Nothing is charged.
     pub async fn explain(&self, sql: &str, caller: &Caller) -> Result<String> {
-        let p = self.prepare(sql, caller, None, &AsOf::current()).await?;
+        let p = self
+            .prepare(
+                sql,
+                caller,
+                None,
+                &AsOf::current(),
+                OnReadViolation::default(),
+            )
+            .await?;
         let physical = self.physical(&p).await?;
         Ok(datafusion::physical_plan::displayable(physical.as_ref())
             .indent(true)
@@ -1886,13 +2051,22 @@ impl Engine {
     }
 
     /// Everything [`Engine::query`] checks before it reads a row, and the schema it would
-    /// answer with: the statement guard, visibility, `decide`, `guarantee`, the plan guard.
-    /// A refusal here is the refusal the query would meet.
+    /// answer with: the statement guard, visibility, `decide`, `guarantee`, the rows that
+    /// break a row rule under `on_violation`, the plan guard. A refusal here is the refusal
+    /// the query would meet.
     /// Failed checks are audited as a query's are; a check that passes is not, since
     /// the query that follows is. Nothing is charged.
-    pub async fn check(&self, sql: &str, caller: &Caller) -> Result<Checked> {
+    pub async fn check(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        on_violation: OnReadViolation,
+    ) -> Result<Checked> {
         let started = Instant::now();
-        match self.prepare(sql, caller, None, &AsOf::current()).await {
+        match self
+            .prepare(sql, caller, None, &AsOf::current(), on_violation)
+            .await
+        {
             Ok(p) => Ok(Checked {
                 schema: Arc::new(p.plan.schema().as_arrow().clone()),
                 contracts: p.resolutions,
@@ -1937,19 +2111,22 @@ impl Engine {
     /// applies to the caller in the plan and the budgets it spends charged now. See
     /// [`Engine::plan`], which this is for one contract.
     pub async fn view(&self, name: &str, caller: &Caller) -> Result<Planned> {
-        self.view_for(name, caller, None).await
+        self.view_for(name, caller, None, OnReadViolation::default())
+            .await
     }
 
     /// [`Engine::view`] planned for `partitions` partitions, when given, instead of one per
-    /// core (see [`Engine::plan_for`]).
+    /// core, with rows that break a row rule dealt with as `on_violation` says (see
+    /// [`Engine::plan_for`]).
     pub async fn view_for(
         &self,
         name: &str,
         caller: &Caller,
         partitions: Option<usize>,
+        on_violation: OnReadViolation,
     ) -> Result<Planned> {
         let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
-        self.plan_for(&sql, caller, partitions).await
+        self.plan_for(&sql, caller, partitions, on_violation).await
     }
 
     /// [`Engine::view_for`] of a contract's Iceberg table as of one snapshot: what a host
@@ -1961,6 +2138,7 @@ impl Engine {
         caller: &Caller,
         snapshot_id: i64,
         partitions: Option<usize>,
+        on_violation: OnReadViolation,
     ) -> Result<Planned> {
         let sql = format!("SELECT * FROM \"{}\"", name.replace('"', "\"\""));
         self.plan_as_of(
@@ -1968,6 +2146,7 @@ impl Engine {
             caller,
             partitions,
             &AsOf::current().with(name, snapshot_id),
+            on_violation,
         )
         .await
     }
@@ -1979,7 +2158,8 @@ impl Engine {
     /// is audited and returned as `query` would return it. What the executor does with the
     /// batches is its own: no envelope is made, since no answer is formed here.
     pub async fn plan(&self, sql: &str, caller: &Caller) -> Result<Planned> {
-        self.plan_for(sql, caller, None).await
+        self.plan_for(sql, caller, None, OnReadViolation::default())
+            .await
     }
 
     /// [`Engine::plan`] for `partitions` partitions, when given, instead of one per core. An
@@ -1987,13 +2167,19 @@ impl Engine {
     /// holds: every partition of a scan, an exchange or a merge runs at once and holds its own
     /// batches, so the partition count is what bounds the plan's memory outside its operators'
     /// pool. The answer does not depend on it.
+    ///
+    /// Rows that break a contract's row rules never leave its view: under
+    /// [`OnReadViolation::Exclude`] the plan leaves them out and each resolution counts them
+    /// per rule ([`Resolution::excluded`]); under [`OnReadViolation::Refuse`] a read of data
+    /// that holds any is refused.
     pub async fn plan_for(
         &self,
         sql: &str,
         caller: &Caller,
         partitions: Option<usize>,
+        on_violation: OnReadViolation,
     ) -> Result<Planned> {
-        self.plan_as_of(sql, caller, partitions, &AsOf::current())
+        self.plan_as_of(sql, caller, partitions, &AsOf::current(), on_violation)
             .await
     }
 
@@ -2004,9 +2190,13 @@ impl Engine {
         caller: &Caller,
         partitions: Option<usize>,
         as_of: &AsOf,
+        on_violation: OnReadViolation,
     ) -> Result<Planned> {
         let started = Instant::now();
-        let out = match self.prepare(sql, caller, partitions, as_of).await {
+        let out = match self
+            .prepare(sql, caller, partitions, as_of, on_violation)
+            .await
+        {
             Ok(p) => self.planned(p, caller).await,
             Err(e) => Err(e),
         };
@@ -2033,22 +2223,27 @@ impl Engine {
     }
 
     /// Run SQL in which every table is a contract.
+    /// Rows that break a contract's row rules are left out, and counted in the envelope
+    /// ([`Resolution::excluded`]).
     pub async fn query(&self, sql: &str, caller: &Caller) -> Result<QueryResult> {
-        self.query_as_of(sql, caller, &AsOf::current()).await
+        self.query_as_of(sql, caller, &AsOf::current(), OnReadViolation::default())
+            .await
     }
 
     /// [`Engine::query`] with the contracts `as_of` names read as of their snapshots: each
     /// under its rules, over the data of that snapshot, with that snapshot's facts deciding
-    /// its guarantees. The envelope names each snapshot read.
+    /// its guarantees. The envelope names each snapshot read. Rows that break a contract's
+    /// row rules are dealt with as `on_violation` says (see [`Engine::plan_for`]).
     pub async fn query_as_of(
         &self,
         sql: &str,
         caller: &Caller,
         as_of: &AsOf,
+        on_violation: OnReadViolation,
     ) -> Result<QueryResult> {
         let started = Instant::now();
         let audit_id = Uuid::new_v4();
-        let out = self.run(sql, caller, audit_id, as_of).await;
+        let out = self.run(sql, caller, audit_id, as_of, on_violation).await;
         let (outcome, rows, charges, contracts) = match &out {
             Ok(r) => (
                 Outcome::Answered,
@@ -2068,10 +2263,15 @@ impl Engine {
     }
 
     #[cfg(feature = "flight")]
-    pub(crate) async fn query_spooled(&self, sql: &str, caller: &Caller) -> Result<SpoolResult> {
+    pub(crate) async fn query_spooled(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        on_violation: OnReadViolation,
+    ) -> Result<SpoolResult> {
         let started = Instant::now();
         let audit_id = Uuid::new_v4();
-        let out = self.spool(sql, caller, audit_id).await;
+        let out = self.spool(sql, caller, audit_id, on_violation).await;
         let (outcome, rows, charges, contracts) = match &out {
             Ok(r) => (
                 Outcome::Answered,
@@ -2091,12 +2291,20 @@ impl Engine {
     }
 
     #[cfg(feature = "flight")]
-    async fn spool(&self, sql: &str, caller: &Caller, audit_id: Uuid) -> Result<SpoolResult> {
+    async fn spool(
+        &self,
+        sql: &str,
+        caller: &Caller,
+        audit_id: Uuid,
+        on_violation: OnReadViolation,
+    ) -> Result<SpoolResult> {
         use datafusion::arrow::ipc::{reader::StreamReader, writer::StreamWriter};
         use futures::StreamExt;
         use sha2::{Digest, Sha256};
         use std::io::{Read, Seek, SeekFrom};
-        let prepared = self.prepare(sql, caller, None, &AsOf::current()).await?;
+        let prepared = self
+            .prepare(sql, caller, None, &AsOf::current(), on_violation)
+            .await?;
         let planned = self.planned(prepared, caller).await?;
         std::fs::create_dir_all(&self.spool_root)?;
         let mut file = tempfile::tempfile_in(&self.spool_root)?;
@@ -2205,8 +2413,9 @@ impl Engine {
         caller: &Caller,
         audit_id: Uuid,
         as_of: &AsOf,
+        on_violation: OnReadViolation,
     ) -> Result<QueryResult> {
-        let p = self.prepare(sql, caller, None, as_of).await?;
+        let p = self.prepare(sql, caller, None, as_of, on_violation).await?;
         if let Some(batches) = self.cache.as_ref().and_then(|c| c.get(&p.cache_key)) {
             let rows = batches.iter().map(|b| b.num_rows()).sum();
             let envelope = Envelope {

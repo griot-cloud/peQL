@@ -13,10 +13,19 @@ pub enum PeqlError {
     Denied { contract: String, rule: String },
     #[error("`{contract}` has no data yet; write to it first")]
     NotWritten { contract: String },
+    /// The deny-level guarantees the data broke when they were last decided.
     #[error("`{contract}` is not servable: {}", .breached.join(", "))]
     NotServable {
         contract: String,
         breached: Vec<String>,
+    },
+    /// Rows that break the contract's row rules, refused by a write or a read that refuses
+    /// them ([`crate::OnWriteViolation::Refuse`], [`crate::OnReadViolation::Refuse`]): each
+    /// rule broken, in the contract's order, and how many rows broke it.
+    #[error("`{contract}` refused rows that break its rules: {}", crate::violation::describe(.violations))]
+    Violated {
+        contract: String,
+        violations: Vec<(String, u64)>,
     },
     #[error("`{contract}` guarantee `{rule}` does not hold")]
     GuaranteeFailed { contract: String, rule: String },
@@ -50,6 +59,7 @@ impl PeqlError {
             self,
             PeqlError::Denied { .. }
                 | PeqlError::NotServable { .. }
+                | PeqlError::Violated { .. }
                 | PeqlError::GuaranteeFailed { .. }
                 | PeqlError::BudgetExhausted { .. }
                 | PeqlError::Refused { .. }
@@ -63,6 +73,12 @@ pub type Result<T> = std::result::Result<T, PeqlError>;
 impl From<String> for PeqlError {
     fn from(s: String) -> Self {
         PeqlError::Invalid(s)
+    }
+}
+
+impl From<datafusion::arrow::error::ArrowError> for PeqlError {
+    fn from(e: datafusion::arrow::error::ArrowError) -> Self {
+        PeqlError::DataFusion(e.into())
     }
 }
 

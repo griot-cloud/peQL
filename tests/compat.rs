@@ -11,7 +11,7 @@ use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::display::array_value_to_string;
 use peql::audit::{MemoryAudit, Outcome};
-use peql::{Caller, Engine, PeqlError, WriteMode};
+use peql::{Caller, Engine, OnWriteViolation, PeqlError, WriteMode};
 
 const ORDERS: &str = r#"
 contract: sales/orders
@@ -112,9 +112,14 @@ async fn engine(dir: &std::path::Path, audit: Arc<MemoryAudit>) -> Engine {
     e.register_contract(ORDERS, &schema())
         .unwrap_or_else(|x| panic!("{x}"));
     e.publish("sales/orders", "globex").unwrap();
-    e.write("sales/orders", vec![batch()], WriteMode::Overwrite)
-        .await
-        .unwrap();
+    e.write(
+        "sales/orders",
+        vec![batch()],
+        WriteMode::Overwrite,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     e
 }
 
@@ -531,8 +536,13 @@ async fn the_cache_never_crosses_callers_or_writes() {
     assert!(!alice.envelope.cached);
     assert_eq!(rows(&alice.batches)[0]["email"], "user1@x.io");
     // A write changes the data hash: the next answer is fresh.
-    e.write("sales/orders", vec![batch()], WriteMode::Append)
-        .await
-        .unwrap();
+    e.write(
+        "sales/orders",
+        vec![batch()],
+        WriteMode::Append,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     assert!(!e.query(sql, &globex()).await.unwrap().envelope.cached);
 }
