@@ -2,7 +2,7 @@
 
 ## Write report
 
-`Engine.write` returns a dictionary with `rows_written: int`, `files: int` and `verdict: dict`. `files` counts the dataset's files after the write, including existing files when appending.
+`Engine.write` returns a dictionary with `rows_written: int`, `files: list`, `verdict: dict` and `table: dict | None` (the dataset's `row_count` and `null_counts` after the write). `files` lists the files the write added, and `verdict` covers the rows written.
 
 ## Validation verdict
 
@@ -14,7 +14,7 @@
 | `row_count` | Number of rows evaluated. |
 | `failures` | Failure counts keyed by assertion id. |
 | `breached` | Contract requirements that failed. |
-| `guarantees` | Results of dataset-level guarantees. |
+| `guarantees` | Results of dataset-level guarantees, decided only by `validate`; empty in a write's verdict. |
 | `stats` | Computed statistics used by rules. |
 | `data_hash` | Hash of the validated data. |
 

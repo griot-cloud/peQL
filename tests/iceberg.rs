@@ -175,7 +175,15 @@ async fn an_append_makes_a_snapshot_whose_parent_is_the_previous_one() {
         .unwrap();
     let commit = second.snapshot.unwrap();
     assert_eq!(commit.parent_snapshot_id, Some(first.snapshot_id));
-    assert_eq!(second.verdict.row_count, 40);
+    // The report is the append's own rows; the snapshot's facts are the table's.
+    assert_eq!(second.verdict.row_count, 20);
+    let facts = s
+        .engine
+        .manifest_as_of("demo/readings", commit.snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(facts.row_count, 40);
 
     let t = table(&s.catalog, "readings").await;
     assert_eq!(t.metadata().current_snapshot_id(), Some(commit.snapshot_id));
@@ -384,7 +392,7 @@ async fn each_snapshot_keeps_its_own_facts() {
     assert_eq!(m1.data_hash, first.verdict.data_hash);
     assert_eq!(m2.data_hash, second.verdict.data_hash);
     assert_ne!(m1.data_hash, m2.data_hash);
-    assert_eq!(m1.files.len(), first.files);
+    assert_eq!(m1.files, first.files);
     // The current facts are the current snapshot's.
     assert_eq!(engine.manifest("demo/readings").unwrap().unwrap(), m2);
 
@@ -1215,7 +1223,17 @@ async fn compaction_commits_over_appends_that_land_while_it_runs_and_keeps_their
     assert_eq!(commit.parent_snapshot_id, Some(appended[1]));
     assert_eq!(report.rows_written, 6, "the rows of the snapshot read");
     assert!(report.verdict.valid);
-    assert_eq!(report.verdict.verdict.row_count, 10);
+    assert_eq!(report.verdict.verdict.row_count, 6, "the rows rewritten");
+    let facts = engine
+        .manifest_as_of("demo/plain", report.snapshot.unwrap().snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        facts.row_count, 10,
+        "the table's rows, appended ones among them"
+    );
+    assert_eq!(facts.files.len(), 3);
 
     let t = table(&catalog.inner, "plain").await;
     assert_eq!(t.metadata().current_snapshot_id(), Some(commit.snapshot_id));
@@ -1496,4 +1514,657 @@ async fn a_column_another_writer_added_with_another_type_is_refused_by_name() {
     }
     let t = table(&catalog.inner, "plain").await;
     assert_eq!(t.metadata().schemas_iter().count(), 2);
+}
+
+/// An Iceberg storage over the local filesystem that records every path whose bytes are read.
+mod counting {
+    use std::sync::{Arc, Mutex};
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures::stream::BoxStream;
+    use iceberg::io::{
+        FileMetadata, FileRead, FileWrite, InputFile, LocalFsStorage, OutputFile, Storage,
+        StorageConfig, StorageFactory,
+    };
+    use serde::{Deserialize, Serialize};
+
+    /// Every path read, in order, by any table on a [`CountingStorageFactory`].
+    pub static READS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    fn read(path: &str) {
+        READS.lock().unwrap().push(path.to_owned());
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct CountingStorage {
+        inner: LocalFsStorage,
+    }
+
+    #[async_trait]
+    #[typetag::serde(name = "peql_test_counting_storage")]
+    impl Storage for CountingStorage {
+        async fn exists(&self, path: &str) -> iceberg::Result<bool> {
+            self.inner.exists(path).await
+        }
+        async fn metadata(&self, path: &str) -> iceberg::Result<FileMetadata> {
+            self.inner.metadata(path).await
+        }
+        async fn read(&self, path: &str) -> iceberg::Result<Bytes> {
+            read(path);
+            self.inner.read(path).await
+        }
+        async fn reader(&self, path: &str) -> iceberg::Result<Box<dyn FileRead>> {
+            read(path);
+            self.inner.reader(path).await
+        }
+        async fn write(&self, path: &str, bs: Bytes) -> iceberg::Result<()> {
+            self.inner.write(path, bs).await
+        }
+        async fn writer(&self, path: &str) -> iceberg::Result<Box<dyn FileWrite>> {
+            self.inner.writer(path).await
+        }
+        async fn delete(&self, path: &str) -> iceberg::Result<()> {
+            self.inner.delete(path).await
+        }
+        async fn delete_prefix(&self, path: &str) -> iceberg::Result<()> {
+            self.inner.delete_prefix(path).await
+        }
+        async fn delete_stream(&self, paths: BoxStream<'static, String>) -> iceberg::Result<()> {
+            self.inner.delete_stream(paths).await
+        }
+        fn new_input(&self, path: &str) -> iceberg::Result<InputFile> {
+            Ok(InputFile::new(Arc::new(self.clone()), path.to_owned()))
+        }
+        fn new_output(&self, path: &str) -> iceberg::Result<OutputFile> {
+            Ok(OutputFile::new(Arc::new(self.clone()), path.to_owned()))
+        }
+    }
+
+    #[derive(Debug, Serialize, Deserialize)]
+    pub struct CountingStorageFactory;
+
+    #[typetag::serde(name = "peql_test_counting_storage_factory")]
+    impl StorageFactory for CountingStorageFactory {
+        fn build(&self, _config: &StorageConfig) -> iceberg::Result<Arc<dyn Storage>> {
+            Ok(Arc::new(CountingStorage::default()))
+        }
+    }
+}
+
+/// The paths of `warehouse` read while `f` runs.
+async fn reads_while<T>(
+    warehouse: &str,
+    f: impl std::future::Future<Output = T>,
+) -> (T, Vec<String>) {
+    counting::READS.lock().unwrap().clear();
+    let out = f.await;
+    let reads = counting::READS
+        .lock()
+        .unwrap()
+        .drain(..)
+        .filter(|p| p.contains(warehouse))
+        .collect();
+    (out, reads)
+}
+
+/// An append to a table of many snapshots reads none of its data files, footers or
+/// manifests, and validates none of its rows: what it reads (the table's metadata, the
+/// parent's manifest list and the parent's facts) is the same whatever the table holds.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_append_reads_nothing_of_the_table_it_did_not_write() {
+    use iceberg::CatalogBuilder;
+    use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
+    let dir = tempfile::tempdir().unwrap();
+    let warehouse = dir.path().join("warehouse");
+    std::fs::create_dir_all(&warehouse).unwrap();
+    let catalog = MemoryCatalogBuilder::default()
+        .with_storage_factory(Arc::new(counting::CountingStorageFactory))
+        .load(
+            "peql-counting",
+            std::collections::HashMap::from([(
+                MEMORY_CATALOG_WAREHOUSE.to_string(),
+                warehouse.display().to_string(),
+            )]),
+        )
+        .await
+        .unwrap();
+    catalog
+        .create_namespace(
+            &iceberg::NamespaceIdent::new("demo".into()),
+            std::collections::HashMap::new(),
+        )
+        .await
+        .unwrap();
+    let catalog: Arc<dyn Catalog> = Arc::new(catalog);
+    let engine =
+        Engine::in_memory(dir.path()).with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    engine.register_contract(&readings(), &schema()).unwrap();
+    let warehouse = warehouse.display().to_string();
+
+    let append = |from: i64| {
+        let engine = &engine;
+        async move {
+            engine
+                .write(
+                    "demo/readings",
+                    vec![batch(from, from + 9)],
+                    WriteMode::Append,
+                )
+                .await
+                .unwrap()
+        }
+    };
+    for i in 0..3 {
+        append(i * 10 + 1).await;
+    }
+    let (small, small_reads) = reads_while(&warehouse, append(31)).await;
+    for i in 4..16 {
+        append(i * 10 + 1).await;
+    }
+    let t = table(&catalog, "readings").await;
+    let current = t.metadata().current_snapshot_id().unwrap();
+    assert!(snapshot_paths(&t, current).await.len() >= 2 * 16);
+    let (big, big_reads) = reads_while(&warehouse, append(161)).await;
+
+    for p in &big_reads {
+        let name = p.rsplit('/').next().unwrap();
+        assert!(!p.ends_with(".parquet"), "read a data file: {p}");
+        assert!(
+            !name.ends_with(".avro") || name.starts_with("snap-"),
+            "read a manifest: {p}"
+        );
+    }
+    // The parent's facts are read; no other snapshot's.
+    let parent = big.snapshot.unwrap().parent_snapshot_id.unwrap();
+    for p in big_reads.iter().filter(|p| p.contains("/metadata/peql/")) {
+        assert!(
+            p.contains(&format!("/metadata/peql/{parent}/"))
+                || p.contains("/metadata/peql/writes/"),
+            "read the facts of another snapshot: {p}"
+        );
+    }
+    assert_eq!(
+        small_reads.len(),
+        big_reads.len(),
+        "an append to 4 snapshots read {small_reads:#?}; to 16, {big_reads:#?}"
+    );
+
+    // The report is the append's; the facts are the table's.
+    assert_eq!((small.rows_written, big.rows_written), (10, 10));
+    assert_eq!(big.verdict.row_count, 10);
+    assert_eq!(big.verdict.failures["non_negative"], 1);
+    assert_eq!(big.verdict.data_hash, peql::manifest::data_hash(&big.files));
+    let facts = engine.manifest("demo/readings").unwrap().unwrap();
+    assert_eq!(facts.row_count, 170);
+    assert_eq!(facts.failures["non_negative"], 17);
+    // And they are what a validation of the whole table finds.
+    let whole = engine.validate("demo/readings").await.unwrap();
+    assert_eq!(
+        (whole.row_count, &whole.failures, &whole.data_hash),
+        (facts.row_count, &facts.failures, &facts.data_hash)
+    );
+}
+
+/// A snapshot whose parent's facts are not recorded (its writer has not recorded them yet,
+/// or stopped before it did) takes them from the facts each write since recorded before it
+/// committed, back to the nearest snapshot with facts, and records them on the way.
+#[tokio::test(flavor = "multi_thread")]
+async fn missing_facts_are_rebuilt_from_the_writes_since_the_last_recorded() {
+    let s = setup().await;
+    let engine = &s.engine;
+    let mut snapshots = Vec::new();
+    for from in [1, 11, 21] {
+        let r = engine
+            .write(
+                "demo/readings",
+                vec![batch(from, from + 9)],
+                WriteMode::Append,
+            )
+            .await
+            .unwrap();
+        snapshots.push(r.snapshot.unwrap().snapshot_id);
+    }
+    let t = table(&s.catalog, "readings").await;
+    let root = t
+        .metadata()
+        .location()
+        .trim_start_matches("file://")
+        .trim_end_matches('/')
+        .to_owned();
+    for s in &snapshots[1..] {
+        std::fs::remove_dir_all(format!("{root}/metadata/peql/{s}")).unwrap();
+    }
+
+    let r = engine
+        .write("demo/readings", vec![batch(31, 40)], WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(r.verdict.row_count, 10);
+    let last = r.snapshot.unwrap().snapshot_id;
+    for s in &snapshots[1..] {
+        assert!(
+            std::path::Path::new(&format!("{root}/metadata/peql/{s}/demo__readings.json")).exists(),
+            "the facts of {s} are recorded again"
+        );
+    }
+    let facts = engine
+        .manifest_as_of("demo/readings", last)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(facts.row_count, 40);
+    let whole = engine.validate("demo/readings").await.unwrap();
+    assert_eq!(
+        (whole.row_count, &whole.failures, &whole.data_hash),
+        (40, &facts.failures, &facts.data_hash)
+    );
+}
+
+const UNIQUE: &str = r#"
+contract: demo/unique
+version: 1
+binding:
+  iceberg: demo.unique
+expose:
+  - {name: id, type: int64}
+  - {name: kwh, type: int64}
+rules:
+  - {id: everyone, op: decide, expr: "true"}
+  - {id: ids_unique, op: guarantee, expr: "dataset.id.distinct_count == dataset.row_count", on_fail: deny}
+  - {id: kwh_bounded, op: guarantee, expr: "dataset.kwh.max <= 1000", on_fail: deny}
+"#;
+
+/// Rules over the whole table are decided only by validating it: no write decides one, and
+/// no read is refused because one is undecided. The facts keep each one's last decision, the
+/// snapshot it was made on and its outcome, carried forward unchanged by later appends; a
+/// deny-level one that failed when last decided makes the table not servable until a
+/// validation finds it holding. Statistics that combine are kept up to date by every write.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_over_the_whole_table_are_decided_only_by_validate() {
+    let s = setup().await;
+    let engine = &s.engine;
+    let cols = [("id", DataType::Int64), ("kwh", DataType::Int64)];
+    engine
+        .register_contract(UNIQUE, &plain(&cols, &[]).schema())
+        .unwrap();
+    let everyone = Caller::new("x", "demo", "any");
+    let read = || engine.query(r#"SELECT id FROM "demo/unique""#, &everyone);
+    let append = |ids: &'static [i64]| {
+        engine.write("demo/unique", vec![plain(&cols, ids)], WriteMode::Append)
+    };
+    let facts = || engine.manifest("demo/unique").unwrap().unwrap();
+
+    // Writes decide nothing about the table: its rules are undecided, and it is served.
+    let r = append(&[1, 2]).await.unwrap();
+    assert!(r.verdict.guarantees.is_empty());
+    append(&[2]).await.unwrap();
+    assert!(facts().guarantees.is_empty(), "{:?}", facts().guarantees);
+    assert!(facts().valid);
+    assert_eq!(ids(&read().await.unwrap().batches), [1, 2, 2]);
+
+    // A validation decides them, of the snapshot it validates.
+    let whole = engine.validate("demo/unique").await.unwrap();
+    let decided_on = whole.snapshot_id.unwrap();
+    assert_eq!(whole.breached, ["ids_unique"]);
+    let checked = facts().guarantees;
+    assert_eq!(
+        (
+            checked["ids_unique"].holds,
+            checked["ids_unique"].snapshot_id
+        ),
+        (false, Some(decided_on))
+    );
+    assert_eq!(
+        (
+            checked["kwh_bounded"].holds,
+            checked["kwh_bounded"].snapshot_id
+        ),
+        (true, Some(decided_on))
+    );
+    assert!(matches!(read().await, Err(PeqlError::NotServable { .. })));
+
+    // An append carries the decisions forward unchanged, even past a bound it breaks; the
+    // maximum it changes is kept up to date, and judged by nothing.
+    let r = append(&[20]).await.unwrap();
+    assert!(r.verdict.valid);
+    let after = facts();
+    assert_eq!(after.guarantees, checked);
+    assert_eq!(after.stats["kwh__max"], serde_json::json!(2000));
+    assert!(!after.stats.contains_key("id__distinct_count"));
+    assert_eq!(after.breached, ["ids_unique"]);
+
+    // The next validation decides again, of the snapshot it validates.
+    let whole = engine.validate("demo/unique").await.unwrap();
+    assert_eq!(whole.breached, ["ids_unique", "kwh_bounded"]);
+    let now = facts().guarantees;
+    assert_eq!(now["kwh_bounded"].snapshot_id, whole.snapshot_id);
+    assert!(!now["kwh_bounded"].holds);
+}
+
+/// A compaction followed by a validation in the same engine, as a host's table maintenance
+/// runs them: the validation decides the compacted snapshot, records each decision in that
+/// snapshot's facts, and appends after carry them forward unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validation_after_a_compaction_decides_the_compacted_snapshot() {
+    let s = setup().await;
+    let engine = &s.engine;
+    let cols = [("id", DataType::Int64), ("kwh", DataType::Int64)];
+    engine
+        .register_contract(UNIQUE, &plain(&cols, &[]).schema())
+        .unwrap();
+    for ids in [[1, 2], [3, 4], [5, 6]] {
+        engine
+            .write("demo/unique", vec![plain(&cols, &ids)], WriteMode::Append)
+            .await
+            .unwrap();
+    }
+    let compacted = engine
+        .compact("demo/unique", u64::MAX, 2)
+        .await
+        .unwrap()
+        .expect("three small files are compacted")
+        .snapshot
+        .unwrap()
+        .snapshot_id;
+    // The compaction decides nothing either.
+    let facts = engine
+        .manifest_as_of("demo/unique", compacted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(facts.guarantees.is_empty());
+    assert_eq!(facts.row_count, 6);
+
+    let whole = engine.validate("demo/unique").await.unwrap();
+    assert_eq!(whole.snapshot_id, Some(compacted));
+    assert!(whole.valid, "{:?}", whole.breached);
+    let facts = engine
+        .manifest_as_of("demo/unique", compacted)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in ["ids_unique", "kwh_bounded"] {
+        let k = &facts.guarantees[id];
+        assert_eq!((k.holds, k.snapshot_id), (true, Some(compacted)), "{id}");
+    }
+    let r = engine
+        .write("demo/unique", vec![plain(&cols, &[7])], WriteMode::Append)
+        .await
+        .unwrap();
+    let after = engine
+        .manifest_as_of("demo/unique", r.snapshot.unwrap().snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.guarantees, facts.guarantees);
+    assert_eq!(after.row_count, 7);
+}
+
+/// Engines writing under different compilations of one contract name share the table: a
+/// reader under one compilation does not combine the facts another compilation's writes
+/// recorded; it validates the snapshot whole under its own and reads every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_under_another_compilation_validates_rather_than_combining() {
+    let s = setup().await;
+    s.engine
+        .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
+        .await
+        .unwrap();
+    // Another engine writes under a second form of the same contract.
+    let second = readings()
+        .replace("version: 1", "version: 2")
+        .replace(
+            "  - {id: non_negative,",
+            "  - {id: kwh_known, op: assert, expr: \"has(row.kwh)\", on_fail: report}\n  - {id: non_negative,",
+        );
+    let other = Engine::in_memory(s._dir.path().join("two"))
+        .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+    other.register_contract(&second, &schema()).unwrap();
+    assert_ne!(
+        other
+            .get("demo/readings")
+            .unwrap()
+            .compilation
+            .contract
+            .compilation_hash,
+        s.engine
+            .get("demo/readings")
+            .unwrap()
+            .compilation
+            .contract
+            .compilation_hash
+    );
+    for from in [21, 31] {
+        other
+            .write(
+                "demo/readings",
+                vec![batch(from, from + 9)],
+                WriteMode::Append,
+            )
+            .await
+            .unwrap();
+    }
+    // A fresh engine under the first form.
+    let reader = Engine::in_memory(s._dir.path().join("three"))
+        .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+    reader.register_contract(&readings(), &schema()).unwrap();
+    let res = reader
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(40));
+    let facts = reader.manifest("demo/readings").unwrap().unwrap();
+    assert_eq!(facts.row_count, 40);
+    assert_eq!(
+        facts.compilation_hash,
+        reader
+            .get("demo/readings")
+            .unwrap()
+            .compilation
+            .contract
+            .compilation_hash
+    );
+}
+
+/// The facts an earlier peQL recorded for a snapshot (the bytes a b9002f7 write recorded, in
+/// its format) are not recorded facts here. A write over them commits and records its own
+/// facts, and the table's facts stay unrecorded rather than rebuilt by the write; a read is
+/// answered, validating the snapshot once and recording its facts; a validation rebuilds them
+/// as a validation of the whole computes them. Facts in this format that do not decode are
+/// refused, naming the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
+    let s = setup().await;
+    let first = s
+        .engine
+        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap()
+        .snapshot_id;
+    let t = table(&s.catalog, "readings").await;
+    let root = t
+        .metadata()
+        .location()
+        .trim_start_matches("file://")
+        .trim_end_matches('/')
+        .to_owned();
+    // As an earlier peQL left the table: its snapshot's facts in that format, no write facts.
+    std::fs::write(
+        format!("{root}/metadata/peql/{first}/demo__readings.json"),
+        include_bytes!("fixtures/facts-b9002f7/iceberg-snapshot-facts.json"),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(format!("{root}/metadata/peql/writes")).unwrap();
+    let fresh = |name: &str| {
+        let e = Engine::in_memory(s._dir.path().join(name))
+            .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+        e.register_contract(&readings(), &schema()).unwrap();
+        e
+    };
+    let engine = fresh("upgraded");
+    assert!(
+        engine
+            .manifest_as_of("demo/readings", first)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let r = engine
+        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(r.verdict.row_count, 10);
+    assert_eq!(r.table, None, "the table's facts are not recorded");
+    let second = r.snapshot.unwrap().snapshot_id;
+    let t = table(&s.catalog, "readings").await;
+    let write_id = &t
+        .metadata()
+        .snapshot_by_id(second)
+        .unwrap()
+        .summary()
+        .additional_properties[peql::iceberg_table::SUMMARY_WRITE_ID];
+    assert!(
+        std::path::Path::new(&format!(
+            "{root}/metadata/peql/writes/{write_id}/demo__readings.json"
+        ))
+        .exists()
+    );
+    let facts_of_second = format!("{root}/metadata/peql/{second}/demo__readings.json");
+    assert!(!std::path::Path::new(&facts_of_second).exists());
+    assert!(
+        engine
+            .manifest_as_of("demo/readings", second)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let res = engine
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(50));
+    assert!(std::path::Path::new(&facts_of_second).exists());
+
+    let rebuilt = engine.validate("demo/readings").await.unwrap();
+    let plan = engine
+        .get("demo/readings")
+        .unwrap()
+        .compilation
+        .validation
+        .plan
+        .clone();
+    let whole = engine.validate_with("demo/readings", plan).await.unwrap();
+    let facts = engine.manifest("demo/readings").unwrap().unwrap();
+    assert_eq!(
+        (facts.row_count, &facts.failures, &facts.data_hash),
+        (whole.row_count, &whole.failures, &whole.data_hash)
+    );
+    assert_eq!(rebuilt.data_hash, whole.data_hash);
+    assert_eq!(facts.row_count, 50);
+
+    // Corrupt facts are refused, by name.
+    let this_format = format!(
+        "{{\"format\": {}, \"contract\": 7}}",
+        peql::manifest::FACTS_FORMAT
+    );
+    for corrupt in [this_format.as_bytes(), &b"{ not json"[..]] {
+        std::fs::write(&facts_of_second, corrupt).unwrap();
+        match fresh("reader")
+            .query(r#"SELECT id FROM "demo/readings""#, &owner())
+            .await
+        {
+            Err(PeqlError::Invalid(m)) => assert!(m.contains(&facts_of_second), "{m}"),
+            other => panic!("{:?}", other.map(|r| r.envelope.rows)),
+        }
+    }
+}
+
+/// `a` with a null every third id, `b` with none.
+fn plain_with_nulls(ids: &[i64]) -> RecordBatch {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a", DataType::Utf8, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|i| (i % 3 != 0).then(|| format!("a{i}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("b{i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// A write reports the table's row count and per-column null counts after it, from the
+/// facts it left: after two appends, what a validation of the whole table finds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_reports_the_tables_rows_and_nulls_from_its_facts() {
+    let s = setup().await;
+    let engine = &s.engine;
+    engine
+        .register_contract(PLAIN_V1, &plain_with_nulls(&[]).schema())
+        .unwrap();
+    let first = engine
+        .write(
+            "demo/plain",
+            vec![plain_with_nulls(&[1, 2, 3, 4])],
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+    let t = first.table.unwrap();
+    assert_eq!((t.row_count, t.null_counts["a"]), (4, 1));
+    let second = engine
+        .write(
+            "demo/plain",
+            vec![plain_with_nulls(&[5, 6, 7, 8, 9])],
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+    let reported = second.table.unwrap();
+    assert_eq!(reported.row_count, 9);
+    assert_eq!(
+        reported.null_counts,
+        [("a", 3), ("b", 0), ("id", 0)]
+            .map(|(c, n)| (c.to_owned(), n))
+            .into()
+    );
+    engine.validate("demo/plain").await.unwrap();
+    let whole = engine
+        .manifest("demo/plain")
+        .unwrap()
+        .unwrap()
+        .table_stats(["id", "a", "b"]);
+    assert_eq!(reported, whole);
+    let counted = engine
+        .query(
+            r#"SELECT COUNT(*) AS n, COUNT(*) - COUNT(a) AS a_nulls FROM "demo/plain""#,
+            &Caller::new("x", "demo", "any"),
+        )
+        .await
+        .unwrap();
+    let col = |name: &str| {
+        counted.batches[0]
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!((col("n"), col("a_nulls")), (9, 3));
 }

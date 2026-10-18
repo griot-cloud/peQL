@@ -38,14 +38,16 @@ use crate::budget::BudgetStore;
 use crate::cache::{CacheKey, QueryCache};
 use crate::envelope::{Asker, Attestation, Envelope, EnvelopeSigner, Resolution, ScanStats};
 use crate::error::{PeqlError, Result};
+use crate::facts::{self, WriteFacts, Written};
 use crate::functions::FunctionStore;
 use crate::gate::{BoundTable, Gate, GateBarrier, GatedQueryPlanner, ensure_gated};
 use crate::guard;
-use crate::manifest::Manifest;
+use crate::manifest::{self, FileEntry, Manifest, TableStats};
 use crate::shape::SuppressExec;
 use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered, Stale};
 
-/// The validation verdict, with the hash of the data it describes.
+/// The validation verdict, with the hash of the data it describes: the whole data, for a
+/// validation; the rows written and the files they were written to, for a write.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Verdict {
     #[serde(flatten)]
@@ -63,14 +65,22 @@ impl std::ops::Deref for Verdict {
     }
 }
 
+/// What one write did: the rows it wrote, the files it added, and the verdict of the
+/// contract's row rules over those rows, whose hash is over those files.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct WriteReport {
     pub rows_written: usize,
-    pub files: usize,
+    /// The data files the write added, by path under the binding (an Iceberg table's
+    /// location), with their rows, flags and hashes.
+    pub files: Vec<FileEntry>,
     pub verdict: Verdict,
     /// The snapshot the write committed, for a table with snapshots (Iceberg).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotCommit>,
+    /// The data's row count and per-column null counts after the write, from its facts as
+    /// the write left them (an Iceberg snapshot's, for the snapshot committed); `None` when
+    /// those facts are not recorded, as for data whose facts are to be rebuilt.
+    pub table: Option<TableStats>,
 }
 
 /// The snapshot a write committed to a table with snapshots, and the one it followed.
@@ -135,16 +145,29 @@ enum Bound {
 pub struct Writing {
     reg: Arc<Registered>,
     location: Location,
+    written: Written,
     rows: AtomicUsize,
     /// The in-memory bytes of the parts written so far, for the width of a row.
     bytes: AtomicUsize,
-    /// An overwrite whose old files are still there.
-    overwrite: tokio::sync::Mutex<bool>,
     /// What one part may hold while it is written, when the writer bounds it.
     memory: Option<usize>,
+    /// Where the parts of a write to Parquet files land, until [`Engine::finish_write`]
+    /// publishes them: only this write's files are there.
+    staged: Option<Staged>,
     /// A write to an Iceberg table, which [`Engine::finish_write`] commits as one snapshot.
     #[cfg(feature = "iceberg")]
     iceberg: Option<crate::iceberg_table::IcebergWrite>,
+    /// The files of the snapshot a rewrite replaces, by path under the table's location.
+    removed: Vec<String>,
+}
+
+/// A directory of one write's files, removed with the write.
+struct Staged(PathBuf);
+
+impl Drop for Staged {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Writing {
@@ -176,6 +199,17 @@ impl Writing {
     fn row_bytes(&self) -> usize {
         let rows = self.rows.load(Ordering::SeqCst).max(1);
         (self.bytes.load(Ordering::SeqCst) / rows).max(1)
+    }
+
+    /// The local directory this write's files land in, and only its files.
+    fn dir(&self) -> Result<&Path> {
+        #[cfg(feature = "iceberg")]
+        if let Some(iw) = &self.iceberg {
+            return Ok(iw.dir());
+        }
+        self.staged.as_ref().map(|s| s.0.as_path()).ok_or_else(|| {
+            PeqlError::Invalid(format!("`{}` was not begun as a write", self.contract()))
+        })
     }
 }
 
@@ -257,9 +291,8 @@ pub struct Engine {
     frozen: AsOf,
     #[cfg(feature = "flight")]
     spool_root: PathBuf,
-    /// Where a write to an Iceberg table that is not on this filesystem lands its data files
-    /// before they go to the table through its `FileIO`.
-    #[cfg(feature = "iceberg")]
+    /// Where a write lands its data files before they go to an object store, or to an
+    /// Iceberg table that is not on this filesystem.
     staging_root: PathBuf,
 }
 
@@ -272,7 +305,6 @@ impl Engine {
         Ok(Engine {
             #[cfg(feature = "flight")]
             spool_root: root.join("_peql/flight"),
-            #[cfg(feature = "iceberg")]
             staging_root: root.join("_peql/staging"),
             store: Arc::new(DirStore::open(root)?),
             functions: Arc::new(FunctionStore::open(root)?),
@@ -300,7 +332,6 @@ impl Engine {
         Engine {
             #[cfg(feature = "flight")]
             spool_root: base.join("_peql/flight"),
-            #[cfg(feature = "iceberg")]
             staging_root: base.join("_peql/staging"),
             store: Arc::new(MemoryStore::default()),
             functions: Arc::new(FunctionStore::in_memory()),
@@ -505,31 +536,12 @@ impl Engine {
     /// Serve a contract from a table instead of its binding's files. Its manifest is computed
     /// now, by validating the table.
     pub async fn bind_table(&self, name: &str, table: Arc<dyn TableProvider>) -> Result<Verdict> {
-        let reg = self.get(name)?;
+        self.get(name)?;
         self.tables
             .write()
             .expect("lock")
             .insert(name.to_owned(), table);
-        let verdict = self.validate(name).await?;
-        let cc = &reg.compilation.contract;
-        self.table_manifests.write().expect("lock").insert(
-            name.to_owned(),
-            Manifest {
-                contract: cc.name.clone(),
-                contract_hash: cc.contract_hash.clone(),
-                compilation_hash: cc.compilation_hash.clone(),
-                written_at: Utc::now(),
-                row_count: verdict.verdict.row_count,
-                valid: verdict.verdict.valid,
-                breached: verdict.verdict.breached.clone(),
-                stats: verdict.verdict.stats.clone(),
-                data_hash: verdict.data_hash.clone(),
-                row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
-                files: Vec::new(),
-                snapshot_id: None,
-            },
-        );
-        Ok(verdict)
+        self.validate(name).await
     }
 
     /// Serve a contract from record batches held in memory.
@@ -582,7 +594,8 @@ impl Engine {
     }
 
     /// What a contract bound to a table with snapshots (Iceberg) knows about one snapshot's
-    /// data, as recorded with that snapshot; `None` when nothing has been recorded for it.
+    /// data: as recorded with that snapshot, or as its write's facts and its parent's give it
+    /// (and then recorded); `None` when neither is recorded.
     pub async fn manifest_as_of(&self, name: &str, snapshot_id: i64) -> Result<Option<Manifest>> {
         #[cfg(not(feature = "iceberg"))]
         let _ = snapshot_id;
@@ -599,7 +612,7 @@ impl Engine {
                         t.table
                     )));
                 }
-                t.load_facts(&table, snapshot_id, name).await
+                self.iceberg_facts(&t, &table, snapshot_id, &reg).await
             }
             _ => Err(no_snapshots(name)),
         }
@@ -617,9 +630,11 @@ impl Engine {
         }
     }
 
-    /// A contract registered over files written elsewhere has no manifest yet: make one. For
-    /// files in an object store, read the manifest again, since another engine may write there.
-    /// For an Iceberg table, read the facts of its current snapshot, or record them.
+    /// A contract registered over files written elsewhere has no manifest yet: make one, by
+    /// validating the whole data. For files in an object store, read the manifest again, since
+    /// another engine may write there. For an Iceberg table, read the facts of its current
+    /// snapshot, or take them from the writes since the last snapshot that has them, or, for
+    /// data peQL did not write under this contract, validate the snapshot whole.
     pub async fn ensure_manifest(&self, name: &str) -> Result<()> {
         let reg = self.get(name)?;
         match self.bound(&reg)? {
@@ -629,7 +644,7 @@ impl Engine {
                 {
                     return Ok(());
                 }
-                self.refresh(name, Utc::now()).await?;
+                self.refresh(name, Utc::now(), None).await?;
                 Ok(())
             }
             Bound::Files(Location::Object(o)) => {
@@ -639,7 +654,7 @@ impl Engine {
                         .expect("lock")
                         .insert(name.to_owned(), m);
                 } else if !o.list_files().await?.is_empty() {
-                    self.refresh(name, Utc::now()).await?;
+                    self.refresh(name, Utc::now(), None).await?;
                 }
                 Ok(())
             }
@@ -653,7 +668,7 @@ impl Engine {
                     self.iceberg_manifests.write().expect("lock").remove(name);
                     return Ok(());
                 };
-                match t.load_facts(&table, snapshot, name).await? {
+                match self.iceberg_facts(&t, &table, snapshot, &reg).await? {
                     Some(m) => {
                         self.iceberg_manifests
                             .write()
@@ -661,8 +676,7 @@ impl Engine {
                             .insert(name.to_owned(), m);
                     }
                     None => {
-                        self.refresh_in(name, Utc::now(), None, Some(snapshot))
-                            .await?;
+                        self.refresh(name, Utc::now(), Some(snapshot)).await?;
                     }
                 }
                 Ok(())
@@ -676,16 +690,14 @@ impl Engine {
         if let Some(m) = self.manifest_as_of(name, snapshot_id).await? {
             return Ok(m);
         }
-        Ok(self
-            .refresh_in(name, Utc::now(), None, Some(snapshot_id))
-            .await?
-            .1)
+        Ok(self.refresh(name, Utc::now(), Some(snapshot_id)).await?.1)
     }
 
     // ── write and validate ──────────────────────────────────────────────────
 
     /// Write batches under a contract (parcel design 10): enrich, compute flags and derived
-    /// columns, cluster and partition, stamp the contract hash, validate, write the manifest.
+    /// columns, cluster and partition, stamp the contract hash, validate the rows written,
+    /// publish them and record what the contract now knows of its data.
     /// One [`Engine::begin_write`], one [`Engine::write_part`], one [`Engine::finish_write`].
     pub async fn write(
         &self,
@@ -699,33 +711,28 @@ impl Engine {
     }
 
     /// Start a write under a contract that arrives in parts, as an out-of-core writer (Moruna's
-    /// `PeqlSink`) delivers it. With [`WriteMode::Overwrite`] the contract's files are removed
-    /// before the first part lands. The data is written by [`Engine::write_part`], as many times as there are parts,
-    /// and the manifest is refreshed once, by [`Engine::finish_write`]; until then the
-    /// manifest describes the data as it was.
+    /// `PeqlSink`) delivers it. The data is written by [`Engine::write_part`], as many times as
+    /// there are parts, into a directory of this write's own; [`Engine::finish_write`]
+    /// validates the rows written and publishes them. Until then nothing a reader reads has
+    /// changed.
     ///
     /// A contract bound to an Iceberg table is written to the table as it is when the write
     /// begins: the table is created if the catalog has none, and its schema made the columns
-    /// the contract writes. Nothing is removed: [`Engine::finish_write`] commits the parts'
-    /// files as one snapshot, which for an overwrite replaces the table's files and commits
-    /// only over the snapshot current here.
+    /// the contract writes. [`Engine::finish_write`] commits the parts' files as one snapshot,
+    /// which for an overwrite replaces the table's files and commits only over the snapshot
+    /// current here.
     pub async fn begin_write(&self, name: &str, mode: WriteMode) -> Result<Writing> {
-        self.begin(
-            name,
-            mode,
-            #[cfg(feature = "iceberg")]
-            None,
-        )
-        .await
+        self.begin(name, mode, None).await
     }
 
     /// [`Engine::begin_write`]; with `rewrite`, a write to an Iceberg table that replaces the
-    /// files of that snapshot with its own, which hold the same rows (a compaction).
+    /// files of that snapshot (named by their paths) with its own, which hold the same rows
+    /// (a compaction).
     async fn begin(
         &self,
         name: &str,
         mode: WriteMode,
-        #[cfg(feature = "iceberg")] rewrite: Option<i64>,
+        rewrite: Option<(i64, Vec<String>)>,
     ) -> Result<Writing> {
         if let Some(snapshot) = self.frozen.get(name) {
             return Err(PeqlError::Invalid(format!(
@@ -743,15 +750,33 @@ impl Engine {
                 "`{name}` binds a single file; bind a directory to write to it"
             )));
         }
-        if let Location::Local(root) = &location {
-            std::fs::create_dir_all(root)?;
-        }
+        let written = match (&rewrite, mode) {
+            (Some(_), _) => Written::Rewrite,
+            (None, WriteMode::Overwrite) => Written::Overwrite,
+            (None, WriteMode::Append) => Written::Append,
+        };
+        let staged = match &location {
+            // Beside the files, so publishing them is a rename; readers skip `_peql/`.
+            Location::Local(root) => {
+                Some(root.join("_peql/staging").join(Uuid::new_v4().to_string()))
+            }
+            Location::Object(_) => Some(self.staging_root.join(Uuid::new_v4().to_string())),
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(_) => None,
+        };
+        let staged = match staged {
+            Some(dir) => {
+                std::fs::create_dir_all(&dir)?;
+                Some(Staged(dir))
+            }
+            None => None,
+        };
         #[cfg(feature = "iceberg")]
         let iceberg = match &location {
             Location::Iceberg(t) => {
                 use crate::iceberg_table::WriteKind;
-                let kind = match (rewrite, mode) {
-                    (Some(of), _) => WriteKind::Rewrite(of),
+                let kind = match (&rewrite, mode) {
+                    (Some((of, _)), _) => WriteKind::Rewrite(*of),
                     (None, WriteMode::Overwrite) => WriteKind::Overwrite,
                     (None, WriteMode::Append) => WriteKind::Append,
                 };
@@ -760,58 +785,36 @@ impl Engine {
                         .await?,
                 )
             }
-            _ => {
-                if rewrite.is_some() {
-                    return Err(PeqlError::Invalid(format!(
-                        "`{name}` is not bound to an Iceberg table; only an Iceberg table's \
-                         snapshot is rewritten"
-                    )));
-                }
-                None
-            }
+            _ => None,
         };
         #[cfg(feature = "iceberg")]
-        let clears = iceberg.is_none() && mode == WriteMode::Overwrite;
+        let rewrites_a_table = iceberg.is_some();
         #[cfg(not(feature = "iceberg"))]
-        let clears = mode == WriteMode::Overwrite;
+        let rewrites_a_table = false;
+        if rewrite.is_some() && !rewrites_a_table {
+            return Err(PeqlError::Invalid(format!(
+                "`{name}` is not bound to an Iceberg table; only an Iceberg table's snapshot is \
+                 rewritten"
+            )));
+        }
         Ok(Writing {
             reg,
             location,
+            written,
             rows: AtomicUsize::new(0),
             bytes: AtomicUsize::new(0),
-            overwrite: tokio::sync::Mutex::new(clears),
             memory: None,
+            staged,
             #[cfg(feature = "iceberg")]
             iceberg,
+            removed: rewrite.map(|(_, files)| files).unwrap_or_default(),
         })
-    }
-
-    /// An overwrite removes the contract's files once, before the first part lands (or at the
-    /// finish of a write with no parts), and only once that part has been planned, so a part
-    /// that does not conform leaves the data as it was.
-    async fn clear_for_overwrite(&self, w: &Writing) -> Result<()> {
-        let mut pending = w.overwrite.lock().await;
-        if *pending {
-            match &w.location {
-                Location::Local(root) => {
-                    for f in binding::list_files(root)? {
-                        std::fs::remove_file(f)?;
-                    }
-                }
-                Location::Object(o) => o.remove_files().await?,
-                // An Iceberg overwrite removes no file; its snapshot replaces the old one.
-                #[cfg(feature = "iceberg")]
-                Location::Iceberg(_) => {}
-            }
-            *pending = false;
-        }
-        Ok(())
     }
 
     /// Write one part of a write begun by [`Engine::begin_write`]: conform it to the row
     /// schema, enrich, compute flags and derived columns, cluster and partition, and write
-    /// Parquet files stamped with the contract hash. Parts may be written concurrently; each
-    /// lands in files of its own. Returns the rows written.
+    /// Parquet files stamped with the contract hash into the write's directory. Parts may be
+    /// written concurrently; each lands in files of its own. Returns the rows written.
     pub async fn write_part(&self, w: &Writing, batches: Vec<RecordBatch>) -> Result<usize> {
         let c = &w.reg.compilation;
         let cc = &c.contract;
@@ -876,61 +879,326 @@ impl Engine {
         let df = ctx
             .execute_logical_plan(parcel_core::compile::resolve(plan)?)
             .await?;
-        self.clear_for_overwrite(w).await?;
-
         let (options, parquet) = write_options(c, w.memory, rows)?;
-        let url = match &w.location {
-            Location::Local(root) => binding::local_url(root, true)?,
-            Location::Object(o) => o.url(true),
-            #[cfg(feature = "iceberg")]
-            Location::Iceberg(t) => w
-                .iceberg
-                .as_ref()
-                .ok_or_else(|| PeqlError::Invalid(format!("{} was not begun as a write", t.table)))?
-                .url()?,
-        };
-        df.write_parquet(&url, options, Some(parquet)).await?;
+        df.write_parquet(&binding::local_url(w.dir()?, true)?, options, Some(parquet))
+            .await?;
         w.rows.fetch_add(rows, Ordering::SeqCst);
         w.bytes.fetch_add(bytes, Ordering::SeqCst);
         Ok(rows)
     }
 
-    /// Finish a write begun by [`Engine::begin_write`]: the data changed, so refresh every
-    /// contract bound to it, the writer's last, which validates it and writes its manifest.
+    /// Finish a write begun by [`Engine::begin_write`]. Every contract bound to the data the
+    /// write lands in, the writer's first, validates the rows written, over the write's own
+    /// files; the files are published (moved under the binding, put in its object store, or
+    /// committed to its Iceberg table as one snapshot whose summary names the write); and
+    /// each contract's facts of its data become what they were combined with the write's
+    /// ([`crate::facts`]). Nothing the write did not write is read: no other file, footer or
+    /// table manifest, and no other row is validated.
     ///
-    /// For an Iceberg table, the parts' files are committed first, as one snapshot, and every
-    /// contract bound to the table records its facts for that snapshot; the report names it.
+    /// The report is the write's own: the rows written, the files added, the verdict of the
+    /// writer's row rules over those rows with the hash of those files, and the snapshot
+    /// committed. A write whose rows break a deny-level rule is published all the same; its
+    /// verdict says so, and so do the facts readers are refused by.
     pub async fn finish_write(&self, w: Writing) -> Result<WriteReport> {
-        self.clear_for_overwrite(&w).await?;
         let name = w.reg.name();
-        #[cfg(feature = "iceberg")]
-        let committed = match &w.iceberg {
-            Some(iw) => Some(iw.commit(&w.reg.compilation.contract).await?.1),
-            None => None,
-        };
-        #[cfg(not(feature = "iceberg"))]
-        let committed: Option<SnapshotCommit> = None;
-        let at = committed.map(|c| c.snapshot_id);
-        let written_at = Utc::now();
         let key = w.location.key()?;
+        let mut bound = vec![w.reg.clone()];
         for other in self.store.list() {
-            if other.name() == name {
-                continue;
-            }
-            if let Ok(Bound::Files(r)) = self.bound(&other)
+            if other.name() != name
+                && let Ok(Bound::Files(r)) = self.bound(&other)
                 && r.key().ok().as_ref() == Some(&key)
             {
-                self.refresh_in(other.name(), written_at, Some(&w), at)
-                    .await?;
+                bound.push(other);
             }
         }
-        let (verdict, manifest) = self.refresh_in(name, written_at, Some(&w), at).await?;
+        let written_at = Utc::now();
+        let mut verdict = None;
+        let mut facts = Vec::with_capacity(bound.len());
+        for reg in &bound {
+            let (v, f) = self.write_facts(&w, reg, written_at).await?;
+            verdict.get_or_insert(v);
+            facts.push(f);
+        }
+        let verdict = verdict.expect("the writer's contract is bound");
+        let (snapshot, table) = self.publish_write(&w, &bound, &facts, written_at).await?;
+        let own = facts.swap_remove(0).facts;
+        let columns = w.reg.compilation.contract.row_schema.clone();
         Ok(WriteReport {
             rows_written: w.rows.load(Ordering::SeqCst),
-            files: manifest.files.len(),
-            verdict,
-            snapshot: committed,
+            files: own.files,
+            verdict: Verdict {
+                verdict,
+                data_hash: own.data_hash,
+                snapshot_id: snapshot.map(|s| s.snapshot_id),
+            },
+            snapshot,
+            table: table.map(|m| m.table_stats(columns.fields().iter().map(|f| f.name().as_str()))),
         })
+    }
+
+    /// The facts of the rows a write wrote, under contract `reg`: its validation plan over the
+    /// write's own files, inside the write's memory when it has one, and those files' entries.
+    async fn write_facts(
+        &self,
+        w: &Writing,
+        reg: &Registered,
+        written_at: DateTime<Utc>,
+    ) -> Result<(parcel_runtime::plan::Verdict, WriteFacts)> {
+        let c = &reg.compilation;
+        let cc = &c.contract;
+        let dir = w.dir()?;
+        let url = binding::local_url(dir, true)?;
+        #[cfg(feature = "iceberg")]
+        let provider = match &w.iceberg {
+            Some(_) => crate::iceberg_table::written_files(cc, &url)?,
+            None => binding::listing_table_at(cc, &url, false, false)?,
+        };
+        #[cfg(not(feature = "iceberg"))]
+        let provider = binding::listing_table_at(cc, &url, false, false)?;
+        let session = match w.memory {
+            Some(memory) => {
+                // A scan holds a few batches: each is an eighth of the write's memory.
+                let batch = (memory / 8 / w.row_bytes()).clamp(64, 8192);
+                self.bounded_session(memory, 1, Some(batch), false)?
+            }
+            None => self.session(),
+        };
+        let verdict = facts::of_rows(
+            c,
+            parcel_runtime::plan::validate_in(&session, c, c.validation.plan.clone(), provider)
+                .await?,
+        );
+        let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
+        let mut files = Vec::new();
+        for path in binding::list_files(dir)? {
+            #[allow(unused_mut)]
+            let mut entry = binding::file_entry(dir, &path, &flag_columns)?;
+            #[cfg(feature = "iceberg")]
+            if let Some(iw) = &w.iceberg {
+                entry.path = iw.table_relative(&entry.path);
+            }
+            files.push(entry);
+        }
+        let manifest = Manifest {
+            contract: cc.name.clone(),
+            contract_hash: cc.contract_hash.clone(),
+            compilation_hash: cc.compilation_hash.clone(),
+            written_at,
+            row_count: verdict.row_count,
+            failures: verdict.failures.clone(),
+            valid: verdict.valid,
+            breached: verdict.breached.clone(),
+            guarantees: BTreeMap::new(),
+            stats: verdict.stats.clone(),
+            data_hash: manifest::data_hash(&files),
+            row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
+            files,
+            snapshot_id: None,
+        };
+        Ok((
+            verdict,
+            WriteFacts {
+                written: w.written,
+                facts: manifest,
+                removed: w.removed.clone(),
+            },
+        ))
+    }
+
+    /// Publish a write's files and record, for each contract in `bound`, its facts of the data
+    /// after the write: what it knew before combined with the write's `facts`, or nothing
+    /// when what it knew before is not known.
+    async fn publish_write(
+        &self,
+        w: &Writing,
+        bound: &[Arc<Registered>],
+        facts: &[WriteFacts],
+        written_at: DateTime<Utc>,
+    ) -> Result<(Option<SnapshotCommit>, Option<Manifest>)> {
+        let dir = w.dir()?;
+        // The writer's contract is the first bound: its facts after the write.
+        let mut own = None;
+        match &w.location {
+            Location::Local(root) => {
+                let mut before = Vec::with_capacity(bound.len());
+                for reg in bound {
+                    before.push(match w.written {
+                        Written::Overwrite => Some(None),
+                        _ => match Manifest::load(root, reg.name())? {
+                            Some(m) => Some(Some(m)),
+                            // Files written elsewhere are not known until validated.
+                            None if binding::list_files(root)?.is_empty() => Some(None),
+                            None => None,
+                        },
+                    });
+                }
+                if w.written == Written::Overwrite {
+                    for f in binding::list_files(root)? {
+                        std::fs::remove_file(f)?;
+                    }
+                }
+                for path in binding::list_files(dir)? {
+                    let to = root.join(binding::relative_path(dir, &path));
+                    if let Some(parent) = to.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::rename(&path, &to)?;
+                }
+                for ((reg, f), before) in bound.iter().zip(facts).zip(before) {
+                    let after = match before {
+                        Some(b) => {
+                            facts::after_write(&reg.compilation, b.as_ref(), f, written_at, None)?
+                        }
+                        None => None,
+                    };
+                    match &after {
+                        Some(m) => m.save(root)?,
+                        None => Manifest::remove(root, reg.name())?,
+                    }
+                    if reg.name() == w.contract() {
+                        own = after;
+                    }
+                }
+                Ok((None, own))
+            }
+            Location::Object(o) => {
+                let mut before = Vec::with_capacity(bound.len());
+                for reg in bound {
+                    before.push(match w.written {
+                        Written::Overwrite => Some(None),
+                        _ => match o.load_manifest(reg.name()).await? {
+                            Some(m) => Some(Some(m)),
+                            None if o.list_files().await?.is_empty() => Some(None),
+                            None => None,
+                        },
+                    });
+                }
+                if w.written == Written::Overwrite {
+                    o.remove_files().await?;
+                }
+                o.upload(dir).await?;
+                for ((reg, f), before) in bound.iter().zip(facts).zip(before) {
+                    let after = match before {
+                        Some(b) => {
+                            facts::after_write(&reg.compilation, b.as_ref(), f, written_at, None)?
+                        }
+                        None => None,
+                    };
+                    if reg.name() == w.contract() {
+                        own = after.clone();
+                    }
+                    match after {
+                        Some(m) => {
+                            o.save_manifest(&m).await?;
+                            self.object_manifests
+                                .write()
+                                .expect("lock")
+                                .insert(reg.name().to_owned(), m);
+                        }
+                        None => {
+                            o.remove_manifest(reg.name()).await?;
+                            self.object_manifests
+                                .write()
+                                .expect("lock")
+                                .remove(reg.name());
+                        }
+                    }
+                }
+                Ok((None, own))
+            }
+            #[cfg(feature = "iceberg")]
+            Location::Iceberg(t) => {
+                let iw = w.iceberg.as_ref().ok_or_else(|| {
+                    PeqlError::Invalid(format!("{} was not begun as a write", t.table))
+                })?;
+                let (table, commit) = iw.commit(&w.reg.compilation.contract, facts).await?;
+                let current = table.metadata().current_snapshot_id() == Some(commit.snapshot_id);
+                // The snapshot is committed, with the write's own facts: what follows only
+                // records the table's facts for it, which a read can also do. When they
+                // cannot be computed (a parent's facts that do not decode, a store that refuses)
+                // the write stands and they stay unrecorded; a read meets the same cause.
+                for reg in bound {
+                    let after = match self.iceberg_facts(t, &table, commit.snapshot_id, reg).await {
+                        Ok(after) => after,
+                        Err(e) => {
+                            tracing::warn!(
+                                contract = reg.name(),
+                                snapshot = commit.snapshot_id,
+                                "the facts of the committed snapshot are not recorded: {e}"
+                            );
+                            None
+                        }
+                    };
+                    if reg.name() == w.contract() {
+                        own = after.clone();
+                    }
+                    let mut cached = self.iceberg_manifests.write().expect("lock");
+                    match after {
+                        Some(m) if current => {
+                            cached.insert(reg.name().to_owned(), m);
+                        }
+                        Some(_) => {}
+                        None => {
+                            cached.remove(reg.name());
+                        }
+                    }
+                }
+                Ok((Some(commit), own))
+            }
+        }
+    }
+
+    /// What contract `reg` knows about `snapshot` of its Iceberg table: its recorded facts, or
+    /// the facts of the nearest snapshot back that has them combined with the facts of each
+    /// write since, recorded for each snapshot on the way. `None` when a snapshot on the way
+    /// was not written by peQL under this contract (or is expired): then the data is known only
+    /// by validating it.
+    #[cfg(feature = "iceberg")]
+    async fn iceberg_facts(
+        &self,
+        t: &crate::iceberg_table::IcebergLocation,
+        table: &iceberg::table::Table,
+        snapshot: i64,
+        reg: &Registered,
+    ) -> Result<Option<Manifest>> {
+        let name = reg.name();
+        let md = table.metadata();
+        let mut writes = Vec::new();
+        let mut at = Some(snapshot);
+        let mut known = None;
+        while let Some(s) = at {
+            if md.snapshot_by_id(s).is_none() {
+                return Ok(None);
+            }
+            if let Some(m) = t.load_facts(table, s, name).await? {
+                known = Some(m);
+                break;
+            }
+            let Some(write) = t.load_write_facts(table, s, name).await? else {
+                return Ok(None);
+            };
+            let snap = md.snapshot_by_id(s).expect("checked above");
+            let replaces = write.written == Written::Overwrite;
+            let at_time =
+                DateTime::from_timestamp_millis(snap.timestamp_ms()).ok_or_else(|| {
+                    PeqlError::Invalid(format!("snapshot {s} of {} has no time", t.table))
+                })?;
+            writes.push((s, at_time, write));
+            if replaces {
+                break;
+            }
+            at = snap.parent_snapshot_id();
+        }
+        for (s, at_time, write) in writes.into_iter().rev() {
+            let Some(m) =
+                facts::after_write(&reg.compilation, known.as_ref(), &write, at_time, Some(s))?
+            else {
+                return Ok(None);
+            };
+            t.save_facts(table, &m).await?;
+            known = Some(m);
+        }
+        Ok(known)
     }
 
     /// Rewrite a contract's Iceberg table into fewer, larger files: when the table's current
@@ -938,10 +1206,10 @@ impl Engine {
     /// `small_file_bytes`, every row of it, as stored, is written again under the contract's
     /// layout and committed as one snapshot that replaces that snapshot's files and keeps
     /// every file appended to the table since, so a table written to while it is compacted is
-    /// still compacted; the facts of the new snapshot are recorded as a write's are, and the
-    /// report counts the rows rewritten. The rows do not change, and no file is deleted: the
-    /// snapshot before stays readable until it is expired. `None` when there is nothing to
-    /// compact.
+    /// still compacted; the facts of the new snapshot are its parent's with the files
+    /// replaced, and the report is of the rows rewritten. The rows do not change, and no file
+    /// is deleted: the snapshot before stays readable until it is expired. `None` when there
+    /// is nothing to compact.
     ///
     /// Refused with [`PeqlError::Conflict`] when, since the snapshot it read, an overwrite, a
     /// delete or another compaction replaced or removed that snapshot's files, or delete files
@@ -968,8 +1236,9 @@ impl Engine {
         }
         let c = &reg.compilation;
         let stored = t.provider(&table, &c.contract, true, snapshot).await?;
+        let replaced = files.into_iter().map(|f| f.relative).collect();
         let w = self
-            .begin(name, WriteMode::Overwrite, Some(snapshot))
+            .begin(name, WriteMode::Overwrite, Some((snapshot, replaced)))
             .await?;
         let iw = w.iceberg.as_ref().ok_or_else(|| {
             PeqlError::Invalid(format!("`{name}`'s compaction was not begun on its table"))
@@ -996,23 +1265,19 @@ impl Engine {
         let plan = LogicalPlanBuilder::from(scan).project(columns)?.build()?;
         let df = ctx.execute_logical_plan(plan).await?;
         let (options, parquet) = write_options(c, None, 0)?;
-        let counts = df.write_parquet(&iw.url()?, options, Some(parquet)).await?;
+        let counts = df
+            .write_parquet(&binding::local_url(w.dir()?, true)?, options, Some(parquet))
+            .await?;
         w.rows.fetch_add(written_rows(&counts)?, Ordering::SeqCst);
         Ok(Some(self.finish_write(w).await?))
     }
 
-    /// Validate a contract over its files and save its manifest.
-    async fn refresh(&self, name: &str, written_at: DateTime<Utc>) -> Result<(Verdict, Manifest)> {
-        self.refresh_in(name, written_at, None, None).await
-    }
-
-    /// [`Engine::refresh`], validating inside a write's memory when it has one. For an Iceberg
-    /// table, of snapshot `at` (the current one when `None`), whose facts are recorded with it.
-    async fn refresh_in(
+    /// Validate a contract over the whole of its data and record its facts: of snapshot `at`
+    /// of an Iceberg table (the current one when `None`).
+    async fn refresh(
         &self,
         name: &str,
         written_at: DateTime<Utc>,
-        w: Option<&Writing>,
         at: Option<i64>,
     ) -> Result<(Verdict, Manifest)> {
         let reg = self.get(name)?;
@@ -1020,55 +1285,18 @@ impl Engine {
         let Bound::Files(location) = self.bound(&reg)? else {
             return Err(PeqlError::Invalid(format!("`{name}` has no files")));
         };
-        #[cfg(feature = "iceberg")]
-        let at = match &location {
-            Location::Iceberg(t) => Some(match at {
-                Some(s) => s,
-                None => t
-                    .load()
-                    .await?
-                    .and_then(|table| table.metadata().current_snapshot_id())
-                    .ok_or_else(|| PeqlError::NotWritten {
-                        contract: name.to_owned(),
-                    })?,
-            }),
-            _ => at,
-        };
         let plan = reg.compilation.validation.plan.clone();
-        let verdict = match w.and_then(|w| w.memory.map(|m| (m, w.row_bytes()))) {
-            Some((memory, row_bytes)) => {
-                // A scan holds a few batches: each is an eighth of the write's memory.
-                let batch = (memory / 8 / row_bytes).clamp(64, 8192);
-                let ctx = self.bounded_session(memory, 1, Some(batch), false)?;
-                self.validate_in(&ctx, name, plan, at).await?
-            }
-            None => self.validate_in(&self.session(), name, plan, at).await?,
-        };
-        let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
-        let files = match &location {
-            Location::Local(root) => binding::list_files(root)?
-                .iter()
-                .map(|f| binding::file_entry(root, f, &flag_columns))
-                .collect::<Result<Vec<_>>>()?,
-            Location::Object(o) => {
-                o.file_entries(&o.list_files().await?, &flag_columns)
-                    .await?
-            }
-            #[cfg(feature = "iceberg")]
-            Location::Iceberg(t) => {
-                let (table, snapshot) = self.iceberg_snapshot(t, name, at).await?;
-                let files = t.files(&table, snapshot).await?;
-                t.file_entries(&table, &files, &flag_columns).await?
-            }
-        };
+        let (verdict, files) = self.whole(&self.session(), name, plan, at).await?;
         let manifest = Manifest {
             contract: cc.name.clone(),
             contract_hash: cc.contract_hash.clone(),
             compilation_hash: cc.compilation_hash.clone(),
             written_at,
             row_count: verdict.verdict.row_count,
+            failures: verdict.verdict.failures.clone(),
             valid: verdict.verdict.valid,
             breached: verdict.verdict.breached.clone(),
+            guarantees: facts::checks(&verdict.verdict, verdict.snapshot_id, Utc::now()),
             stats: verdict.verdict.stats.clone(),
             data_hash: verdict.data_hash.clone(),
             row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
@@ -1086,7 +1314,7 @@ impl Engine {
             }
             #[cfg(feature = "iceberg")]
             Location::Iceberg(t) => {
-                let (table, snapshot) = self.iceberg_snapshot(t, name, at).await?;
+                let (table, snapshot) = self.iceberg_snapshot(t, name, verdict.snapshot_id).await?;
                 t.save_facts(&table, &manifest).await?;
                 if table.metadata().current_snapshot_id() == Some(snapshot) {
                     self.iceberg_manifests
@@ -1099,17 +1327,47 @@ impl Engine {
         Ok((verdict, manifest))
     }
 
-    /// Run the contract's validation plan over its data (peQL design 4.9a). For an Iceberg
-    /// table, over its current snapshot, which the verdict names.
+    /// Run the contract's validation plan over the whole of its data (peQL design 4.9a), on
+    /// demand, and record what it finds as the contract's facts of the data: every statistic,
+    /// a distinct count among them, and every guarantee decided. For an Iceberg table, over its
+    /// current snapshot, which the verdict names. No write runs this.
     pub async fn validate(&self, name: &str) -> Result<Verdict> {
-        let plan = self.get(name)?.compilation.validation.plan.clone();
-        self.validate_with(name, plan).await
+        let reg = self.get(name)?;
+        match self.bound(&reg)? {
+            Bound::Files(_) => Ok(self.refresh(name, Utc::now(), None).await?.0),
+            Bound::Table(_) => {
+                let plan = reg.compilation.validation.plan.clone();
+                let (verdict, _) = self.whole(&self.session(), name, plan, None).await?;
+                let cc = &reg.compilation.contract;
+                self.table_manifests.write().expect("lock").insert(
+                    name.to_owned(),
+                    Manifest {
+                        contract: cc.name.clone(),
+                        contract_hash: cc.contract_hash.clone(),
+                        compilation_hash: cc.compilation_hash.clone(),
+                        written_at: Utc::now(),
+                        row_count: verdict.verdict.row_count,
+                        failures: verdict.verdict.failures.clone(),
+                        valid: verdict.verdict.valid,
+                        breached: verdict.verdict.breached.clone(),
+                        guarantees: facts::checks(&verdict.verdict, None, Utc::now()),
+                        stats: verdict.verdict.stats.clone(),
+                        data_hash: verdict.data_hash.clone(),
+                        row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
+                        files: Vec::new(),
+                        snapshot_id: None,
+                    },
+                );
+                Ok(verdict)
+            }
+        }
     }
 
     /// Run a validation plan obtained elsewhere (e.g. decoded from a bundle) over the
-    /// contract's data. This is what a certificate verifier does: same plan, same data.
+    /// contract's whole data. This is what a certificate verifier does: same plan, same data.
+    /// Nothing is recorded.
     pub async fn validate_with(&self, name: &str, plan: LogicalPlan) -> Result<Verdict> {
-        self.validate_in(&self.session(), name, plan, None).await
+        Ok(self.whole(&self.session(), name, plan, None).await?.0)
     }
 
     /// [`Engine::validate_with`] over one snapshot of a contract's Iceberg table: what a
@@ -1120,67 +1378,85 @@ impl Engine {
         plan: LogicalPlan,
         snapshot_id: i64,
     ) -> Result<Verdict> {
-        self.validate_in(&self.session(), name, plan, Some(snapshot_id))
-            .await
+        Ok(self
+            .whole(&self.session(), name, plan, Some(snapshot_id))
+            .await?
+            .0)
     }
 
-    /// [`Engine::validate_with`] in a given session; for an Iceberg table, of snapshot `at`
-    /// (the current one when `None`).
-    async fn validate_in(
+    /// A validation plan over the whole of a contract's data in a given session, with the
+    /// entries of every file it holds (their footers and hashes); for an Iceberg table, of
+    /// snapshot `at` (the current one when `None`).
+    async fn whole(
         &self,
         session: &SessionContext,
         name: &str,
         plan: LogicalPlan,
         at: Option<i64>,
-    ) -> Result<Verdict> {
+    ) -> Result<(Verdict, Vec<FileEntry>)> {
         let reg = self.get(name)?;
+        let cc = &reg.compilation.contract;
+        let flag_columns: Vec<String> = cc.flags.iter().map(|f| f.column.clone()).collect();
         let bound = self.bound(&reg)?;
         #[cfg(feature = "iceberg")]
         if let Bound::Files(Location::Iceberg(t)) = &bound {
             let (table, snapshot) = self.iceberg_snapshot(t, name, at).await?;
-            let provider = t
-                .provider(&table, &reg.compilation.contract, false, snapshot)
-                .await?;
+            let provider = t.provider(&table, cc, false, snapshot).await?;
             let verdict =
                 parcel_runtime::plan::validate_in(session, &reg.compilation, plan, provider)
                     .await?;
             let files = t.files(&table, snapshot).await?;
-            return Ok(Verdict {
-                verdict,
-                data_hash: t.data_hash(&table, &files).await?,
-                snapshot_id: Some(snapshot),
-            });
+            let entries = t.file_entries(&table, &files, &flag_columns).await?;
+            return Ok((
+                Verdict {
+                    verdict,
+                    data_hash: manifest::data_hash(&entries),
+                    snapshot_id: Some(snapshot),
+                },
+                entries,
+            ));
         }
         if at.is_some() {
             return Err(no_snapshots(name));
         }
         let provider = match &bound {
             Bound::Table(t) => t.clone(),
-            Bound::Files(_) => {
-                self.bindings
-                    .provider(&reg.compilation.contract, false)
-                    .await?
-            }
+            Bound::Files(_) => self.bindings.provider(cc, false).await?,
         };
         let verdict =
             parcel_runtime::plan::validate_in(session, &reg.compilation, plan, provider).await?;
-        let data_hash = match bound {
-            Bound::Files(Location::Local(root)) => {
-                binding::data_hash(&root, &binding::list_files(&root)?)?
-            }
-            Bound::Files(Location::Object(o)) => o.data_hash(&o.list_files().await?).await?,
-            #[cfg(feature = "iceberg")]
-            Bound::Files(Location::Iceberg(_)) => unreachable!("validated above"),
+        let (data_hash, entries) = match bound {
             Bound::Table(t) => {
                 let batches = self.session().read_table(t)?.collect().await?;
-                parcel_core::hash::sha256_hex(&crate::envelope::ipc_bytes(&batches))
+                (
+                    parcel_core::hash::sha256_hex(&crate::envelope::ipc_bytes(&batches)),
+                    Vec::new(),
+                )
+            }
+            Bound::Files(location) => {
+                let entries = match location {
+                    Location::Local(root) => binding::list_files(&root)?
+                        .iter()
+                        .map(|f| binding::file_entry(&root, f, &flag_columns))
+                        .collect::<Result<Vec<_>>>()?,
+                    Location::Object(o) => {
+                        o.file_entries(&o.list_files().await?, &flag_columns)
+                            .await?
+                    }
+                    #[cfg(feature = "iceberg")]
+                    Location::Iceberg(_) => unreachable!("validated above"),
+                };
+                (manifest::data_hash(&entries), entries)
             }
         };
-        Ok(Verdict {
-            verdict,
-            data_hash,
-            snapshot_id: None,
-        })
+        Ok((
+            Verdict {
+                verdict,
+                data_hash,
+                snapshot_id: None,
+            },
+            entries,
+        ))
     }
 
     /// A contract's Iceberg table and the snapshot `at` names (the current one when `None`).
@@ -1260,7 +1536,18 @@ impl Engine {
         });
         let mut annotations = Vec::new();
         for g in &cc.guarantees {
-            if !reference::eval_bool(&g.cel, &ctx).map_err(PeqlError::Invalid)? {
+            // A guarantee decided by the data alone holds as it was last decided, by a
+            // validation of the whole data (a deny-level one that failed made the data not
+            // servable, above); one not decided since is not judged here.
+            let holds = if c.validation.data_guarantees.contains(&g.id) {
+                manifest.guarantees.get(&g.id).is_none_or(|k| k.holds)
+            } else if facts::undecided(c, g, &manifest.stats) {
+                // A query-time guarantee over a statistic not known since the last validation.
+                true
+            } else {
+                reference::eval_bool(&g.cel, &ctx).map_err(PeqlError::Invalid)?
+            };
+            if !holds {
                 match g.on_fail {
                     GuaranteeOnFail::Deny => {
                         return Err(PeqlError::GuaranteeFailed {

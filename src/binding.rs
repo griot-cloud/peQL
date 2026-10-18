@@ -260,19 +260,44 @@ pub fn list_files(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(out)
 }
 
-/// One file's footer: row count, the contract hash it was written under, and per-flag status.
+/// One local file's entry, named by its path under `root`: row count, the contract hash it
+/// was written under and per-flag status from its footer, and the sha256 of its bytes.
 pub fn file_entry(root: &Path, path: &Path, flag_columns: &[String]) -> Result<FileEntry> {
     let reader = SerializedFileReader::new(File::open(path)?)
         .map_err(|e| PeqlError::Invalid(format!("{}: {e}", path.display())))?;
     Ok(entry_from_footer(
-        path.strip_prefix(root)
-            .unwrap_or(path)
-            .display()
-            .to_string(),
+        relative_path(root, path),
         std::fs::metadata(path)?.len(),
         reader.metadata(),
         flag_columns,
+        file_sha256(path)?,
     ))
+}
+
+/// `path` under `root`, `/`-separated, as entries and data hashes name files.
+pub fn relative_path(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// The sha256 of a local file's bytes, read in chunks.
+pub fn file_sha256(path: &Path) -> Result<String> {
+    use std::io::Read;
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; 1 << 20];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha2::Digest::update(&mut hasher, &buf[..n]);
+    }
+    Ok(hex::encode(sha2::Digest::finalize(hasher)))
 }
 
 /// A manifest entry from a file's decoded footer, wherever the file lives.
@@ -281,6 +306,7 @@ pub fn entry_from_footer(
     bytes: u64,
     meta: &ParquetMetaData,
     flag_columns: &[String],
+    sha256: String,
 ) -> FileEntry {
     let file_meta = meta.file_metadata();
     let contract_hash = file_meta
@@ -315,50 +341,30 @@ pub fn entry_from_footer(
         };
         flags.insert(flag.clone(), status);
     }
+    // Nulls per top-level column, from every row group's statistics; a column a row group
+    // has no null count for is left out.
+    let mut null_counts = BTreeMap::new();
+    for i in 0..schema.num_columns() {
+        let column = schema.column(i);
+        if column.path().parts().len() != 1 {
+            continue;
+        }
+        let nulls: Option<u64> = meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.column(i).statistics().and_then(|s| s.null_count_opt()))
+            .sum();
+        if let Some(n) = nulls {
+            null_counts.insert(column.name().to_owned(), n as i64);
+        }
+    }
     FileEntry {
         path,
         rows: file_meta.num_rows(),
         bytes,
         contract_hash,
         flags,
-    }
-}
-
-/// sha256 over (relative path, sha256 of bytes) for every file, in path order.
-pub fn data_hash(root: &Path, files: &[PathBuf]) -> Result<String> {
-    use std::io::Read;
-    let mut acc = DataHash::default();
-    for f in files {
-        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-        let mut file = File::open(f)?;
-        let mut buf = vec![0u8; 1 << 20];
-        loop {
-            let n = file.read(&mut buf)?;
-            if n == 0 {
-                break;
-            }
-            sha2::Digest::update(&mut hasher, &buf[..n]);
-        }
-        acc.add(
-            &f.strip_prefix(root).unwrap_or(f).display().to_string(),
-            &hex::encode(sha2::Digest::finalize(hasher)),
-        );
-    }
-    Ok(acc.finish())
-}
-
-/// The data hash, built one file at a time, in path order.
-#[derive(Default)]
-pub struct DataHash(String);
-
-impl DataHash {
-    pub fn add(&mut self, relative_path: &str, sha256_hex: &str) {
-        self.0.push_str(relative_path);
-        self.0.push(':');
-        self.0.push_str(sha256_hex);
-        self.0.push('\n');
-    }
-    pub fn finish(self) -> String {
-        parcel_core::hash::sha256_hex(self.0.as_bytes())
+        null_counts,
+        sha256,
     }
 }

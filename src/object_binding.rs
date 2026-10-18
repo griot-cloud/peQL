@@ -39,7 +39,7 @@ use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, PutPayload};
 use parcel_core::CompiledContract;
 use parcel_core::document::Source;
 
-use crate::binding::{self, BindingResolver, DataHash, Location};
+use crate::binding::{self, BindingResolver, Location};
 use crate::error::{PeqlError, Result};
 use crate::manifest::{FileEntry, MANIFEST_DIR, Manifest};
 
@@ -201,7 +201,7 @@ impl ObjectLocation {
         Ok(files)
     }
 
-    /// Delete every data file (manifests stay; the refresh that follows rewrites them).
+    /// Delete every data file (manifests stay): what an overwrite does before it publishes.
     pub async fn remove_files(&self) -> Result<()> {
         for f in self.list_files().await? {
             self.store.delete(&f.location).await.map_err(store_err)?;
@@ -209,7 +209,8 @@ impl ObjectLocation {
         Ok(())
     }
 
-    /// Manifest entries from each file's footer, read with two ranged reads.
+    /// Manifest entries from each file's footer, read with two ranged reads, and the sha256
+    /// of its bytes, streamed: what a validation of the whole data records.
     pub async fn file_entries(
         &self,
         files: &[ObjectMeta],
@@ -223,6 +224,7 @@ impl ObjectLocation {
                 f.size,
                 &meta,
                 flag_columns,
+                self.sha256(f).await?,
             ));
         }
         Ok(out)
@@ -258,35 +260,57 @@ impl ObjectLocation {
         ParquetMetaDataReader::decode_metadata(&buf).map_err(|e| bad(&e))
     }
 
-    /// The same hash [`binding::data_hash`] computes over local files, streamed.
-    pub async fn data_hash(&self, files: &[ObjectMeta]) -> Result<String> {
-        let mut acc = DataHash::default();
-        for f in files {
-            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-            let mut stream = self
-                .store
-                .get(&f.location)
-                .await
-                .map_err(store_err)?
-                .into_stream();
-            while let Some(chunk) = stream.try_next().await.map_err(store_err)? {
-                sha2::Digest::update(&mut hasher, &chunk);
-            }
-            acc.add(
-                &self.relative(&f.location),
-                &hex::encode(sha2::Digest::finalize(hasher)),
-            );
+    async fn sha256(&self, f: &ObjectMeta) -> Result<String> {
+        let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+        let mut stream = self
+            .store
+            .get(&f.location)
+            .await
+            .map_err(store_err)?
+            .into_stream();
+        while let Some(chunk) = stream.try_next().await.map_err(store_err)? {
+            sha2::Digest::update(&mut hasher, &chunk);
         }
-        Ok(acc.finish())
+        Ok(hex::encode(sha2::Digest::finalize(hasher)))
+    }
+
+    /// Put every file under the local directory `staged` at the same path under the prefix,
+    /// in parts of [`UPLOAD_CHUNK`]: what publishes a write's files.
+    pub async fn upload(&self, staged: &std::path::Path) -> Result<()> {
+        use std::io::Read;
+        for path in binding::list_files(staged)? {
+            let mut to = self.path.clone();
+            for part in binding::relative_path(staged, &path).split('/') {
+                to = to.join(part);
+            }
+            let upload = self.store.put_multipart(&to).await.map_err(store_err)?;
+            let mut writer =
+                object_store::WriteMultipart::new_with_chunk_size(upload, UPLOAD_CHUNK);
+            let mut file = std::fs::File::open(&path)?;
+            let mut chunk = vec![0u8; UPLOAD_CHUNK];
+            loop {
+                let n = file.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                writer.wait_for_capacity(2).await.map_err(store_err)?;
+                writer.write(&chunk[..n]);
+            }
+            writer.finish().await.map_err(store_err)?;
+        }
+        Ok(())
     }
 
     pub async fn load_manifest(&self, contract: &str) -> Result<Option<Manifest>> {
         match self.store.get(&self.manifest_path(contract)).await {
             Ok(r) => {
                 let bytes = r.bytes().await.map_err(store_err)?;
-                serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|e| PeqlError::Invalid(format!("manifest of `{contract}`: {e}")))
+                crate::manifest::decode(&bytes).map_err(|e| {
+                    PeqlError::Invalid(format!(
+                        "manifest of `{contract}` ({}): {e}",
+                        self.manifest_path(contract)
+                    ))
+                })
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(store_err(e)),
@@ -295,7 +319,7 @@ impl ObjectLocation {
 
     /// One put: object stores replace an object whole, so a reader never sees half of one.
     pub async fn save_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let body = serde_json::to_vec_pretty(manifest)
+        let body = crate::manifest::encode(manifest)
             .map_err(|e| PeqlError::Invalid(format!("manifest: {e}")))?;
         self.store
             .put(
@@ -306,7 +330,18 @@ impl ObjectLocation {
             .map_err(store_err)?;
         Ok(())
     }
+
+    /// Remove the manifest one contract keeps, when it no longer describes the data.
+    pub async fn remove_manifest(&self, contract: &str) -> Result<()> {
+        match self.store.delete(&self.manifest_path(contract)).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(e) => Err(store_err(e)),
+        }
+    }
 }
+
+/// How much of a staged file goes to the store per part.
+const UPLOAD_CHUNK: usize = 8 << 20;
 
 fn store_err(e: object_store::Error) -> PeqlError {
     PeqlError::DataFusion(datafusion::error::DataFusionError::ObjectStore(Box::new(e)))

@@ -138,6 +138,7 @@ impl Engine {
             "rows_written": report.rows_written,
             "files": report.files,
             "verdict": report.verdict,
+            "table": report.table,
         }))
         .map_err(err)
     }

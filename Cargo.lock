@@ -5585,6 +5585,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "typetag",
  "uuid",
  "wat",
  "yaml_serde",
