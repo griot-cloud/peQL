@@ -1829,3 +1829,69 @@ async fn a_rule_over_the_whole_table_is_decided_on_demand_not_by_a_write() {
     let facts = engine.manifest("demo/unique").unwrap().unwrap();
     assert_eq!(facts.breached, ["kwh_bounded"]);
 }
+
+/// Engines writing under different compilations of one contract name share the table: a
+/// reader under one compilation does not combine the facts another compilation's writes
+/// recorded; it validates the snapshot whole under its own and reads every row.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reader_under_another_compilation_validates_rather_than_combining() {
+    let s = setup().await;
+    s.engine
+        .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
+        .await
+        .unwrap();
+    // Another engine writes under a second form of the same contract.
+    let second = readings()
+        .replace("version: 1", "version: 2")
+        .replace(
+            "  - {id: non_negative,",
+            "  - {id: kwh_known, op: assert, expr: \"has(row.kwh)\", on_fail: report}\n  - {id: non_negative,",
+        );
+    let other = Engine::in_memory(s._dir.path().join("two"))
+        .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+    other.register_contract(&second, &schema()).unwrap();
+    assert_ne!(
+        other
+            .get("demo/readings")
+            .unwrap()
+            .compilation
+            .contract
+            .compilation_hash,
+        s.engine
+            .get("demo/readings")
+            .unwrap()
+            .compilation
+            .contract
+            .compilation_hash
+    );
+    for from in [21, 31] {
+        other
+            .write(
+                "demo/readings",
+                vec![batch(from, from + 9)],
+                WriteMode::Append,
+            )
+            .await
+            .unwrap();
+    }
+    // A fresh engine under the first form.
+    let reader = Engine::in_memory(s._dir.path().join("three"))
+        .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+    reader.register_contract(&readings(), &schema()).unwrap();
+    let res = reader
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(40));
+    let facts = reader.manifest("demo/readings").unwrap().unwrap();
+    assert_eq!(facts.row_count, 40);
+    assert_eq!(
+        facts.compilation_hash,
+        reader
+            .get("demo/readings")
+            .unwrap()
+            .compilation
+            .contract
+            .compilation_hash
+    );
+}

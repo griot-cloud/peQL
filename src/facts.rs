@@ -120,9 +120,9 @@ fn decide(
 
 /// What a contract knows about its data after a write, from what it knew before (`before`,
 /// `None` for data with no rows) and the write's facts, at `written_at` and, for a table
-/// with snapshots, the snapshot the write committed. `Ok(None)` when `before` was computed
-/// under another compilation of the contract: then nothing is known until the data is
-/// validated under this one.
+/// with snapshots, the snapshot the write committed. `Ok(None)` when `before` or the write's
+/// facts were computed under another compilation of the contract (another engine wrote under
+/// another form of it): then nothing is known until the data is validated under this one.
 pub fn after_write(
     c: &Compilation,
     before: Option<&Manifest>,
@@ -133,10 +133,7 @@ pub fn after_write(
     let cc = &c.contract;
     let w = &write.facts;
     if w.compilation_hash != cc.compilation_hash {
-        return Err(PeqlError::Invalid(format!(
-            "the facts of a write under `{}` were computed under compilation {}, not {}",
-            cc.name, w.compilation_hash, cc.compilation_hash
-        )));
+        return Ok(None);
     }
     let before = match (write.written, before) {
         (Written::Overwrite, _) | (Written::Append, None) => None,
