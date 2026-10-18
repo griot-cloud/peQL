@@ -11,7 +11,7 @@ use datafusion::arrow::array::{Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use iceberg::Catalog;
 use peql::iceberg_table::{IcebergTables, SUMMARY_CONTRACT, SUMMARY_CONTRACT_HASH, SUMMARY_WRITE};
-use peql::{AsOf, Caller, Engine, PeqlError, WriteMode};
+use peql::{AsOf, Caller, Engine, OnReadViolation, OnWriteViolation, PeqlError, WriteMode};
 use support::*;
 
 /// The readings contract bound, by its document, to `demo.readings`.
@@ -72,9 +72,15 @@ async fn a_contract_reads_and_writes_an_iceberg_table() {
     let engine = &s.engine;
 
     let report = engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     assert_eq!(report.rows_written, 40);
     assert!(report.verdict.valid);
 
@@ -163,16 +169,28 @@ async fn an_append_makes_a_snapshot_whose_parent_is_the_previous_one() {
     let s = setup().await;
     let first = s
         .engine
-        .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 20)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap();
     let second = s
         .engine
-        .write("demo/readings", vec![batch(21, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(21, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let commit = second.snapshot.unwrap();
     assert_eq!(commit.parent_snapshot_id, Some(first.snapshot_id));
     // The report is the append's own rows; the snapshot's facts are the table's.
@@ -204,6 +222,7 @@ async fn an_append_makes_a_snapshot_whose_parent_is_the_previous_one() {
             r#"SELECT id FROM "demo/readings""#,
             &owner(),
             &AsOf::current().with("demo/readings", first.snapshot_id),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -215,9 +234,15 @@ async fn an_overwrite_leaves_the_previous_snapshot_readable_and_its_files_in_pla
     let s = setup().await;
     let engine = &s.engine;
     let first = engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap();
     let t = table(&s.catalog, "readings").await;
@@ -225,9 +250,15 @@ async fn an_overwrite_leaves_the_previous_snapshot_readable_and_its_files_in_pla
     assert!(!first_files.is_empty());
 
     let report = engine
-        .write("demo/readings", vec![batch(101, 110)], WriteMode::Overwrite)
+        .write(
+            "demo/readings",
+            vec![batch(101, 110)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let second = report.snapshot.unwrap();
     assert_eq!(second.parent_snapshot_id, Some(first.snapshot_id));
     assert_eq!(report.verdict.row_count, 10);
@@ -255,7 +286,12 @@ async fn an_overwrite_leaves_the_previous_snapshot_readable_and_its_files_in_pla
     // The previous snapshot reads its rows through the engine, under the contract.
     let as_of = AsOf::current().with("demo/readings", first.snapshot_id);
     let res = engine
-        .query_as_of(r#"SELECT id, meter FROM "demo/readings""#, &guest(), &as_of)
+        .query_as_of(
+            r#"SELECT id, meter FROM "demo/readings""#,
+            &guest(),
+            &as_of,
+            OnReadViolation::Exclude,
+        )
         .await
         .unwrap();
     assert_eq!(ids(&res.batches), guest_ids(40));
@@ -274,6 +310,7 @@ async fn an_overwrite_leaves_the_previous_snapshot_readable_and_its_files_in_pla
             r#"SELECT id FROM "demo/readings""#,
             &Caller::new("m", "partner", "marketing"),
             &as_of,
+            OnReadViolation::Exclude,
         )
         .await;
     assert!(
@@ -288,7 +325,13 @@ async fn an_overwrite_leaves_the_previous_snapshot_readable_and_its_files_in_pla
 
     // The planned view of the old snapshot, for an executor of the host's.
     let planned = engine
-        .view_as_of("demo/readings", &owner(), first.snapshot_id, Some(1))
+        .view_as_of(
+            "demo/readings",
+            &owner(),
+            first.snapshot_id,
+            Some(1),
+            OnReadViolation::Exclude,
+        )
         .await
         .unwrap();
     let batches = datafusion::physical_plan::collect(planned.plan.clone(), planned.ctx.task_ctx())
@@ -303,6 +346,7 @@ async fn an_overwrite_leaves_the_previous_snapshot_readable_and_its_files_in_pla
             r#"SELECT id FROM "demo/readings""#,
             &owner(),
             &AsOf::current().with("demo/readings", 42),
+            OnReadViolation::Exclude,
         )
         .await;
     assert!(missing.is_err());
@@ -313,18 +357,32 @@ async fn two_overwrites_from_one_snapshot_cannot_both_commit() {
     let s = setup().await;
     let engine = &s.engine;
     let base = engine
-        .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 20)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap();
 
     let a = engine
-        .begin_write("demo/readings", WriteMode::Overwrite)
+        .begin_write(
+            "demo/readings",
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let b = engine
-        .begin_write("demo/readings", WriteMode::Overwrite)
+        .begin_write(
+            "demo/readings",
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     engine.write_part(&a, vec![batch(201, 210)]).await.unwrap();
@@ -352,7 +410,7 @@ async fn two_overwrites_from_one_snapshot_cannot_both_commit() {
 
     // An append started from the base still commits: appends do not replace.
     let c = engine
-        .begin_write("demo/readings", WriteMode::Append)
+        .begin_write("demo/readings", WriteMode::Append, OnWriteViolation::Warn)
         .await
         .unwrap();
     engine.write_part(&c, vec![batch(401, 405)]).await.unwrap();
@@ -365,13 +423,25 @@ async fn each_snapshot_keeps_its_own_facts() {
     let s = setup().await;
     let engine = &s.engine;
     let first = engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let second = engine
-        .write("demo/readings", vec![batch(41, 45)], WriteMode::Overwrite)
+        .write(
+            "demo/readings",
+            vec![batch(41, 45)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let (s1, s2) = (
         first.snapshot.unwrap().snapshot_id,
         second.snapshot.unwrap().snapshot_id,
@@ -430,6 +500,7 @@ async fn each_snapshot_keeps_its_own_facts() {
             r#"SELECT COUNT(*) AS n FROM "demo/readings""#,
             &owner(),
             &AsOf::current().with("demo/readings", s1),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -454,6 +525,7 @@ async fn each_snapshot_keeps_its_own_facts() {
             r#"SELECT COUNT(*) FROM "demo/readings-copy""#,
             &owner(),
             &AsOf::current().with("demo/readings-copy", s1),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -536,9 +608,11 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
             "demo/plain",
             vec![plain(&v1_cols, &[1, 2])],
             WriteMode::Append,
+            OnWriteViolation::Warn,
         )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap()
         .snapshot_id;
@@ -548,9 +622,15 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
         .register_contract(PLAIN_V2, &plain(&v2_cols, &[]).schema())
         .unwrap();
     let s2 = engine
-        .write("demo/plain", vec![plain(&v2_cols, &[3])], WriteMode::Append)
+        .write(
+            "demo/plain",
+            vec![plain(&v2_cols, &[3])],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap()
         .snapshot_id;
@@ -593,6 +673,7 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
             r#"SELECT * FROM "demo/plain-v1" ORDER BY id"#,
             &everyone,
             &AsOf::current().with("demo/plain-v1", s1),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -616,6 +697,7 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
             r#"SELECT * FROM "demo/plain""#,
             &everyone,
             &AsOf::current().with("demo/plain", s1),
+            OnReadViolation::Exclude,
         )
         .await;
     assert!(stale.is_err());
@@ -639,7 +721,12 @@ async fn an_unwritten_iceberg_contract_is_reported_and_snapshots_need_a_table() 
     let parquet = Engine::in_memory(dir.path());
     parquet.register_contract(READINGS, &schema()).unwrap();
     parquet
-        .write("demo/readings", vec![batch(1, 4)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 4)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let r = parquet
@@ -647,6 +734,7 @@ async fn an_unwritten_iceberg_contract_is_reported_and_snapshots_need_a_table() 
             r#"SELECT id FROM "demo/readings""#,
             &owner(),
             &AsOf::current().with("demo/readings", 1),
+            OnReadViolation::Exclude,
         )
         .await;
     assert!(matches!(r, Err(PeqlError::Invalid(_))), "{:?}", r.err());
@@ -657,6 +745,7 @@ async fn an_unwritten_iceberg_contract_is_reported_and_snapshots_need_a_table() 
             "SELECT 1",
             &owner(),
             &AsOf::current().with("demo/readings", 1),
+            OnReadViolation::Exclude,
         )
         .await;
     assert!(r.is_err());
@@ -680,7 +769,12 @@ async fn a_binding_with_nested_namespaces_names_the_table_in_the_innermost() {
         )
         .unwrap();
     engine
-        .write("demo/readings", vec![batch(1, 10)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 10)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
 
@@ -713,7 +807,12 @@ async fn a_parquet_binding_is_not_read_through_a_catalog() {
         .unwrap();
     let w = s
         .engine
-        .write("demo/files", vec![batch(1, 4)], WriteMode::Append)
+        .write(
+            "demo/files",
+            vec![batch(1, 4)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await;
     match w {
         Err(PeqlError::Invalid(m)) => assert_eq!(
@@ -721,7 +820,7 @@ async fn a_parquet_binding_is_not_read_through_a_catalog() {
             "`demo/files` is bound to `binding: {parquet: readings/}`, which this engine's \
              bindings do not reach"
         ),
-        other => panic!("{:?}", other.map(|r| r.rows_written)),
+        other => panic!("{:?}", other.map(|r| r.report.rows_written)),
     }
 }
 
@@ -858,9 +957,15 @@ async fn the_catalog_refuses_an_overwrite_once_the_table_has_moved() {
         Engine::in_memory(dir.path()).with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
     engine.register_contract(&readings(), &schema()).unwrap();
     let base = engine
-        .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 20)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap();
 
@@ -885,12 +990,17 @@ async fn the_catalog_refuses_an_overwrite_once_the_table_has_moved() {
             .unwrap();
     });
     let lost = engine
-        .write("demo/readings", vec![batch(201, 210)], WriteMode::Overwrite)
+        .write(
+            "demo/readings",
+            vec![batch(201, 210)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await;
     assert!(
         matches!(lost, Err(PeqlError::Conflict(_))),
         "{:?}",
-        lost.map(|r| r.snapshot)
+        lost.map(|r| r.report.snapshot)
     );
     let t = catalog
         .load_table(&table_ident("demo", "readings"))
@@ -928,9 +1038,11 @@ async fn an_engine_frozen_at_a_snapshot_reads_it_in_every_read_and_writes_nothin
             "demo/plain",
             vec![plain(&v1_cols, &[1, 2])],
             WriteMode::Append,
+            OnWriteViolation::Warn,
         )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap()
         .snapshot_id;
@@ -943,6 +1055,7 @@ async fn an_engine_frozen_at_a_snapshot_reads_it_in_every_read_and_writes_nothin
             "demo/plain",
             vec![plain(&v2_cols, &[3, 4, 5])],
             WriteMode::Overwrite,
+            OnWriteViolation::Warn,
         )
         .await
         .unwrap();
@@ -973,7 +1086,12 @@ async fn an_engine_frozen_at_a_snapshot_reads_it_in_every_read_and_writes_nothin
 
     // Nothing is written under it.
     let refused = frozen
-        .write("demo/plain", vec![plain(&v1_cols, &[9])], WriteMode::Append)
+        .write(
+            "demo/plain",
+            vec![plain(&v1_cols, &[9])],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await;
     assert!(
         matches!(&refused, Err(PeqlError::Invalid(m)) if m.contains("read as of snapshot")),
@@ -996,9 +1114,15 @@ async fn compaction_replaces_small_files_with_one_snapshot_and_keeps_every_row()
     for ids in [[1, 2], [3, 4], [5, 6]] {
         last = s
             .engine
-            .write("demo/plain", vec![plain(&cols, &ids)], WriteMode::Append)
+            .write(
+                "demo/plain",
+                vec![plain(&cols, &ids)],
+                WriteMode::Append,
+                OnWriteViolation::Warn,
+            )
             .await
             .unwrap()
+            .report
             .snapshot;
     }
     let before = last.unwrap().snapshot_id;
@@ -1052,6 +1176,7 @@ async fn compaction_replaces_small_files_with_one_snapshot_and_keeps_every_row()
             r#"SELECT * FROM "demo/plain" ORDER BY id"#,
             &everyone,
             &AsOf::current().with("demo/plain", before),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -1082,9 +1207,15 @@ async fn a_table_in_another_store_is_written_through_its_file_io() {
     engine.register_contract(&readings(), &schema()).unwrap();
 
     let first = engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let first = first.snapshot.unwrap().snapshot_id;
     let t = table(&catalog, "readings").await;
     assert!(
@@ -1108,7 +1239,12 @@ async fn a_table_in_another_store_is_written_through_its_file_io() {
     );
 
     engine
-        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(41, 50)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let res = engine
@@ -1118,7 +1254,12 @@ async fn a_table_in_another_store_is_written_through_its_file_io() {
     assert_eq!(ids(&res.batches), owner_ids(50));
 
     engine
-        .write("demo/readings", vec![batch(1, 5)], WriteMode::Overwrite)
+        .write(
+            "demo/readings",
+            vec![batch(1, 5)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let res = engine
@@ -1131,6 +1272,7 @@ async fn a_table_in_another_store_is_written_through_its_file_io() {
             r#"SELECT id FROM "demo/readings""#,
             &owner(),
             &AsOf::current().with("demo/readings", first),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -1175,9 +1317,11 @@ async fn three_small_files(dir: &std::path::Path) -> (Arc<Interleaved>, Engine, 
                 "demo/plain",
                 vec![plain(&PLAIN_COLUMNS, &ids)],
                 WriteMode::Append,
+                OnWriteViolation::Warn,
             )
             .await
             .unwrap()
+            .report
             .snapshot;
     }
     (catalog, engine, other, last.unwrap().snapshot_id)
@@ -1199,9 +1343,11 @@ async fn compaction_commits_over_appends_that_land_while_it_runs_and_keeps_their
                     "demo/plain",
                     vec![plain(&PLAIN_COLUMNS, &ids)],
                     WriteMode::Append,
+                    OnWriteViolation::Warn,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .report;
             appended
                 .lock()
                 .unwrap()
@@ -1289,6 +1435,7 @@ async fn compaction_commits_over_appends_that_land_while_it_runs_and_keeps_their
             r#"SELECT id FROM "demo/plain" ORDER BY id"#,
             &everyone,
             &AsOf::current().with("demo/plain", read),
+            OnReadViolation::Exclude,
         )
         .await
         .unwrap();
@@ -1308,6 +1455,7 @@ async fn a_compaction_the_table_moves_under_at_every_commit_gives_up_and_keeps_e
                     "demo/plain",
                     vec![plain(&PLAIN_COLUMNS, &[100 + i])],
                     WriteMode::Append,
+                    OnWriteViolation::Warn,
                 )
                 .await
                 .unwrap();
@@ -1344,9 +1492,11 @@ async fn compaction_is_refused_once_an_overwrite_replaced_the_files_it_read() {
                     "demo/plain",
                     vec![plain(&PLAIN_COLUMNS, &[100, 101])],
                     WriteMode::Overwrite,
+                    OnWriteViolation::Warn,
                 )
                 .await
-                .unwrap();
+                .unwrap()
+                .report;
             *overwrote.lock().unwrap() = Some(r.snapshot.unwrap().snapshot_id);
         });
     }
@@ -1399,6 +1549,7 @@ async fn two_writers_adding_c(
             "demo/plain",
             vec![plain(&PLAIN_COLUMNS, &[1, 2])],
             WriteMode::Append,
+            OnWriteViolation::Warn,
         )
         .await
         .unwrap();
@@ -1439,13 +1590,23 @@ async fn two_writers_adding_one_column_at_once_both_write_and_the_schema_changes
         let (other, cols) = (other.clone(), cols.clone());
         catalog.before_commit(move || async move {
             other
-                .write("demo/plain", vec![plain(&cols, &[3])], WriteMode::Append)
+                .write(
+                    "demo/plain",
+                    vec![plain(&cols, &[3])],
+                    WriteMode::Append,
+                    OnWriteViolation::Warn,
+                )
                 .await
                 .unwrap();
         });
     }
     engine
-        .write("demo/plain", vec![plain(&cols, &[4])], WriteMode::Append)
+        .write(
+            "demo/plain",
+            vec![plain(&cols, &[4])],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
 
@@ -1491,7 +1652,12 @@ async fn a_column_another_writer_added_with_another_type_is_refused_by_name() {
                 ("c", DataType::Utf8),
             ];
             other
-                .write("demo/plain", vec![plain(&cols, &[3])], WriteMode::Append)
+                .write(
+                    "demo/plain",
+                    vec![plain(&cols, &[3])],
+                    WriteMode::Append,
+                    OnWriteViolation::Warn,
+                )
                 .await
                 .unwrap();
         });
@@ -1503,14 +1669,19 @@ async fn a_column_another_writer_added_with_another_type_is_refused_by_name() {
         ("c", DataType::Int64),
     ];
     let refused = engine
-        .write("demo/plain", vec![plain(&cols, &[4])], WriteMode::Append)
+        .write(
+            "demo/plain",
+            vec![plain(&cols, &[4])],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await;
     match refused {
         Err(PeqlError::Invalid(m)) => {
             assert!(m.contains("column `c`"), "{m}");
             assert!(m.contains("is Utf8; the contract writes Int64"), "{m}");
         }
-        other => panic!("{:?}", other.map(|r| r.snapshot)),
+        other => panic!("{:?}", other.map(|r| r.report.snapshot)),
     }
     let t = table(&catalog.inner, "plain").await;
     assert_eq!(t.metadata().schemas_iter().count(), 2);
@@ -1650,6 +1821,7 @@ async fn an_append_reads_nothing_of_the_table_it_did_not_write() {
                     "demo/readings",
                     vec![batch(from, from + 9)],
                     WriteMode::Append,
+                    OnWriteViolation::Warn,
                 )
                 .await
                 .unwrap()
@@ -1676,7 +1848,7 @@ async fn an_append_reads_nothing_of_the_table_it_did_not_write() {
         );
     }
     // The parent's facts are read; no other snapshot's.
-    let parent = big.snapshot.unwrap().parent_snapshot_id.unwrap();
+    let parent = big.report.snapshot.unwrap().parent_snapshot_id.unwrap();
     for p in big_reads.iter().filter(|p| p.contains("/metadata/peql/")) {
         assert!(
             p.contains(&format!("/metadata/peql/{parent}/"))
@@ -1691,10 +1863,16 @@ async fn an_append_reads_nothing_of_the_table_it_did_not_write() {
     );
 
     // The report is the append's; the facts are the table's.
-    assert_eq!((small.rows_written, big.rows_written), (10, 10));
-    assert_eq!(big.verdict.row_count, 10);
-    assert_eq!(big.verdict.failures["non_negative"], 1);
-    assert_eq!(big.verdict.data_hash, peql::manifest::data_hash(&big.files));
+    assert_eq!(
+        (small.report.rows_written, big.report.rows_written),
+        (10, 10)
+    );
+    assert_eq!(big.report.verdict.row_count, 10);
+    assert_eq!(big.report.verdict.failures["non_negative"], 1);
+    assert_eq!(
+        big.report.verdict.data_hash,
+        peql::manifest::data_hash(&big.report.files)
+    );
     let facts = engine.manifest("demo/readings").unwrap().unwrap();
     assert_eq!(facts.row_count, 170);
     assert_eq!(facts.failures["non_negative"], 17);
@@ -1720,9 +1898,11 @@ async fn missing_facts_are_rebuilt_from_the_writes_since_the_last_recorded() {
                 "demo/readings",
                 vec![batch(from, from + 9)],
                 WriteMode::Append,
+                OnWriteViolation::Warn,
             )
             .await
-            .unwrap();
+            .unwrap()
+            .report;
         snapshots.push(r.snapshot.unwrap().snapshot_id);
     }
     let t = table(&s.catalog, "readings").await;
@@ -1737,9 +1917,15 @@ async fn missing_facts_are_rebuilt_from_the_writes_since_the_last_recorded() {
     }
 
     let r = engine
-        .write("demo/readings", vec![batch(31, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(31, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     assert_eq!(r.verdict.row_count, 10);
     let last = r.snapshot.unwrap().snapshot_id;
     for s in &snapshots[1..] {
@@ -1791,13 +1977,18 @@ async fn rules_over_the_whole_table_are_decided_only_by_validate() {
     let everyone = Caller::new("x", "demo", "any");
     let read = || engine.query(r#"SELECT id FROM "demo/unique""#, &everyone);
     let append = |ids: &'static [i64]| {
-        engine.write("demo/unique", vec![plain(&cols, ids)], WriteMode::Append)
+        engine.write(
+            "demo/unique",
+            vec![plain(&cols, ids)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
     };
     let facts = || engine.manifest("demo/unique").unwrap().unwrap();
 
     // Writes decide nothing about the table: its rules are undecided, and it is served.
     let r = append(&[1, 2]).await.unwrap();
-    assert!(r.verdict.guarantees.is_empty());
+    assert!(r.report.verdict.guarantees.is_empty());
     append(&[2]).await.unwrap();
     assert!(facts().guarantees.is_empty(), "{:?}", facts().guarantees);
     assert!(facts().valid);
@@ -1827,7 +2018,7 @@ async fn rules_over_the_whole_table_are_decided_only_by_validate() {
     // An append carries the decisions forward unchanged, even past a bound it breaks; the
     // maximum it changes is kept up to date, and judged by nothing.
     let r = append(&[20]).await.unwrap();
-    assert!(r.verdict.valid);
+    assert!(r.report.verdict.valid);
     let after = facts();
     assert_eq!(after.guarantees, checked);
     assert_eq!(after.stats["kwh__max"], serde_json::json!(2000));
@@ -1855,7 +2046,12 @@ async fn a_validation_after_a_compaction_decides_the_compacted_snapshot() {
         .unwrap();
     for ids in [[1, 2], [3, 4], [5, 6]] {
         engine
-            .write("demo/unique", vec![plain(&cols, &ids)], WriteMode::Append)
+            .write(
+                "demo/unique",
+                vec![plain(&cols, &ids)],
+                WriteMode::Append,
+                OnWriteViolation::Warn,
+            )
             .await
             .unwrap();
     }
@@ -1889,9 +2085,15 @@ async fn a_validation_after_a_compaction_decides_the_compacted_snapshot() {
         assert_eq!((k.holds, k.snapshot_id), (true, Some(compacted)), "{id}");
     }
     let r = engine
-        .write("demo/unique", vec![plain(&cols, &[7])], WriteMode::Append)
+        .write(
+            "demo/unique",
+            vec![plain(&cols, &[7])],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let after = engine
         .manifest_as_of("demo/unique", r.snapshot.unwrap().snapshot_id)
         .await
@@ -1908,7 +2110,12 @@ async fn a_validation_after_a_compaction_decides_the_compacted_snapshot() {
 async fn a_reader_under_another_compilation_validates_rather_than_combining() {
     let s = setup().await;
     s.engine
-        .write("demo/readings", vec![batch(1, 20)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 20)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     // Another engine writes under a second form of the same contract.
@@ -1941,6 +2148,7 @@ async fn a_reader_under_another_compilation_validates_rather_than_combining() {
                 "demo/readings",
                 vec![batch(from, from + 9)],
                 WriteMode::Append,
+                OnWriteViolation::Warn,
             )
             .await
             .unwrap();
@@ -1978,9 +2186,15 @@ async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
     let s = setup().await;
     let first = s
         .engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap()
+        .report
         .snapshot
         .unwrap()
         .snapshot_id;
@@ -2014,9 +2228,15 @@ async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
     );
 
     let r = engine
-        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(41, 50)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     assert_eq!(r.verdict.row_count, 10);
     assert_eq!(r.table, None, "the table's facts are not recorded");
     let second = r.snapshot.unwrap().snapshot_id;
@@ -2122,9 +2342,11 @@ async fn a_write_reports_the_tables_rows_and_nulls_from_its_facts() {
             "demo/plain",
             vec![plain_with_nulls(&[1, 2, 3, 4])],
             WriteMode::Append,
+            OnWriteViolation::Warn,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let t = first.table.unwrap();
     assert_eq!((t.row_count, t.null_counts["a"]), (4, 1));
     let second = engine
@@ -2132,9 +2354,11 @@ async fn a_write_reports_the_tables_rows_and_nulls_from_its_facts() {
             "demo/plain",
             vec![plain_with_nulls(&[5, 6, 7, 8, 9])],
             WriteMode::Append,
+            OnWriteViolation::Warn,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     let reported = second.table.unwrap();
     assert_eq!(reported.row_count, 9);
     assert_eq!(

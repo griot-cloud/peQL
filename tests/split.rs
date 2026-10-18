@@ -6,7 +6,7 @@ use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use parcel_runtime::differential::differential;
-use peql::{Caller, Engine, WriteMode};
+use peql::{Caller, Engine, OnWriteViolation, WriteMode};
 
 const CONTRACT: &str = r#"
 contract: telco/subscribers
@@ -107,7 +107,12 @@ async fn stored_and_live_agree() {
     );
 
     engine
-        .write("telco/subscribers", vec![batch()], WriteMode::Overwrite)
+        .write(
+            "telco/subscribers",
+            vec![batch()],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
 

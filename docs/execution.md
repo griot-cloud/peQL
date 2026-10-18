@@ -28,7 +28,7 @@ Queries use the manifest to check whether the data can be served. They can reuse
 
 These are separate checks: evaluating a row expression live does not refresh a saved dataset verdict. Writes through peQL update manifests from the rows they write; `validate` recomputes a manifest from the whole dataset; external file edits update nothing. Contract changes that affect validation should be followed by a rewrite from the source data.
 
-A write is not a transaction that rolls back on a failed quality check. Data can be stored and subsequently marked unservable. The write report tells you which checks failed.
+A write's `on_violation` decides what happens to rows that break a row rule. Under the default, `refuse`, nothing the write wrote is published. Under `exclude`, the rows are flagged before they are written and only those that pass are written. Under `warn`, every row is stored. A read's view filters out every row that fails a `drop` or `deny` assert, and the envelope counts the rows it left out per rule from the manifest. A dataset is not servable only when a deny-level guarantee failed when `validate` last decided it.
 
 ## Keeping rules in the execution plan
 

@@ -99,3 +99,40 @@ def test_parallel_queries_keep_each_callers_view(tmp_path):
 
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(read, ["acme", "globex"] * 8))
+
+
+READINGS_CONTRACT = """
+contract: demo/readings
+version: 1
+owner: acme
+binding: {parquet: readings/}
+expose:
+  - {name: id, type: int64}
+  - {name: kwh, type: int64}
+rules:
+  - {id: non_negative, op: assert, expr: "row.kwh >= 0", on_fail: drop}
+"""
+
+READINGS = pa.table({"id": pa.array([1, 2, 3, 4], pa.int64()), "kwh": pa.array([5, -1, 7, -2], pa.int64())})
+
+
+def test_rows_that_break_a_rule_are_refused_set_aside_or_left_out(tmp_path):
+    eng = peql.Engine.open(tmp_path)
+    eng.register(READINGS_CONTRACT, READINGS)
+    owner = peql.Caller("user:alice", "analytics", "acme")
+    with pytest.raises(peql.Refused, match=r"non_negative \(2 rows\)"):
+        eng.write("demo/readings", READINGS)
+
+    report = eng.write("demo/readings", READINGS, on_violation="exclude")
+    assert (report["rows_written"], report["rows_excluded"]) == (2, 2)
+    assert report["violations"] == {"non_negative": 2}
+    assert report["excluded"].column("id").to_pylist() == [2, 4]
+    assert report["excluded"].column("_violations").to_pylist() == [["non_negative"], ["non_negative"]]
+
+    report = eng.write("demo/readings", READINGS, on_violation="warn")
+    assert report["rows_written"] == 4 and report["excluded"] is None
+    t, envelope = eng.query_with_envelope('SELECT id FROM "demo/readings" ORDER BY id', owner)
+    assert t.column("id").to_pylist() == [1, 3]
+    assert envelope["contracts"][0]["excluded"] == {"non_negative": 2}
+    with pytest.raises(peql.Refused, match=r"non_negative \(2 rows\)"):
+        eng.query('SELECT id FROM "demo/readings"', owner, on_violation="refuse")

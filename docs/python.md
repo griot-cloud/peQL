@@ -59,12 +59,15 @@ orders = pa.table({
 engine = peql.Engine.open("python-demo")
 contract = Path("peql-demo/orders.yaml").read_text()
 engine.register(contract, schema=orders.schema)
-report = engine.write("sales/orders", orders)
-print(report["verdict"])
+report = engine.write("sales/orders", orders, on_violation="exclude")
+print(report["violations"])               # {'positive_amount': 1}
+print(report["excluded"].to_pylist())     # order 3, with its _violations
 engine.publish("sales/orders", "globex")
 ```
 
-`register` takes contract text, not a filename. `write` replaces the bound Parquet data by default; pass `append=True` to add rows. Inspect `report["verdict"]["valid"]` before assuming the data can be queried.
+`register` takes contract text, not a filename. `write` replaces the bound Parquet data by default; pass `append=True` to add rows.
+
+Order 3 breaks the contract's `positive_amount` rule. By default, `write` refuses such rows: it writes nothing and raises `peql.Refused`, naming each rule and how many rows broke it. With `on_violation="exclude"` it writes the rows that pass and returns the others in `report["excluded"]`, a table with a `_violations` column listing the rules each row broke. `on_violation="warn"` writes every row. Queries never return rows that break a row rule: by default they leave them out and count them in the envelope; `query(sql, caller, on_violation="refuse")` refuses instead. See [Rows that break a contract](reference.md#rows-that-break-a-contract).
 
 ## Common methods
 
@@ -74,10 +77,10 @@ engine.publish("sales/orders", "globex")
 | `Engine.in_memory(base=".")` | Keep engine state in memory; relative data paths still resolve under `base`. |
 | `register(source, schema)` | Register YAML/JSON contract text against an Arrow schema or table. |
 | `register_compiled(contract, compiled)` | Register a contract parcel already compiled (`parcel compile -o` bytes), as given; nothing is compiled. |
-| `write(name, data, append=False)` | Write an Arrow table or batch; return a report dictionary. |
+| `write(name, data, append=False, on_violation="refuse")` | Write an Arrow table or batch; return a report dictionary. |
 | `validate(name)` | Return a verdict dictionary. |
-| `query(sql, caller)` | Return an Arrow table. |
-| `query_with_envelope(sql, caller)` | Return `(table, metadata)`. |
+| `query(sql, caller, on_violation="exclude")` | Return an Arrow table. |
+| `query_with_envelope(sql, caller, on_violation="exclude")` | Return `(table, metadata)`. |
 | `describe(name, caller)` | Return exposed `(column, type)` pairs. |
 | `contracts()` | List registered contract names, without a caller visibility check. |
 | `publish(name, audience)` / `unpublish(name, audience)` | Share or withdraw visibility. |

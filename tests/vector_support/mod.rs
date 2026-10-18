@@ -4,7 +4,7 @@ use datafusion::arrow::{
     datatypes::{DataType, Field, Float32Type, Schema, SchemaRef},
 };
 use parcel_core::registry::FunctionManifest;
-use peql::{Caller, Engine, WriteMode, audit::MemoryAudit};
+use peql::{Caller, Engine, OnWriteViolation, WriteMode, audit::MemoryAudit};
 use std::sync::Arc;
 
 pub fn schema() -> SchemaRef {
@@ -94,7 +94,12 @@ pub async fn engine(dir: &std::path::Path, audit: Arc<MemoryAudit>, mask: bool) 
     engine.register_contract(&contract, &schema()).unwrap();
     engine.publish("demo/vectors", "partner").unwrap();
     engine
-        .write("demo/vectors", vec![batch()], WriteMode::Overwrite)
+        .write(
+            "demo/vectors",
+            vec![batch()],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     engine

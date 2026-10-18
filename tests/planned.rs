@@ -10,7 +10,7 @@ use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_plan::execution_plan::reset_plan_states;
 use paths::{Answer, BOTH, Path, answer, run};
 use peql::audit::{MemoryAudit, Outcome};
-use peql::{Caller, Engine, PeqlError, WriteMode};
+use peql::{Caller, Engine, OnReadViolation, OnWriteViolation, PeqlError, WriteMode};
 
 /// Guests see every region but `XS`; the tenant `tiny` sees only `XS`, which has three rows.
 const CELLS: &str = r#"
@@ -161,7 +161,7 @@ async fn engine(dir: &std::path::Path, audit: Arc<MemoryAudit>) -> Engine {
     }
     // Several parts, so the data is several files and the plan several partitions.
     let w = e
-        .begin_write("demo/cells", WriteMode::Overwrite)
+        .begin_write("demo/cells", WriteMode::Overwrite, OnWriteViolation::Warn)
         .await
         .unwrap();
     for part in 0..4 {
@@ -170,9 +170,14 @@ async fn engine(dir: &std::path::Path, audit: Arc<MemoryAudit>) -> Engine {
             .unwrap();
     }
     e.finish_write(w).await.unwrap();
-    e.write("demo/pay", vec![pay()], WriteMode::Overwrite)
-        .await
-        .unwrap();
+    e.write(
+        "demo/pay",
+        vec![pay()],
+        WriteMode::Overwrite,
+        OnWriteViolation::Warn,
+    )
+    .await
+    .unwrap();
     e
 }
 
@@ -482,7 +487,7 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
     assert_eq!(before.row_count as i64, N);
 
     let w = e
-        .begin_write("demo/cells", WriteMode::Append)
+        .begin_write("demo/cells", WriteMode::Append, OnWriteViolation::Warn)
         .await
         .unwrap();
     assert_eq!(w.contract(), "demo/cells");
@@ -490,7 +495,10 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
         e.write_part(&w, vec![cells(N, N + 100)]),
         e.write_part(&w, vec![cells(N + 100, N + 250)])
     );
-    assert_eq!((a.unwrap(), b.unwrap()), (100, 150));
+    assert_eq!(
+        (a.unwrap().rows_written, b.unwrap().rows_written),
+        (100, 150)
+    );
     assert_eq!(w.rows(), 250);
     // Until the write finishes, the manifest describes the data as it was.
     assert_eq!(
@@ -511,7 +519,7 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
 
     // An overwrite replaces what is there when it finishes.
     let w = e
-        .begin_write("demo/cells", WriteMode::Overwrite)
+        .begin_write("demo/cells", WriteMode::Overwrite, OnWriteViolation::Warn)
         .await
         .unwrap();
     e.write_part(&w, vec![cells(0, 10)]).await.unwrap();
@@ -520,7 +528,7 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
 
     // A part that does not conform leaves an overwrite's old data where it was.
     let w = e
-        .begin_write("demo/cells", WriteMode::Overwrite)
+        .begin_write("demo/cells", WriteMode::Overwrite, OnWriteViolation::Warn)
         .await
         .unwrap();
     let alien = RecordBatch::try_new(
@@ -537,14 +545,18 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
     assert_eq!(e.validate("demo/cells").await.unwrap().row_count, 10);
     // An overwrite with no parts at all empties the contract.
     let w = e
-        .begin_write("demo/cells", WriteMode::Overwrite)
+        .begin_write("demo/cells", WriteMode::Overwrite, OnWriteViolation::Warn)
         .await
         .unwrap();
     assert_eq!(e.finish_write(w).await.unwrap().verdict.row_count, 0);
 
     // A contract bound to a table is not written.
     e.bind_batches("demo/pay", vec![pay()]).await.unwrap();
-    assert!(e.begin_write("demo/pay", WriteMode::Append).await.is_err());
+    assert!(
+        e.begin_write("demo/pay", WriteMode::Append, OnWriteViolation::Warn)
+            .await
+            .is_err()
+    );
 }
 
 /// Two contracts bound to the same files have one location, whatever their names; a contract
@@ -566,7 +578,10 @@ async fn contracts_over_the_same_files_share_a_location() {
 async fn a_plan_for_fewer_partitions_answers_the_same() {
     let dir = tempfile::tempdir().unwrap();
     let e = engine(dir.path(), Arc::default()).await;
-    let one = e.view_for("demo/cells", &owner(), Some(1)).await.unwrap();
+    let one = e
+        .view_for("demo/cells", &owner(), Some(1), OnReadViolation::Exclude)
+        .await
+        .unwrap();
     let mut widest = 0;
     let _ = datafusion::common::tree_node::TreeNode::apply(&one.plan, |node| {
         widest = widest.max(node.properties().partitioning.partition_count());
@@ -579,7 +594,11 @@ async fn a_plan_for_fewer_partitions_answers_the_same() {
         keyed_rows(&run(default).await.batches, &[])
     );
     let sql = r#"SELECT dept, SUM(amount) AS s FROM "demo/cells" GROUP BY dept ORDER BY dept"#;
-    let two = run(e.plan_for(sql, &owner(), Some(2)).await.unwrap()).await;
+    let two = run(e
+        .plan_for(sql, &owner(), Some(2), OnReadViolation::Exclude)
+        .await
+        .unwrap())
+    .await;
     let any = run(e.plan(sql, &owner()).await.unwrap()).await;
     assert_eq!(two.batches, any.batches);
 }
@@ -615,7 +634,7 @@ async fn a_write_inside_its_memory_cuts_its_row_groups() {
     let e = engine(dir.path(), Arc::default()).await;
     let rows = 200_000;
     let w = e
-        .begin_write("demo/cells", WriteMode::Overwrite)
+        .begin_write("demo/cells", WriteMode::Overwrite, OnWriteViolation::Warn)
         .await
         .unwrap()
         .with_memory(4 << 20);
@@ -630,7 +649,7 @@ async fn a_write_inside_its_memory_cuts_its_row_groups() {
     );
 
     let w = e
-        .begin_write("demo/cells", WriteMode::Overwrite)
+        .begin_write("demo/cells", WriteMode::Overwrite, OnWriteViolation::Warn)
         .await
         .unwrap();
     e.write_part(&w, vec![cells(0, rows)]).await.unwrap();

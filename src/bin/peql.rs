@@ -11,7 +11,7 @@ use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::prelude::{CsvReadOptions, ParquetReadOptions, SessionContext};
 use peql::format::{ResultFormat, ResultFormatter};
-use peql::{Caller, Engine, PeqlError, WriteMode};
+use peql::{Caller, Engine, OnReadViolation, OnWriteViolation, PeqlError, WriteMode};
 
 #[derive(Parser)]
 #[command(name = "peql", version, about = "Query data through parcel contracts")]
@@ -54,6 +54,14 @@ enum Command {
         /// Add to the existing data instead of replacing it.
         #[arg(long)]
         append: bool,
+        /// Rows that break a row rule: refuse the write, exclude them (into `--excluded`), or
+        /// warn and commit them.
+        #[arg(long, default_value = "refuse")]
+        on_violation: OnWriteViolation,
+        /// Where `--on-violation exclude` writes the rows it sets aside, as Parquet, with the
+        /// rules each broke.
+        #[arg(long, required_if_eq("on_violation", "exclude"))]
+        excluded: Option<PathBuf>,
         #[command(flatten)]
         types: TypeHints,
     },
@@ -76,6 +84,9 @@ enum Command {
         /// Print the physical plan instead of running the query (operators only).
         #[arg(long)]
         explain: bool,
+        /// Rows that break a row rule: exclude them (and count them), or refuse the query.
+        #[arg(long, default_value = "exclude")]
+        on_violation: OnReadViolation,
     },
     /// The schema a caller would see.
     Describe {
@@ -249,6 +260,8 @@ async fn run(cli: Cli) -> R {
             contract,
             input,
             append,
+            on_violation,
+            excluded,
             types,
         } => {
             let (schema, batches) = read_data(&input, &types).await?;
@@ -267,24 +280,36 @@ async fn run(cli: Cli) -> R {
             } else {
                 WriteMode::Overwrite
             };
-            let report = engine.write(&name, batches, mode).await.map_err(s)?;
-            let v = &report.verdict;
+            let outcome = match engine.write(&name, batches, mode, on_violation).await {
+                Ok(o) => o,
+                Err(e @ PeqlError::Violated { .. }) => {
+                    eprintln!("refused: {e}");
+                    return Ok(ExitCode::from(1));
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            let report = &outcome.report;
             println!(
-                "wrote {} rows to {name} ({} files): {}",
+                "wrote {} rows to {name} ({} files)",
                 report.rows_written,
                 report.files.len(),
-                if v.valid {
-                    "valid".to_owned()
-                } else {
-                    format!("NOT SERVABLE ({})", v.breached.join(", "))
-                }
             );
-            for (id, fails) in &v.failures {
-                if *fails > 0 {
-                    println!("  {id}: {fails} rows fail");
-                }
+            let what = match on_violation {
+                OnWriteViolation::Exclude => "set aside",
+                OnWriteViolation::Warn | OnWriteViolation::Refuse => "committed",
+            };
+            for (rule, n) in &report.violations {
+                println!("  {rule}: {n} rows break it ({what})");
             }
-            Ok(if v.valid {
+            if let (Some(rows), Some(path)) = (&outcome.excluded, &excluded) {
+                emit(std::slice::from_ref(rows), Output::Parquet, Some(path))?;
+                println!(
+                    "  {} rows set aside in {}",
+                    report.rows_excluded,
+                    path.display()
+                );
+            }
+            Ok(if report.verdict.valid {
                 ExitCode::SUCCESS
             } else {
                 ExitCode::from(1)
@@ -306,13 +331,17 @@ async fn run(cli: Cli) -> R {
             out,
             envelope,
             explain,
+            on_violation,
         } => {
             let caller = caller.resolve()?;
             if explain {
                 println!("{}", engine.explain(&sql, &caller).await.map_err(s)?);
                 return Ok(ExitCode::SUCCESS);
             }
-            let res = match engine.query(&sql, &caller).await {
+            let res = match engine
+                .query_as_of(&sql, &caller, &peql::AsOf::current(), on_violation)
+                .await
+            {
                 Ok(r) => r,
                 Err(e) if e.is_refusal() => {
                     eprintln!("refused: {e}");
@@ -328,6 +357,9 @@ async fn run(cli: Cli) -> R {
                 );
             } else {
                 for c in &res.envelope.contracts {
+                    for (rule, n) in &c.excluded {
+                        eprintln!("note: `{}` left out {n} rows that break {rule}", c.contract);
+                    }
                     if !c.annotations.is_empty() {
                         eprintln!(
                             "note: `{}` guarantees not met: {}",
@@ -362,11 +394,7 @@ async fn run(cli: Cli) -> R {
                         m.row_count,
                         m.written_at.format("%Y-%m-%d %H:%M")
                     ),
-                    Some(m) => format!(
-                        "{} rows, NOT SERVABLE ({})",
-                        m.row_count,
-                        m.breached.join(", ")
-                    ),
+                    Some(m) => format!("{} rows, breaks {}", m.row_count, m.breached.join(", ")),
                     None => "no data".into(),
                 };
                 let audiences: Vec<String> =

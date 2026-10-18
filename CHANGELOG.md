@@ -65,8 +65,29 @@ bundle fetch are gone, and what a host needs to serve it is here instead.
   an executor running it inside a memory budget plans for the parallelism the budget holds.
 - The envelope names its caller and the epsilon charged; `QueryResult` carries the answer's
   schema and the signature.
+- What happens to rows that break a contract's row rules (a failing `drop` or `deny` assert;
+  `report` asserts only count). A write takes `OnWriteViolation`: `Refuse` (the default)
+  commits nothing and fails with `PeqlError::Violated { contract, violations }`, each rule with
+  its row count; `Exclude` commits only the rows that pass and returns the others, in the row
+  schema plus a `_violations` list of the rules each broke (`violation::VIOLATIONS_COLUMN`);
+  `Warn` commits every row. `WriteReport` gains `on_violation`, `violations` (rows per rule)
+  and `rows_excluded`. A read takes `OnReadViolation`: `Exclude` (the default) leaves the rows
+  out and reports them per rule in `Resolution::excluded`; `Refuse` fails with `Violated`.
+  There is no mode in which a read returns them; caller-level rules refuse first, whatever
+  the mode. Flight reads take the `x-peql-on-violation` header and ingests the `on_violation`
+  option (`refuse` or `warn`); the CLI's `write` and `query` take `--on-violation`, and
+  `write --excluded PATH` keeps the set-aside rows; Python's `write` and `query` take
+  `on_violation=` and the write report carries `excluded` as a table.
 
 **Changed**
+- `Engine::write(name, batches, mode, on_violation)` returns `WriteOutcome { report, excluded }`;
+  `Engine::begin_write` takes `on_violation`; `Engine::write_part` returns
+  `Part { rows_written, excluded }`. `query_as_of`, `plan_for`, `plan_as_of`, `view_for`,
+  `view_as_of` and `check` take an `OnReadViolation`.
+- A contract's view leaves out rows that fail a `deny` assert as well as a `drop` one, so the
+  view hash of a contract with a deny-level assert changes. Failing rows of a deny-level assert
+  no longer make the data `NotServable`: `NotServable` names only deny-level guarantees that
+  failed when last decided.
 - `BindingResolver::root` is `location`, which returns a `Location` (local path or object store
   prefix); `object_stores` lets a resolver register its stores with every session.
 - Signed bundles are feature `signed-bundle` (`peql::signed_bundle`), verify-only:

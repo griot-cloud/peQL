@@ -2,7 +2,7 @@
 mod vector_support;
 use datafusion::arrow::array::{Array, Float64Array};
 use peql::{
-    Caller, PeqlError,
+    Caller, OnWriteViolation, PeqlError,
     audit::{MemoryAudit, Outcome},
 };
 use sha2::{Digest, Sha256};
@@ -207,7 +207,12 @@ async fn an_exposed_distance_column_cannot_be_silently_replaced() {
     let data = RecordBatch::try_new(schema.clone(), columns).unwrap();
     engine.register_contract("contract: demo/collision\nversion: 1\nowner: demo\nbinding: {parquet: collision/}\nexpose: [{name: id, type: int64}, {name: embedding, type: 'fixed_size_list<float32, 2>'}, {name: distance, type: float64}]\nrules: []", &schema).unwrap();
     engine
-        .write("demo/collision", vec![data], peql::WriteMode::Overwrite)
+        .write(
+            "demo/collision",
+            vec![data],
+            peql::WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let error = engine
@@ -256,7 +261,12 @@ async fn invalid_and_zero_norm_candidates_do_not_consume_cosine_top_k() {
     .unwrap();
     engine.register_contract("contract: demo/vectors\nversion: 1\nowner: demo\nbinding: {parquet: vectors/}\nexpose: [{name: id, type: int64}, {name: embedding, type: 'fixed_size_list<float32, 2>'}]\nrules: []", &schema()).unwrap();
     engine
-        .write("demo/vectors", vec![data], peql::WriteMode::Overwrite)
+        .write(
+            "demo/vectors",
+            vec![data],
+            peql::WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let cosine = engine

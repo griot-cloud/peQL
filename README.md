@@ -8,7 +8,7 @@ Policy Enforcing Query Engine (peQL) is a SQL query engine that lets you define 
 
 **Set limits on what agents can query.** Give an agent access to the rows and columns its task requires. peQL applies those limits to the SQL it submits.
 
-**Keep failed quality checks out of reports.** Exclude rows that fail required checks, or refuse queries when a dataset fails a quality or freshness requirement.
+**Keep failed quality checks out of reports.** Refuse writes of rows that break a contract's checks or set them aside, never return such rows to a query, and refuse queries when a dataset fails a quality or freshness requirement.
 
 **Share statistics with privacy rules.** Suppress results for small groups, add noise to aggregates and limit repeated queries with a privacy budget.
 

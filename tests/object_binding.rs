@@ -9,7 +9,7 @@ use futures::TryStreamExt;
 use object_store::ObjectStore;
 use object_store::memory::InMemory;
 use object_store::path::Path as ObjectPath;
-use peql::{Engine, ObjectStoreParquet, WriteMode};
+use peql::{Engine, ObjectStoreParquet, OnWriteViolation, WriteMode};
 use support::*;
 
 async fn keys(store: &Arc<dyn ObjectStore>, prefix: &str) -> Vec<String> {
@@ -33,9 +33,15 @@ async fn scenario(base: &str, store: Arc<dyn ObjectStore>, prefix: &str) {
     engine.publish("demo/readings", "partner").unwrap();
 
     let report = engine
-        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     assert_eq!(report.rows_written, 40);
     assert!(report.verdict.valid);
 
@@ -98,7 +104,12 @@ async fn scenario(base: &str, store: Arc<dyn ObjectStore>, prefix: &str) {
 
     // Replace the data: the old files go, the manifest follows.
     engine
-        .write("demo/readings", vec![batch(1, 10)], WriteMode::Overwrite)
+        .write(
+            "demo/readings",
+            vec![batch(1, 10)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
     let res = engine
@@ -138,7 +149,12 @@ async fn bindings_resolve_inside_the_store_or_not_at_all() {
             .replace("version: 1", &format!("version: {}", version + 1));
         engine.register_contract(&doc, &schema()).unwrap();
         let res = engine
-            .write("demo/readings", vec![batch(1, 4)], WriteMode::Overwrite)
+            .write(
+                "demo/readings",
+                vec![batch(1, 4)],
+                WriteMode::Overwrite,
+                OnWriteViolation::Warn,
+            )
             .await;
         assert_eq!(res.is_ok(), ok, "{binding}: {:?}", res.err());
     }
@@ -164,4 +180,53 @@ fn an_s3_store_is_passed_in_not_read_from_the_environment() {
     let stores = r.object_stores();
     assert_eq!(stores.len(), 1);
     assert_eq!(stores[0].0.as_str(), "s3://lake/");
+}
+
+/// A write refused for rows that break a rule puts nothing in the store and leaves nothing
+/// staged; one that sets them aside puts only the rows that pass.
+#[tokio::test]
+async fn a_refused_write_puts_nothing_in_the_store() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let disk = tempfile::tempdir().unwrap();
+    let engine = Engine::open(disk.path()).unwrap().with_bindings(Arc::new(
+        ObjectStoreParquet::new("s3://lake/tenant-a/", store.clone()).unwrap(),
+    ));
+    engine.register_contract(READINGS, &schema()).unwrap();
+    let refused = engine
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Refuse,
+        )
+        .await;
+    assert!(
+        matches!(&refused, Err(peql::PeqlError::Violated { violations, .. }) if violations == &[("non_negative".to_owned(), 4)]),
+        "{:?}",
+        refused.map(|o| o.report)
+    );
+    assert_eq!(keys(&store, "tenant-a").await, Vec::<String>::new());
+    let staging = disk.path().join("_peql/staging");
+    assert!(
+        !staging.exists() || std::fs::read_dir(&staging).unwrap().next().is_none(),
+        "nothing is left staged"
+    );
+
+    let outcome = engine
+        .write(
+            "demo/readings",
+            vec![batch(1, 40)],
+            WriteMode::Append,
+            OnWriteViolation::Exclude,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.report.rows_written, 36);
+    assert_eq!(outcome.excluded.unwrap().num_rows(), 4);
+    let res = engine
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(40));
+    assert!(res.envelope.contracts[0].excluded.is_empty());
 }

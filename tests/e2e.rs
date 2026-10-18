@@ -12,7 +12,9 @@ use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use parcel_runtime::differential::differential;
-use peql::{Caller, Engine, PeqlError as EngineError, WriteMode};
+use peql::{
+    Caller, Engine, OnReadViolation, OnWriteViolation, PeqlError as EngineError, WriteMode,
+};
 
 const CONTRACT: &str = include_str!("fixtures/sales_orders.yaml");
 
@@ -206,10 +208,15 @@ async fn end_to_end(binding: Binding) {
 
     // Write: flags, layout, manifest, verdict.
     let report = engine
-        .write("sales/orders", vec![batch(&data)], WriteMode::Overwrite)
+        .write(
+            "sales/orders",
+            vec![batch(&data)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
         .unwrap();
-    let v = &report.verdict;
+    let v = &report.report.verdict;
     assert!(v.valid, "{v:#?}");
     assert_eq!(v.row_count, 600);
     assert_eq!(v.failures["pk_present"], 0);
@@ -222,14 +229,14 @@ async fn end_to_end(binding: Binding) {
     // A write's verdict is its row rules over its rows; guarantees are the whole data's.
     assert!(v.guarantees.is_empty(), "{:?}", v.guarantees);
     assert!(
-        report.files.len() >= 4,
+        report.report.files.len() >= 4,
         "partitioned by region and dt: {} files",
-        report.files.len()
+        report.report.files.len()
     );
 
     let manifest = engine.manifest("sales/orders").unwrap().unwrap();
     assert!(manifest.valid);
-    assert_eq!(manifest.files, report.files);
+    assert_eq!(manifest.files, report.report.files);
     assert_eq!(manifest.data_hash, v.data_hash);
     assert!(
         manifest.flags_current(
@@ -451,38 +458,511 @@ async fn end_to_end(binding: Binding) {
     let _ = Utc.timestamp_opt(0, 0);
 }
 
-async fn deny_rules_make_data_unservable(binding: Binding) {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = engine(dir.path(), binding).await;
+/// Every tenant's rows, and no suppression: what the admit and the shapes let through.
+fn admin() -> Caller {
+    Caller::new("root", "acme", "reporting").with_roles(&["admin"])
+}
+
+/// The orders with order 5's id missing: it breaks `pk_present` (deny); every 25th order
+/// breaks `amount_consistent` (drop), and every 20th phone number fails `msisdn_format`, which
+/// only reports.
+fn breaking() -> Vec<Order> {
     let mut data = orders();
     data[5].order_id = None;
-    let report = engine
-        .write("sales/orders", vec![batch(&data)], WriteMode::Overwrite)
-        .await
-        .unwrap();
-    assert!(!report.verdict.valid);
-    assert_eq!(report.verdict.breached, ["pk_present"]);
-    let q = engine
-        .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
+    data
+}
+
+/// The orders that break no row rule.
+fn passing() -> Vec<Order> {
+    orders()
+        .into_iter()
+        .filter(|o| o.amount == o.unit * o.qty as i64)
+        .collect()
+}
+
+const ALL_IDS: &str = r#"SELECT order_id FROM "sales/orders""#;
+
+fn order_ids(batches: &[RecordBatch]) -> Vec<Option<i64>> {
+    let mut ids: Vec<Option<i64>> = batches
+        .iter()
+        .flat_map(|b| {
+            let a = b
+                .column_by_name("order_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .clone();
+            (0..a.len()).map(move |i| a.is_valid(i).then(|| a.value(i)))
+        })
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Every `.parquet` file under `dir`.
+fn parquet_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for e in std::fs::read_dir(&d).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+            } else if p.extension().is_some_and(|x| x == "parquet") {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// A write refuses rows that break a row rule unless the writer asks otherwise: the refusal
+/// names each rule and its count, in the contract's order, and nothing is committed.
+async fn a_write_refuses_rows_that_break_a_rule_by_default(binding: Binding) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), binding).await;
+    assert_eq!(OnWriteViolation::default(), OnWriteViolation::Refuse);
+    let refused = engine
+        .write(
+            "sales/orders",
+            vec![batch(&breaking())],
+            WriteMode::Overwrite,
+            OnWriteViolation::default(),
+        )
         .await;
+    match refused {
+        Err(EngineError::Violated {
+            contract,
+            violations,
+        }) => {
+            assert_eq!(contract, "sales/orders");
+            assert_eq!(
+                violations,
+                [
+                    ("pk_present".to_owned(), 1),
+                    ("amount_consistent".to_owned(), 24)
+                ]
+            );
+        }
+        other => panic!("{:?}", other.map(|o| o.report)),
+    }
+    let e = engine
+        .write(
+            "sales/orders",
+            vec![batch(&breaking())],
+            WriteMode::Append,
+            OnWriteViolation::Refuse,
+        )
+        .await
+        .unwrap_err();
+    assert!(e.is_refusal());
     assert!(
-        matches!(q, Err(EngineError::NotServable { .. })),
+        e.to_string()
+            .contains("pk_present (1 row), amount_consistent (24 rows)"),
+        "{e}"
+    );
+    assert!(engine.manifest("sales/orders").unwrap().is_none());
+    assert_eq!(parquet_files(dir.path()), Vec::<std::path::PathBuf>::new());
+    let q = engine.query(ALL_IDS, &admin()).await;
+    assert!(
+        matches!(q, Err(EngineError::NotWritten { .. })),
         "{:?}",
         q.err()
     );
 
-    // Fixing the data by overwriting makes it servable again.
+    // Rows that break no rule are written; a report-level assert's failures refuse nothing.
     let report = engine
-        .write("sales/orders", vec![batch(&orders())], WriteMode::Overwrite)
+        .write(
+            "sales/orders",
+            vec![batch(&passing())],
+            WriteMode::Overwrite,
+            OnWriteViolation::Refuse,
+        )
+        .await
+        .unwrap()
+        .report;
+    assert_eq!(report.rows_written, 576);
+    assert_eq!(report.on_violation, OnWriteViolation::Refuse);
+    assert!(report.violations.is_empty());
+    assert_eq!(report.rows_excluded, 0);
+    assert_eq!(report.verdict.failures["msisdn_format"], 30);
+    assert!(report.verdict.valid);
+}
+
+/// `exclude` commits only the rows that break no rule and hands the others back, each with the
+/// rules it broke; the report counts them per rule.
+async fn exclude_commits_only_the_rows_that_pass(binding: Binding) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), binding).await;
+    let outcome = engine
+        .write(
+            "sales/orders",
+            vec![batch(&breaking())],
+            WriteMode::Overwrite,
+            OnWriteViolation::Exclude,
+        )
         .await
         .unwrap();
-    assert!(report.verdict.valid);
-    assert!(
-        engine
-            .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
-            .await
-            .is_ok()
+    let report = &outcome.report;
+    assert_eq!(report.rows_written, 575);
+    assert_eq!(report.rows_excluded, 25);
+    assert_eq!(
+        report.violations,
+        BTreeMap::from([
+            ("pk_present".to_owned(), 1),
+            ("amount_consistent".to_owned(), 24)
+        ])
     );
+    assert!(report.verdict.valid, "{:?}", report.verdict.breached);
+    assert_eq!(report.verdict.row_count, 575);
+    assert_eq!(report.verdict.failures["pk_present"], 0);
+    assert_eq!(report.verdict.failures["amount_consistent"], 0);
+    assert_eq!(report.verdict.failures["msisdn_format"], 30);
+
+    let excluded = outcome.excluded.as_ref().unwrap();
+    assert_eq!(excluded.num_rows(), 25);
+    let mut columns: Vec<String> = schema().fields().iter().map(|f| f.name().clone()).collect();
+    columns.push(peql::violation::VIOLATIONS_COLUMN.to_owned());
+    let names: Vec<String> = excluded
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, columns);
+    let ids = excluded
+        .column_by_name("order_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .clone();
+    let reasons = excluded
+        .column_by_name(peql::violation::VIOLATIONS_COLUMN)
+        .unwrap()
+        .as_any()
+        .downcast_ref::<ListArray>()
+        .unwrap()
+        .clone();
+    let mut set_aside = Vec::new();
+    for i in 0..excluded.num_rows() {
+        let rules = reasons.value(i);
+        let rules = rules.as_any().downcast_ref::<StringArray>().unwrap();
+        let rules: Vec<&str> = (0..rules.len()).map(|r| rules.value(r)).collect();
+        set_aside.push((ids.is_valid(i).then(|| ids.value(i)), rules.join(",")));
+    }
+    set_aside.sort();
+    let mut expected = vec![(None, "pk_present".to_owned())];
+    expected.extend(
+        (0..600)
+            .step_by(25)
+            .map(|i| (Some(i), "amount_consistent".to_owned())),
+    );
+    assert_eq!(set_aside, expected);
+
+    // What was committed breaks nothing, so a read leaves nothing out, and a read that
+    // refuses breaking rows is answered.
+    let res = engine.query(ALL_IDS, &admin()).await.unwrap();
+    assert_eq!(res.envelope.rows, 575);
+    assert!(res.envelope.contracts[0].excluded.is_empty());
+    assert!(!order_ids(&res.batches).contains(&None));
+    let refusing = engine
+        .query_as_of(
+            ALL_IDS,
+            &admin(),
+            &peql::AsOf::current(),
+            OnReadViolation::Refuse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(refusing.envelope.rows, 575);
+
+    // A write in parts hands each part's breaking rows back from that part, and holds none.
+    let w = engine
+        .begin_write("sales/orders", WriteMode::Append, OnWriteViolation::Exclude)
+        .await
+        .unwrap();
+    let data = breaking();
+    let first = engine
+        .write_part(&w, vec![batch(&data[..300])])
+        .await
+        .unwrap();
+    let second = engine
+        .write_part(&w, vec![batch(&data[300..])])
+        .await
+        .unwrap();
+    assert_eq!((first.rows_written, second.rows_written), (287, 288));
+    assert_eq!(first.excluded.unwrap().num_rows(), 13);
+    assert_eq!(second.excluded.unwrap().num_rows(), 12);
+    let report = engine.finish_write(w).await.unwrap();
+    assert_eq!((report.rows_written, report.rows_excluded), (575, 25));
+    assert_eq!(report.violations["amount_consistent"], 24);
+    assert_eq!(
+        engine.query(ALL_IDS, &admin()).await.unwrap().envelope.rows,
+        1150
+    );
+
+    // A write all of whose rows break a rule commits none of them.
+    let all_breaking: Vec<Order> = breaking()
+        .into_iter()
+        .filter(|o| o.order_id.is_none() || o.amount != o.unit * o.qty as i64)
+        .collect();
+    let outcome = engine
+        .write(
+            "sales/orders",
+            vec![batch(&all_breaking)],
+            WriteMode::Append,
+            OnWriteViolation::Exclude,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        (outcome.report.rows_written, outcome.report.rows_excluded),
+        (0, 25)
+    );
+    assert_eq!(outcome.excluded.unwrap().num_rows(), 25);
+    assert_eq!(
+        engine.query(ALL_IDS, &admin()).await.unwrap().envelope.rows,
+        1150
+    );
+}
+
+/// `warn` commits every row and marks the write; a read then leaves the breaking rows out and
+/// counts them, or, asked to refuse them, is refused naming each rule and its count.
+async fn warn_commits_every_row_and_a_read_leaves_the_breaking_ones_out(binding: Binding) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), binding).await;
+    let report = engine
+        .write(
+            "sales/orders",
+            vec![batch(&breaking())],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
+        .await
+        .unwrap()
+        .report;
+    assert_eq!(report.rows_written, 600);
+    assert_eq!(report.rows_excluded, 0);
+    assert_eq!(
+        report.violations,
+        BTreeMap::from([
+            ("pk_present".to_owned(), 1),
+            ("amount_consistent".to_owned(), 24)
+        ])
+    );
+    assert!(!report.verdict.valid);
+    assert_eq!(report.verdict.breached, ["pk_present"]);
+
+    // By default the view leaves them out, and the envelope says how many per rule.
+    let res = engine.query(ALL_IDS, &admin()).await.unwrap();
+    assert_eq!(res.envelope.rows, 575);
+    let ids = order_ids(&res.batches);
+    assert!(!ids.contains(&None));
+    assert!(!ids.contains(&Some(25)));
+    assert_eq!(
+        res.envelope.contracts[0].excluded,
+        BTreeMap::from([
+            ("pk_present".to_owned(), 1),
+            ("amount_consistent".to_owned(), 24)
+        ])
+    );
+    // Even a query written to find them does not.
+    let probe = engine
+        .query(
+            r#"SELECT order_id FROM "sales/orders" WHERE order_id IS NULL OR order_id % 25 = 0"#,
+            &admin(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(probe.envelope.rows, 0);
+    // An executor's plan is the same view.
+    let planned = engine
+        .view_for("sales/orders", &admin(), Some(1), OnReadViolation::Exclude)
+        .await
+        .unwrap();
+    assert_eq!(planned.contracts[0].excluded["pk_present"], 1);
+
+    // Asked to refuse them, every read path is refused, naming each rule and its count.
+    let violated = |r: peql::Result<()>| match r {
+        Err(EngineError::Violated {
+            contract,
+            violations,
+        }) => {
+            assert_eq!(contract, "sales/orders");
+            assert_eq!(
+                violations,
+                [
+                    ("pk_present".to_owned(), 1),
+                    ("amount_consistent".to_owned(), 24)
+                ]
+            );
+        }
+        other => panic!("{other:?}"),
+    };
+    violated(
+        engine
+            .query_as_of(
+                ALL_IDS,
+                &admin(),
+                &peql::AsOf::current(),
+                OnReadViolation::Refuse,
+            )
+            .await
+            .map(|_| ()),
+    );
+    violated(
+        engine
+            .view_for("sales/orders", &admin(), None, OnReadViolation::Refuse)
+            .await
+            .map(|_| ()),
+    );
+    violated(
+        engine
+            .check(ALL_IDS, &admin(), OnReadViolation::Refuse)
+            .await
+            .map(|_| ()),
+    );
+
+    // Data that breaks no rule is read either way.
+    engine
+        .write(
+            "sales/orders",
+            vec![batch(&passing())],
+            WriteMode::Overwrite,
+            OnWriteViolation::Refuse,
+        )
+        .await
+        .unwrap();
+    let res = engine
+        .query_as_of(
+            ALL_IDS,
+            &admin(),
+            &peql::AsOf::current(),
+            OnReadViolation::Refuse,
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.envelope.rows, 576);
+    assert!(res.envelope.contracts[0].excluded.is_empty());
+}
+
+/// A contract's context terms refuse a read whatever it asks about breaking rows, before the
+/// rows are looked at.
+async fn a_context_breach_refuses_whatever_the_mode(binding: Binding) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), binding).await;
+    engine
+        .write(
+            "sales/orders",
+            vec![batch(&breaking())],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
+        .await
+        .unwrap();
+    let marketing = Caller::new("mo", "acme", "marketing").with_roles(&["admin"]);
+    for mode in [OnReadViolation::Exclude, OnReadViolation::Refuse] {
+        let denied = |r: peql::Result<()>| match r {
+            Err(EngineError::Denied { contract, rule }) => {
+                assert_eq!(
+                    (contract.as_str(), rule.as_str()),
+                    ("sales/orders", "analytics_only")
+                )
+            }
+            other => panic!("{mode:?}: {other:?}"),
+        };
+        denied(
+            engine
+                .query_as_of(ALL_IDS, &marketing, &peql::AsOf::current(), mode)
+                .await
+                .map(|_| ()),
+        );
+        denied(
+            engine
+                .view_for("sales/orders", &marketing, None, mode)
+                .await
+                .map(|_| ()),
+        );
+        denied(engine.check(ALL_IDS, &marketing, mode).await.map(|_| ()));
+    }
+    let denied = engine.query(ALL_IDS, &marketing).await;
+    assert!(
+        matches!(denied, Err(EngineError::Denied { .. })),
+        "{:?}",
+        denied.err()
+    );
+}
+
+/// The columns a contract withholds stay withheld, and masked columns masked, whatever a read
+/// asks about breaking rows.
+async fn withheld_columns_stay_withheld_in_every_mode(binding: Binding) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine(dir.path(), binding).await;
+    engine
+        .write(
+            "sales/orders",
+            vec![batch(&passing())],
+            WriteMode::Overwrite,
+            OnWriteViolation::Refuse,
+        )
+        .await
+        .unwrap();
+    let globex = analyst("globex");
+    for mode in [OnReadViolation::Exclude, OnReadViolation::Refuse] {
+        let res = engine
+            .query_as_of(
+                r#"SELECT * FROM "sales/orders""#,
+                &globex,
+                &peql::AsOf::current(),
+                mode,
+            )
+            .await
+            .unwrap();
+        let columns: Vec<String> = res
+            .schema
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect();
+        assert_eq!(
+            columns,
+            ["order_id", "customer_id", "email", "region", "amount_cents"],
+            "{mode:?}"
+        );
+        assert!(res.envelope.rows > 0);
+        let emails = res
+            .batches
+            .iter()
+            .flat_map(|b| {
+                let a = b
+                    .column_by_name("email")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .clone();
+                (0..a.len()).map(move |i| a.value(i).to_owned())
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            emails.iter().all(|e| !e.contains('@')),
+            "{mode:?}: {emails:?}"
+        );
+        for probe in [
+            r#"SELECT msisdn FROM "sales/orders""#,
+            r#"SELECT tenant_id FROM "sales/orders""#,
+        ] {
+            assert!(
+                engine
+                    .query_as_of(probe, &globex, &peql::AsOf::current(), mode)
+                    .await
+                    .is_err(),
+                "{mode:?}: {probe}"
+            );
+        }
+    }
 }
 
 async fn data_guarantee_denies(binding: Binding) {
@@ -493,9 +973,15 @@ async fn data_guarantee_denies(binding: Binding) {
         o.customer_id = None; // 5% missing, above the 2% the contract guarantees
     }
     let report = engine
-        .write("sales/orders", vec![batch(&data)], WriteMode::Overwrite)
+        .write(
+            "sales/orders",
+            vec![batch(&data)],
+            WriteMode::Overwrite,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     // The rows break no row rule, and a write decides no guarantee: the data is served.
     assert!(report.verdict.valid, "{:?}", report.verdict.breached);
     let facts = engine.manifest("sales/orders").unwrap().unwrap();
@@ -527,13 +1013,20 @@ async fn append_accumulates(binding: Binding) {
             "sales/orders",
             vec![batch(&data[..300])],
             WriteMode::Overwrite,
+            OnWriteViolation::Warn,
         )
         .await
         .unwrap();
     let r = engine
-        .write("sales/orders", vec![batch(&data[300..])], WriteMode::Append)
+        .write(
+            "sales/orders",
+            vec![batch(&data[300..])],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
     // The write's verdict covers its own rows, and its hash its own files.
     let half = data[300..]
         .iter()
@@ -588,11 +1081,16 @@ async fn an_iceberg_binding_without_a_catalog_is_refused() {
                 (`binding: {iceberg: sales.orders}`), and this engine has no Iceberg catalog";
 
     let w = engine
-        .write("sales/orders", vec![batch(&orders())], WriteMode::Append)
+        .write(
+            "sales/orders",
+            vec![batch(&orders())],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
         .await;
     match w {
         Err(EngineError::Invalid(m)) => assert_eq!(m, want),
-        other => panic!("{:?}", other.map(|r| r.rows_written)),
+        other => panic!("{:?}", other.map(|r| r.report.rows_written)),
     }
     let q = engine
         .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
@@ -623,7 +1121,11 @@ macro_rules! on_every_binding {
 
 on_every_binding!(
     end_to_end,
-    deny_rules_make_data_unservable,
+    a_write_refuses_rows_that_break_a_rule_by_default,
+    exclude_commits_only_the_rows_that_pass,
+    warn_commits_every_row_and_a_read_leaves_the_breaking_ones_out,
+    a_context_breach_refuses_whatever_the_mode,
+    withheld_columns_stay_withheld_in_every_mode,
     data_guarantee_denies,
     append_accumulates,
     unwritten_contract_is_reported,

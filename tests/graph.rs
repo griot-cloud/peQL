@@ -7,7 +7,7 @@ use std::sync::Arc;
 use datafusion::arrow::array::*;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::util::display::array_value_to_string;
-use peql::{Caller, Engine, WriteMode};
+use peql::{Caller, Engine, OnWriteViolation, WriteMode};
 
 const NODES: &str = r#"
 contract: process/nodes
@@ -61,6 +61,7 @@ async fn engine(dir: &std::path::Path) -> Engine {
             .unwrap(),
         ],
         WriteMode::Overwrite,
+        OnWriteViolation::Warn,
     )
     .await
     .unwrap();
@@ -94,6 +95,7 @@ async fn engine(dir: &std::path::Path) -> Engine {
             .unwrap(),
         ],
         WriteMode::Overwrite,
+        OnWriteViolation::Warn,
     )
     .await
     .unwrap();

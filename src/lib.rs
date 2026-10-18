@@ -46,6 +46,7 @@ pub mod signer;
 pub mod store;
 mod vector;
 pub mod view_hash;
+pub mod violation;
 
 /// Flight SQL over tonic (feature `flight`).
 #[cfg(feature = "flight")]
@@ -61,8 +62,8 @@ pub mod lance_table;
 
 pub use binding::{BindingResolver, LocalParquet, Location};
 pub use engine::{
-    AsOf, Checked, Engine, Planned, QueryResult, SnapshotCommit, Verdict, WriteMode, WriteReport,
-    Writing,
+    AsOf, Checked, Engine, Part, Planned, QueryResult, SnapshotCommit, Verdict, WriteMode,
+    WriteOutcome, WriteReport, Writing,
 };
 pub use envelope::{Envelope, EnvelopeSigner, Resolution};
 pub use error::{PeqlError, Result};
@@ -72,3 +73,4 @@ pub use object_binding::ObjectStoreParquet;
 pub use parcel_runtime::Caller;
 pub use signer::SocketSigner;
 pub use view_hash::{compiled_view_hash, view_hash};
+pub use violation::{OnReadViolation, OnWriteViolation};

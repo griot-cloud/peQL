@@ -10,7 +10,9 @@ here=$(cd "$(dirname "$0")" && pwd)
 echo "== quickstart"
 cd "$here/quickstart"
 rm -rf data _peql
-"$P" write contracts/orders.yaml --input incoming/orders.csv --type msisdn=utf8
+"$P" write contracts/orders.yaml --input incoming/orders.csv --type msisdn=utf8 \
+  --on-violation exclude --excluded data/set-aside.parquet
+test -s data/set-aside.parquet
 "$P" register contracts/orders_ea.yaml --schema incoming/orders.csv --type msisdn=utf8
 "$P" publish sales/orders --to globex
 "$P" publish sales/orders_ea --to globex
@@ -32,7 +34,8 @@ rm -rf data _peql
 for f in is_meter_serial units county; do
   "$P" function register functions/meter_serial.wasm --manifest "functions/$f.yaml" --owner kplc
 done
-"$P" write contracts/tokens.yaml --input incoming/tokens.csv
+"$P" write contracts/tokens.yaml --input incoming/tokens.csv \
+  --on-violation exclude --excluded data/set-aside.parquet
 "$P" query 'SELECT meter AS county, COUNT(*) AS tokens FROM "kplc/tokens" GROUP BY meter ORDER BY county' --caller callers/kisumu-analyst.yaml
 
 echo "== handoff: parcel compiles, peql runs"

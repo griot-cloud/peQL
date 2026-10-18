@@ -13,7 +13,7 @@ content_max_width: 68rem
   <h2 id="usecases-title" class="home-section-title">Use cases</h2>
   <div class="home-usecase"><h3>Share data with customers and partners</h3><p>Let each customer query their own records from a shared dataset. Mask personal details for partners while allowing authorised staff to see them.</p></div>
   <div class="home-usecase"><h3>Set limits on what agents can query</h3><p>Give an agent access to the rows and columns its task requires. peQL applies those limits to the SQL it submits.</p></div>
-  <div class="home-usecase"><h3>Keep failed quality checks out of reports</h3><p>Exclude rows that fail required checks, or refuse queries when a dataset fails a quality or freshness requirement.</p></div>
+  <div class="home-usecase"><h3>Keep failed quality checks out of reports</h3><p>Refuse writes of rows that break a contract's checks or set them aside, never return such rows to a query, and refuse queries when a dataset fails a quality or freshness requirement.</p></div>
   <div class="home-usecase"><h3>Share statistics with privacy rules</h3><p>Suppress results for small groups, add noise to aggregates and limit repeated queries with a privacy budget.</p></div>
 </section>
 
