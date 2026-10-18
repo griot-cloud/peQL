@@ -38,6 +38,7 @@ async fn a_manifest_of_an_earlier_peql_beside_local_files_is_rebuilt_by_a_read()
         .await
         .unwrap();
     assert_eq!(r.verdict.row_count, 10);
+    assert_eq!(r.table, None);
     assert!(engine.manifest("demo/readings").unwrap().is_none());
 
     let res = engine
@@ -50,7 +51,11 @@ async fn a_manifest_of_an_earlier_peql_beside_local_files_is_rebuilt_by_a_read()
     let whole = engine.validate("demo/readings").await.unwrap();
     assert_eq!((whole.row_count, &whole.data_hash), (50, &read.data_hash));
 
-    std::fs::write(&path, b"{\"format\": 2}").unwrap();
+    std::fs::write(
+        &path,
+        format!("{{\"format\": {}}}", peql::manifest::FACTS_FORMAT),
+    )
+    .unwrap();
     match engine
         .query(r#"SELECT id FROM "demo/readings""#, &owner())
         .await

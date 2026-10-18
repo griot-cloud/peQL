@@ -42,7 +42,7 @@ use crate::facts::{self, WriteFacts, Written};
 use crate::functions::FunctionStore;
 use crate::gate::{BoundTable, Gate, GateBarrier, GatedQueryPlanner, ensure_gated};
 use crate::guard;
-use crate::manifest::{self, FileEntry, Manifest};
+use crate::manifest::{self, FileEntry, Manifest, TableStats};
 use crate::shape::SuppressExec;
 use crate::store::{ContractStore, DirStore, MemoryStore, PUBLIC, Registered, Stale};
 
@@ -77,6 +77,10 @@ pub struct WriteReport {
     /// The snapshot the write committed, for a table with snapshots (Iceberg).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<SnapshotCommit>,
+    /// The data's row count and per-column null counts after the write, from its facts as
+    /// the write left them (an Iceberg snapshot's, for the snapshot committed); `None` when
+    /// those facts are not recorded, as for data whose facts are to be rebuilt.
+    pub table: Option<TableStats>,
 }
 
 /// The snapshot a write committed to a table with snapshots, and the one it followed.
@@ -916,8 +920,9 @@ impl Engine {
             facts.push(f);
         }
         let verdict = verdict.expect("the writer's contract is bound");
-        let snapshot = self.publish_write(&w, &bound, &facts, written_at).await?;
+        let (snapshot, table) = self.publish_write(&w, &bound, &facts, written_at).await?;
         let own = facts.swap_remove(0).facts;
+        let columns = w.reg.compilation.contract.row_schema.clone();
         Ok(WriteReport {
             rows_written: w.rows.load(Ordering::SeqCst),
             files: own.files,
@@ -927,6 +932,7 @@ impl Engine {
                 snapshot_id: snapshot.map(|s| s.snapshot_id),
             },
             snapshot,
+            table: table.map(|m| m.table_stats(columns.fields().iter().map(|f| f.name().as_str()))),
         })
     }
 
@@ -1008,8 +1014,10 @@ impl Engine {
         bound: &[Arc<Registered>],
         facts: &[WriteFacts],
         written_at: DateTime<Utc>,
-    ) -> Result<Option<SnapshotCommit>> {
+    ) -> Result<(Option<SnapshotCommit>, Option<Manifest>)> {
         let dir = w.dir()?;
+        // The writer's contract is the first bound: its facts after the write.
+        let mut own = None;
         match &w.location {
             Location::Local(root) => {
                 let mut before = Vec::with_capacity(bound.len());
@@ -1043,12 +1051,15 @@ impl Engine {
                         }
                         None => None,
                     };
-                    match after {
+                    match &after {
                         Some(m) => m.save(root)?,
                         None => Manifest::remove(root, reg.name())?,
                     }
+                    if reg.name() == w.contract() {
+                        own = after;
+                    }
                 }
-                Ok(None)
+                Ok((None, own))
             }
             Location::Object(o) => {
                 let mut before = Vec::with_capacity(bound.len());
@@ -1073,6 +1084,9 @@ impl Engine {
                         }
                         None => None,
                     };
+                    if reg.name() == w.contract() {
+                        own = after.clone();
+                    }
                     match after {
                         Some(m) => {
                             o.save_manifest(&m).await?;
@@ -1090,7 +1104,7 @@ impl Engine {
                         }
                     }
                 }
-                Ok(None)
+                Ok((None, own))
             }
             #[cfg(feature = "iceberg")]
             Location::Iceberg(t) => {
@@ -1115,6 +1129,9 @@ impl Engine {
                             None
                         }
                     };
+                    if reg.name() == w.contract() {
+                        own = after.clone();
+                    }
                     let mut cached = self.iceberg_manifests.write().expect("lock");
                     match after {
                         Some(m) if current => {
@@ -1126,7 +1143,7 @@ impl Engine {
                         }
                     }
                 }
-                Ok(Some(commit))
+                Ok((Some(commit), own))
             }
         }
     }

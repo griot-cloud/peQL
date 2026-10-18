@@ -79,7 +79,7 @@ Joins, aggregates and subqueries operate over the exposed contract views. DDL, D
 
 ## Validation and write reports
 
-A write report contains `rows_written`, `files`, `verdict` and, for an Iceberg table, `snapshot`. `files` lists the files the write added; `verdict` is the contract's row rules over the rows written, with a hash over those files. The dataset's manifest is updated from the write's facts without reading earlier files.
+A write report contains `rows_written`, `files`, `verdict`, `table` and, for an Iceberg table, `snapshot`. `table` is the data's `row_count` and per-column `null_counts` after the write, from its manifest, or null while the manifest is not recorded. `files` lists the files the write added; `verdict` is the contract's row rules over the rows written, with a hash over those files. The dataset's manifest is updated from the write's facts without reading earlier files.
 
 The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`, `stats` and `data_hash`. `failures` maps assertion IDs to failing-row counts. `valid` can be true when drop-level or report-only checks fail. A write's verdict covers only its rows and row rules, so its `guarantees` is empty; `validate` decides each dataset guarantee over the whole data, and the manifest keeps each one's last decision (`holds`, `snapshot_id`, `decided_at`) until the next `validate`.
 

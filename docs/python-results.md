@@ -2,7 +2,7 @@
 
 ## Write report
 
-`Engine.write` returns a dictionary with `rows_written: int`, `files: list` and `verdict: dict`. `files` lists the files the write added, and `verdict` covers the rows written.
+`Engine.write` returns a dictionary with `rows_written: int`, `files: list`, `verdict: dict` and `table: dict | None` (the dataset's `row_count` and `null_counts` after the write). `files` lists the files the write added, and `verdict` covers the rows written.
 
 ## Validation verdict
 

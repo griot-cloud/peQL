@@ -341,12 +341,30 @@ pub fn entry_from_footer(
         };
         flags.insert(flag.clone(), status);
     }
+    // Nulls per top-level column, from every row group's statistics; a column a row group
+    // has no null count for is left out.
+    let mut null_counts = BTreeMap::new();
+    for i in 0..schema.num_columns() {
+        let column = schema.column(i);
+        if column.path().parts().len() != 1 {
+            continue;
+        }
+        let nulls: Option<u64> = meta
+            .row_groups()
+            .iter()
+            .map(|rg| rg.column(i).statistics().and_then(|s| s.null_count_opt()))
+            .sum();
+        if let Some(n) = nulls {
+            null_counts.insert(column.name().to_owned(), n as i64);
+        }
+    }
     FileEntry {
         path,
         rows: file_meta.num_rows(),
         bytes,
         contract_hash,
         flags,
+        null_counts,
         sha256,
     }
 }

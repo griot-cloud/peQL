@@ -18,7 +18,7 @@ pub const MANIFEST_DIR: &str = "_peql/manifests";
 /// facts), in each file's `format` key. A file of another format, or with none, was recorded
 /// by another peQL and is treated as not recorded: the facts are computed again. A file of
 /// this format that does not decode is corrupt and refused.
-pub const FACTS_FORMAT: u64 = 2;
+pub const FACTS_FORMAT: u64 = 3;
 
 #[derive(Serialize)]
 struct Stored<'a, T: Serialize> {
@@ -81,6 +81,9 @@ pub struct FileEntry {
     pub contract_hash: String,
     /// Per assert flag column: whether every row passes, fails, or both.
     pub flags: BTreeMap<String, FlagStatus>,
+    /// Nulls per top-level column the file holds, from its footer's statistics; a column
+    /// without them is absent.
+    pub null_counts: BTreeMap<String, i64>,
     /// sha256 of the file's bytes, recorded when the file is written or first validated, so
     /// the data hash of a table is computed from its files' entries, never by reading them.
     pub sha256: String,
@@ -117,7 +120,35 @@ pub struct Manifest {
     pub snapshot_id: Option<i64>,
 }
 
+/// What a table holds, from its facts and never from its files: as Iceberg's snapshot summary
+/// counts records, peQL's facts count rows and each column's nulls.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableStats {
+    pub row_count: i64,
+    /// Nulls per column of `columns` that every file of the data counts nulls of.
+    pub null_counts: BTreeMap<String, i64>,
+}
+
 impl Manifest {
+    /// The data's statistics over `columns`, summed from its files' entries.
+    pub fn table_stats<'a>(&self, columns: impl IntoIterator<Item = &'a str>) -> TableStats {
+        let mut null_counts = BTreeMap::new();
+        for column in columns {
+            let nulls: Option<i64> = self
+                .files
+                .iter()
+                .map(|f| f.null_counts.get(column).copied())
+                .sum();
+            if let Some(n) = nulls {
+                null_counts.insert(column.to_owned(), n);
+            }
+        }
+        TableStats {
+            row_count: self.row_count,
+            null_counts,
+        }
+    }
+
     fn path(root: &Path, contract: &str) -> PathBuf {
         root.join(MANIFEST_DIR)
             .join(format!("{}.json", contract.replace('/', "__")))

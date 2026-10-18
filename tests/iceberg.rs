@@ -2018,6 +2018,7 @@ async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
         .await
         .unwrap();
     assert_eq!(r.verdict.row_count, 10);
+    assert_eq!(r.table, None, "the table's facts are not recorded");
     let second = r.snapshot.unwrap().snapshot_id;
     let t = table(&s.catalog, "readings").await;
     let write_id = &t
@@ -2067,7 +2068,11 @@ async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
     assert_eq!(facts.row_count, 50);
 
     // Corrupt facts are refused, by name.
-    for corrupt in [&b"{\"format\": 2, \"contract\": 7}"[..], &b"{ not json"[..]] {
+    let this_format = format!(
+        "{{\"format\": {}, \"contract\": 7}}",
+        peql::manifest::FACTS_FORMAT
+    );
+    for corrupt in [this_format.as_bytes(), &b"{ not json"[..]] {
         std::fs::write(&facts_of_second, corrupt).unwrap();
         match fresh("reader")
             .query(r#"SELECT id FROM "demo/readings""#, &owner())
@@ -2077,4 +2082,89 @@ async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
             other => panic!("{:?}", other.map(|r| r.envelope.rows)),
         }
     }
+}
+
+/// `a` with a null every third id, `b` with none.
+fn plain_with_nulls(ids: &[i64]) -> RecordBatch {
+    let schema: SchemaRef = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("a", DataType::Utf8, true),
+        Field::new("b", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(
+                ids.iter()
+                    .map(|i| (i % 3 != 0).then(|| format!("a{i}")))
+                    .collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                ids.iter().map(|i| format!("b{i}")).collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap()
+}
+
+/// A write reports the table's row count and per-column null counts after it, from the
+/// facts it left: after two appends, what a validation of the whole table finds.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_write_reports_the_tables_rows_and_nulls_from_its_facts() {
+    let s = setup().await;
+    let engine = &s.engine;
+    engine
+        .register_contract(PLAIN_V1, &plain_with_nulls(&[]).schema())
+        .unwrap();
+    let first = engine
+        .write(
+            "demo/plain",
+            vec![plain_with_nulls(&[1, 2, 3, 4])],
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+    let t = first.table.unwrap();
+    assert_eq!((t.row_count, t.null_counts["a"]), (4, 1));
+    let second = engine
+        .write(
+            "demo/plain",
+            vec![plain_with_nulls(&[5, 6, 7, 8, 9])],
+            WriteMode::Append,
+        )
+        .await
+        .unwrap();
+    let reported = second.table.unwrap();
+    assert_eq!(reported.row_count, 9);
+    assert_eq!(
+        reported.null_counts,
+        [("a", 3), ("b", 0), ("id", 0)]
+            .map(|(c, n)| (c.to_owned(), n))
+            .into()
+    );
+    engine.validate("demo/plain").await.unwrap();
+    let whole = engine
+        .manifest("demo/plain")
+        .unwrap()
+        .unwrap()
+        .table_stats(["id", "a", "b"]);
+    assert_eq!(reported, whole);
+    let counted = engine
+        .query(
+            r#"SELECT COUNT(*) AS n, COUNT(*) - COUNT(a) AS a_nulls FROM "demo/plain""#,
+            &Caller::new("x", "demo", "any"),
+        )
+        .await
+        .unwrap();
+    let col = |name: &str| {
+        counted.batches[0]
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!((col("n"), col("a_nulls")), (9, 3));
 }
