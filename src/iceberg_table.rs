@@ -65,7 +65,7 @@ use uuid::Uuid;
 use crate::binding::{self, BindingResolver, Location};
 use crate::error::{PeqlError, Result};
 use crate::facts::WriteFacts;
-use crate::manifest::{FileEntry, Manifest};
+use crate::manifest::{self, FileEntry, Manifest};
 
 /// Snapshot summary keys peQL writes: the contract the snapshot's files were written under.
 pub const SUMMARY_CONTRACT: &str = "peql.contract";
@@ -294,12 +294,16 @@ impl IcebergLocation {
         if !input.exists().await? {
             return Ok(None);
         }
-        let manifest: Manifest = serde_json::from_slice(&input.read().await?).map_err(|e| {
+        let Some(manifest) = manifest::decode::<Manifest>(&input.read().await?).map_err(|e| {
             PeqlError::Invalid(format!(
-                "facts of `{contract}` for snapshot {snapshot} of {}: {e}",
-                self.table
+                "facts of `{contract}` for snapshot {snapshot} of {} ({}): {e}",
+                self.table,
+                input.location()
             ))
-        })?;
+        })?
+        else {
+            return Ok(None);
+        };
         if manifest.snapshot_id != Some(snapshot) {
             return Err(PeqlError::Invalid(format!(
                 "the facts of `{contract}` filed under snapshot {snapshot} of {} describe snapshot {:?}",
@@ -317,8 +321,8 @@ impl IcebergLocation {
                 manifest.contract
             ))
         })?;
-        let body = serde_json::to_vec_pretty(manifest)
-            .map_err(|e| PeqlError::Invalid(format!("facts: {e}")))?;
+        let body =
+            manifest::encode(manifest).map_err(|e| PeqlError::Invalid(format!("facts: {e}")))?;
         table
             .file_io()
             .new_output(Self::facts_path(table, snapshot, &manifest.contract))?
@@ -342,7 +346,7 @@ impl IcebergLocation {
         write: &str,
         facts: &WriteFacts,
     ) -> Result<()> {
-        let body = serde_json::to_vec_pretty(facts)
+        let body = manifest::encode(facts)
             .map_err(|e| PeqlError::Invalid(format!("facts of write {write}: {e}")))?;
         table
             .file_io()
@@ -373,14 +377,13 @@ impl IcebergLocation {
         if !input.exists().await? {
             return Ok(None);
         }
-        serde_json::from_slice(&input.read().await?)
-            .map(Some)
-            .map_err(|e| {
-                PeqlError::Invalid(format!(
-                    "facts of `{contract}` for write {write} of {}: {e}",
-                    self.table
-                ))
-            })
+        manifest::decode(&input.read().await?).map_err(|e| {
+            PeqlError::Invalid(format!(
+                "facts of `{contract}` for write {write} of {} ({}): {e}",
+                self.table,
+                input.location()
+            ))
+        })
     }
 
     fn no_snapshot(&self, snapshot: i64) -> PeqlError {

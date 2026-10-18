@@ -20,12 +20,6 @@ pub enum PeqlError {
     },
     #[error("`{contract}` guarantee `{rule}` does not hold")]
     GuaranteeFailed { contract: String, rule: String },
-    /// A deny-level guarantee that reads a statistic not known for the data, as a distinct
-    /// count is not once rows are appended, until the whole data is validated again.
-    #[error(
-        "`{contract}` guarantee `{rule}` is undecided: a statistic it reads is not known for this data until it is validated whole"
-    )]
-    Unverified { contract: String, rule: String },
     #[error("privacy budget `{budget}` is exhausted for this caller")]
     BudgetExhausted { budget: String },
     #[error("only queries are allowed: `{verb}` is refused")]
@@ -57,7 +51,6 @@ impl PeqlError {
             PeqlError::Denied { .. }
                 | PeqlError::NotServable { .. }
                 | PeqlError::GuaranteeFailed { .. }
-                | PeqlError::Unverified { .. }
                 | PeqlError::BudgetExhausted { .. }
                 | PeqlError::Refused { .. }
                 | PeqlError::UnknownContract(_)

@@ -2,13 +2,14 @@
 //! after it, computed from what was known before and the write's own facts: a write never
 //! reads data it did not write.
 //!
-//! A write validates its own rows under the contract's validation plan. The row rules
-//! (`assert`) decide the write's verdict; the dataset rules (`guarantee`) are about the whole
-//! data, so they are decided over the data's statistics, which a write combines with its own:
-//! row counts, failure counts, null counts and rates, pass rates, minima and maxima. A
-//! statistic that does not combine (a distinct count, a `dataset.other` aggregate) is not known
-//! after an append; a guarantee that reads one is undecided until the whole data is validated
-//! again ([`crate::Engine::validate`]).
+//! A write validates its own rows under the contract's validation plan, and only the row
+//! rules (`assert`) decide anything about them: the write's verdict. The rules about the whole
+//! data (`guarantee`s over dataset statistics) are decided only by validating the whole data
+//! ([`crate::Engine::validate`]); the facts keep each one's last decision, carried forward by
+//! later writes unchanged. A write keeps the statistics that combine up to date (row counts,
+//! failure counts, null counts and rates, pass rates, minima and maxima) without judging any
+//! rule over them; one that does not combine (a distinct count, a `dataset.other` aggregate)
+//! is not known after an append until the next validation.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -19,13 +20,12 @@ use parcel_core::compile::GuaranteeRule;
 use parcel_core::document::{AssertOnFail, GuaranteeOnFail};
 use parcel_core::ir::{ColumnStat, DatasetField};
 use parcel_core::types::Type;
-use parcel_runtime::plan::{dataset_value, parse_decimal};
-use parcel_runtime::reference::{self, Scope};
+use parcel_runtime::plan::parse_decimal;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::error::{PeqlError, Result};
-use crate::manifest::{self, Manifest};
+use crate::manifest::{self, GuaranteeCheck, Manifest};
 
 /// What a write did to the data's files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,34 +88,43 @@ pub fn undecided(c: &Compilation, g: &GuaranteeRule, stats: &BTreeMap<String, Va
         .any(|r| computed.contains(r.as_str()) && !stats.contains_key(r))
 }
 
-/// The verdict over data with these failure counts and statistics: every deny-level assert
-/// without failing rows, and every deny-level guarantee decided by the data alone holding.
-/// A guarantee whose statistics are not known is not decided here; the resolver refuses it.
-fn decide(
+/// The deny-level rules data with these failure counts and guarantee decisions breaks: every
+/// deny-level assert with failing rows, then every deny-level guarantee that did not hold
+/// when last decided, in the contract's order.
+pub fn breached(
     c: &Compilation,
     failures: &BTreeMap<String, i64>,
-    stats: &BTreeMap<String, Value>,
-    written_at: DateTime<Utc>,
-) -> Result<Vec<String>> {
-    let cc = &c.contract;
-    let mut breached = failed_asserts(c, failures);
-    let ctx = reference::context(&Scope {
-        dataset: Some(dataset_value(c, stats, written_at, &cc.contract_hash)),
-        pins: cc.functions.clone(),
-        ..Scope::default()
-    });
-    for g in &cc.guarantees {
-        if g.on_fail != GuaranteeOnFail::Deny
-            || !c.validation.data_guarantees.contains(&g.id)
-            || undecided(c, g, stats)
-        {
-            continue;
-        }
-        if !reference::eval_bool(&g.cel, &ctx).map_err(PeqlError::Invalid)? {
-            breached.push(g.id.clone());
+    checks: &BTreeMap<String, GuaranteeCheck>,
+) -> Vec<String> {
+    let mut out = failed_asserts(c, failures);
+    for g in &c.contract.guarantees {
+        if g.on_fail == GuaranteeOnFail::Deny && checks.get(&g.id).is_some_and(|k| !k.holds) {
+            out.push(g.id.clone());
         }
     }
-    Ok(breached)
+    out
+}
+
+/// The decisions a whole validation's verdict makes, at `decided_at`, of `snapshot_id`.
+pub fn checks(
+    verdict: &parcel_runtime::plan::Verdict,
+    snapshot_id: Option<i64>,
+    decided_at: DateTime<Utc>,
+) -> BTreeMap<String, GuaranteeCheck> {
+    verdict
+        .guarantees
+        .iter()
+        .map(|(id, holds)| {
+            (
+                id.clone(),
+                GuaranteeCheck {
+                    holds: *holds,
+                    snapshot_id,
+                    decided_at,
+                },
+            )
+        })
+        .collect()
 }
 
 /// What a contract knows about its data after a write, from what it knew before (`before`,
@@ -146,9 +155,12 @@ pub fn after_write(
         (_, Some(b)) if b.compilation_hash != cc.compilation_hash => return Ok(None),
         (_, b) => b,
     };
+    // A write decides no guarantee: an append or a rewrite carries the last decisions
+    // forward; data a write replaces whole, or that had none, has none.
     let mut m = match before {
         None => Manifest {
             written_at,
+            guarantees: BTreeMap::new(),
             ..w.clone()
         },
         Some(b) if write.written == Written::Rewrite => {
@@ -200,6 +212,7 @@ pub fn after_write(
                 failures,
                 stats,
                 files,
+                guarantees: b.guarantees.clone(),
                 ..w.clone()
             }
         }
@@ -207,7 +220,7 @@ pub fn after_write(
     m.files.sort_by(|a, b| a.path.cmp(&b.path));
     m.data_hash = manifest::data_hash(&m.files);
     m.snapshot_id = snapshot_id;
-    m.breached = decide(c, &m.failures, &m.stats, m.written_at)?;
+    m.breached = breached(c, &m.failures, &m.guarantees);
     m.valid = m.breached.is_empty();
     Ok(Some(m))
 }

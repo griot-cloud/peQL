@@ -8,10 +8,60 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use parcel_runtime::compiled::ColumnDef;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// Manifests live here under the binding root, one per contract bound to the data.
 pub const MANIFEST_DIR: &str = "_peql/manifests";
+
+/// The format of every facts file peQL records (manifests, a snapshot's facts, a write's
+/// facts), in each file's `format` key. A file of another format, or with none, was recorded
+/// by another peQL and is treated as not recorded: the facts are computed again. A file of
+/// this format that does not decode is corrupt and refused.
+pub const FACTS_FORMAT: u64 = 2;
+
+#[derive(Serialize)]
+struct Stored<'a, T: Serialize> {
+    format: u64,
+    #[serde(flatten)]
+    facts: &'a T,
+}
+
+/// Facts as recorded: their JSON with the [`FACTS_FORMAT`] they are in.
+pub fn encode<T: Serialize>(facts: &T) -> std::result::Result<Vec<u8>, String> {
+    serde_json::to_vec_pretty(&Stored {
+        format: FACTS_FORMAT,
+        facts,
+    })
+    .map_err(|e| e.to_string())
+}
+
+/// Recorded facts, or `None` for facts of another format; an error for bytes that are not a
+/// JSON object, or facts of this format that do not decode.
+pub fn decode<T: DeserializeOwned>(bytes: &[u8]) -> std::result::Result<Option<T>, String> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
+    let Some(object) = value.as_object() else {
+        return Err("not a JSON object".to_owned());
+    };
+    if object.get("format").and_then(serde_json::Value::as_u64) != Some(FACTS_FORMAT) {
+        return Ok(None);
+    }
+    serde_json::from_value(value)
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
+/// The last decision of one guarantee over the whole data: made only by validating it whole
+/// ([`crate::Engine::validate`]), and carried forward by every append and rewrite until the
+/// next validation. An overwrite replaces the data the decision was about, so it drops it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GuaranteeCheck {
+    pub holds: bool,
+    /// The snapshot it was decided on, for data in a table with snapshots (Iceberg).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<i64>,
+    pub decided_at: DateTime<Utc>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -45,12 +95,16 @@ pub struct Manifest {
     pub row_count: i64,
     /// Failing rows per assert.
     pub failures: BTreeMap<String, i64>,
-    /// Whether the data satisfies every deny-level rule: the validation verdict.
+    /// Whether the data satisfies every deny-level rule: no deny-level assert fails a row, and
+    /// no deny-level guarantee failed when last decided.
     pub valid: bool,
     pub breached: Vec<String>,
+    /// Each guarantee decided by the data alone, as last decided by validating the whole data;
+    /// a guarantee not decided since the data was first written is absent.
+    pub guarantees: BTreeMap<String, GuaranteeCheck>,
     /// Every statistic known for the data, keyed by its column name. One that cannot be
     /// combined from a write's (a distinct count) is absent once a write appended rows, until
-    /// the whole data is validated again.
+    /// the whole data is validated again. No rule is judged over them by a write.
     pub stats: BTreeMap<String, serde_json::Value>,
     /// Hash over the bytes of every file, in path order: what a certificate signs. Computed
     /// from the files' entries ([`data_hash`]).
@@ -75,9 +129,8 @@ impl Manifest {
         if !p.exists() {
             return Ok(None);
         }
-        serde_json::from_str(&std::fs::read_to_string(p)?)
-            .map(Some)
-            .map_err(std::io::Error::other)
+        decode(&std::fs::read(&p)?)
+            .map_err(|e| std::io::Error::other(format!("{}: {e}", p.display())))
     }
 
     /// Remove the manifest one contract keeps, when it no longer describes the data.
@@ -92,10 +145,7 @@ impl Manifest {
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         let p = Self::path(root, &self.contract);
         std::fs::create_dir_all(p.parent().expect("manifest dir"))?;
-        crate::atomic::write(
-            &p,
-            serde_json::to_string_pretty(self).map_err(std::io::Error::other)?,
-        )
+        crate::atomic::write(&p, encode(self).map_err(std::io::Error::other)?)
     }
 
     /// True when every file was written under this contract hash, so stored flags and

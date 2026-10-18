@@ -982,6 +982,7 @@ impl Engine {
             failures: verdict.failures.clone(),
             valid: verdict.valid,
             breached: verdict.breached.clone(),
+            guarantees: BTreeMap::new(),
             stats: verdict.stats.clone(),
             data_hash: manifest::data_hash(&files),
             row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
@@ -1098,10 +1099,22 @@ impl Engine {
                 })?;
                 let (table, commit) = iw.commit(&w.reg.compilation.contract, facts).await?;
                 let current = table.metadata().current_snapshot_id() == Some(commit.snapshot_id);
+                // The snapshot is committed, with the write's own facts: what follows only
+                // records the table's facts for it, which a read can also do. When they
+                // cannot be computed (a parent's facts that do not decode, a store that refuses)
+                // the write stands and they stay unrecorded; a read meets the same cause.
                 for reg in bound {
-                    let after = self
-                        .iceberg_facts(t, &table, commit.snapshot_id, reg)
-                        .await?;
+                    let after = match self.iceberg_facts(t, &table, commit.snapshot_id, reg).await {
+                        Ok(after) => after,
+                        Err(e) => {
+                            tracing::warn!(
+                                contract = reg.name(),
+                                snapshot = commit.snapshot_id,
+                                "the facts of the committed snapshot are not recorded: {e}"
+                            );
+                            None
+                        }
+                    };
                     let mut cached = self.iceberg_manifests.write().expect("lock");
                     match after {
                         Some(m) if current => {
@@ -1266,6 +1279,7 @@ impl Engine {
             failures: verdict.verdict.failures.clone(),
             valid: verdict.verdict.valid,
             breached: verdict.verdict.breached.clone(),
+            guarantees: facts::checks(&verdict.verdict, verdict.snapshot_id, Utc::now()),
             stats: verdict.verdict.stats.clone(),
             data_hash: verdict.data_hash.clone(),
             row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
@@ -1319,6 +1333,7 @@ impl Engine {
                         failures: verdict.verdict.failures.clone(),
                         valid: verdict.verdict.valid,
                         breached: verdict.verdict.breached.clone(),
+                        guarantees: facts::checks(&verdict.verdict, None, Utc::now()),
                         stats: verdict.verdict.stats.clone(),
                         data_hash: verdict.data_hash.clone(),
                         row_schema: parcel_runtime::compiled::schema_to_defs(&cc.row_schema),
@@ -1504,20 +1519,18 @@ impl Engine {
         });
         let mut annotations = Vec::new();
         for g in &cc.guarantees {
-            // A statistic it reads is not known for this data: undecided, so it does not hold.
-            if facts::undecided(c, g, &manifest.stats) {
-                match g.on_fail {
-                    GuaranteeOnFail::Deny => {
-                        return Err(PeqlError::Unverified {
-                            contract: cc.name.clone(),
-                            rule: g.id.clone(),
-                        });
-                    }
-                    GuaranteeOnFail::Annotate => annotations.push(g.id.clone()),
-                }
-                continue;
-            }
-            if !reference::eval_bool(&g.cel, &ctx).map_err(PeqlError::Invalid)? {
+            // A guarantee decided by the data alone holds as it was last decided, by a
+            // validation of the whole data (a deny-level one that failed made the data not
+            // servable, above); one not decided since is not judged here.
+            let holds = if c.validation.data_guarantees.contains(&g.id) {
+                manifest.guarantees.get(&g.id).is_none_or(|k| k.holds)
+            } else if facts::undecided(c, g, &manifest.stats) {
+                // A query-time guarantee over a statistic not known since the last validation.
+                true
+            } else {
+                reference::eval_bool(&g.cel, &ctx).map_err(PeqlError::Invalid)?
+            };
+            if !holds {
                 match g.on_fail {
                     GuaranteeOnFail::Deny => {
                         return Err(PeqlError::GuaranteeFailed {

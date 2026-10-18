@@ -1,0 +1,56 @@
+{
+  "contract": "demo/readings",
+  "contract_hash": "9c1e8d0bcfcdd1bb12b7b47523afe4a4a99ba54a71275d344593b6617a1c2c44",
+  "compilation_hash": "5e70d17a06030820d5360adefaea03aa2cc86689edfb5d44ba8a505caf1b6e95",
+  "written_at": "2026-10-18T13:22:42.475202Z",
+  "row_count": 40,
+  "valid": true,
+  "breached": [],
+  "stats": {
+    "assertions__non_negative__pass_rate": 0.9,
+    "row_count": 40
+  },
+  "data_hash": "3228de3a2206c5529beccad94b3b7e70e7acf326ebb6fc882416fdecea7540ab",
+  "row_schema": [
+    {
+      "name": "id",
+      "type": "Int64",
+      "nullable": false
+    },
+    {
+      "name": "region",
+      "type": "Utf8",
+      "nullable": false
+    },
+    {
+      "name": "meter",
+      "type": "Utf8",
+      "nullable": true
+    },
+    {
+      "name": "kwh",
+      "type": "Int64",
+      "nullable": true
+    }
+  ],
+  "files": [
+    {
+      "path": "region=EA/lGaD76ltiJPm49Gc.parquet",
+      "rows": 20,
+      "bytes": 1949,
+      "contract_hash": "9c1e8d0bcfcdd1bb12b7b47523afe4a4a99ba54a71275d344593b6617a1c2c44",
+      "flags": {
+        "_c_non_negative": "mixed"
+      }
+    },
+    {
+      "path": "region=WA/lGaD76ltiJPm49Gc.parquet",
+      "rows": 20,
+      "bytes": 1954,
+      "contract_hash": "9c1e8d0bcfcdd1bb12b7b47523afe4a4a99ba54a71275d344593b6617a1c2c44",
+      "flags": {
+        "_c_non_negative": "all_pass"
+      }
+    }
+  ]
+}

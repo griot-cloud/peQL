@@ -1775,12 +1775,13 @@ rules:
   - {id: kwh_bounded, op: guarantee, expr: "dataset.kwh.max <= 1000", on_fail: deny}
 "#;
 
-/// A guarantee over a statistic of the whole table that a write cannot combine (a distinct
-/// count) is not decided by an append: a read is refused as undecided until the table is
-/// validated on demand. One over a statistic that combines (a maximum) is decided by every
-/// write, from the table's facts and the write's.
+/// Rules over the whole table are decided only by validating it: no write decides one, and
+/// no read is refused because one is undecided. The facts keep each one's last decision, the
+/// snapshot it was made on and its outcome, carried forward unchanged by later appends; a
+/// deny-level one that failed when last decided makes the table not servable until a
+/// validation finds it holding. Statistics that combine are kept up to date by every write.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_rule_over_the_whole_table_is_decided_on_demand_not_by_a_write() {
+async fn rules_over_the_whole_table_are_decided_only_by_validate() {
     let s = setup().await;
     let engine = &s.engine;
     let cols = [("id", DataType::Int64), ("kwh", DataType::Int64)];
@@ -1792,42 +1793,112 @@ async fn a_rule_over_the_whole_table_is_decided_on_demand_not_by_a_write() {
     let append = |ids: &'static [i64]| {
         engine.write("demo/unique", vec![plain(&cols, ids)], WriteMode::Append)
     };
+    let facts = || engine.manifest("demo/unique").unwrap().unwrap();
 
-    // The first write is the whole table: everything is known.
-    append(&[1, 2]).await.unwrap();
-    assert_eq!(ids(&read().await.unwrap().batches), [1, 2]);
+    // Writes decide nothing about the table: its rules are undecided, and it is served.
+    let r = append(&[1, 2]).await.unwrap();
+    assert!(r.verdict.guarantees.is_empty());
+    append(&[2]).await.unwrap();
+    assert!(facts().guarantees.is_empty(), "{:?}", facts().guarantees);
+    assert!(facts().valid);
+    assert_eq!(ids(&read().await.unwrap().batches), [1, 2, 2]);
 
-    // An append: the distinct count of the table is not known, the maximum is.
-    let r = append(&[3]).await.unwrap();
-    assert!(r.verdict.valid);
-    let facts = engine.manifest("demo/unique").unwrap().unwrap();
-    assert!(
-        !facts.stats.contains_key("id__distinct_count"),
-        "{:?}",
-        facts.stats
-    );
-    assert_eq!(facts.stats["kwh__max"], serde_json::json!(300));
-    match read().await {
-        Err(PeqlError::Unverified { rule, .. }) => assert_eq!(rule, "ids_unique"),
-        other => panic!("{:?}", other.map(|r| r.envelope.rows)),
-    }
-
-    // Validated on demand, the table is known again, and served.
+    // A validation decides them, of the snapshot it validates.
     let whole = engine.validate("demo/unique").await.unwrap();
-    assert!(whole.valid, "{:?}", whole.breached);
-    assert_eq!(ids(&read().await.unwrap().batches), [1, 2, 3]);
-
-    // A duplicate: undecided after the append, breached once validated.
-    append(&[3]).await.unwrap();
-    assert!(matches!(read().await, Err(PeqlError::Unverified { .. })));
-    let whole = engine.validate("demo/unique").await.unwrap();
+    let decided_on = whole.snapshot_id.unwrap();
     assert_eq!(whole.breached, ["ids_unique"]);
+    let checked = facts().guarantees;
+    assert_eq!(
+        (
+            checked["ids_unique"].holds,
+            checked["ids_unique"].snapshot_id
+        ),
+        (false, Some(decided_on))
+    );
+    assert_eq!(
+        (
+            checked["kwh_bounded"].holds,
+            checked["kwh_bounded"].snapshot_id
+        ),
+        (true, Some(decided_on))
+    );
     assert!(matches!(read().await, Err(PeqlError::NotServable { .. })));
 
-    // A maximum past the bound is decided by the append itself.
-    append(&[20]).await.unwrap();
-    let facts = engine.manifest("demo/unique").unwrap().unwrap();
-    assert_eq!(facts.breached, ["kwh_bounded"]);
+    // An append carries the decisions forward unchanged, even past a bound it breaks; the
+    // maximum it changes is kept up to date, and judged by nothing.
+    let r = append(&[20]).await.unwrap();
+    assert!(r.verdict.valid);
+    let after = facts();
+    assert_eq!(after.guarantees, checked);
+    assert_eq!(after.stats["kwh__max"], serde_json::json!(2000));
+    assert!(!after.stats.contains_key("id__distinct_count"));
+    assert_eq!(after.breached, ["ids_unique"]);
+
+    // The next validation decides again, of the snapshot it validates.
+    let whole = engine.validate("demo/unique").await.unwrap();
+    assert_eq!(whole.breached, ["ids_unique", "kwh_bounded"]);
+    let now = facts().guarantees;
+    assert_eq!(now["kwh_bounded"].snapshot_id, whole.snapshot_id);
+    assert!(!now["kwh_bounded"].holds);
+}
+
+/// A compaction followed by a validation in the same engine, as a host's table maintenance
+/// runs them: the validation decides the compacted snapshot, records each decision in that
+/// snapshot's facts, and appends after carry them forward unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_validation_after_a_compaction_decides_the_compacted_snapshot() {
+    let s = setup().await;
+    let engine = &s.engine;
+    let cols = [("id", DataType::Int64), ("kwh", DataType::Int64)];
+    engine
+        .register_contract(UNIQUE, &plain(&cols, &[]).schema())
+        .unwrap();
+    for ids in [[1, 2], [3, 4], [5, 6]] {
+        engine
+            .write("demo/unique", vec![plain(&cols, &ids)], WriteMode::Append)
+            .await
+            .unwrap();
+    }
+    let compacted = engine
+        .compact("demo/unique", u64::MAX, 2)
+        .await
+        .unwrap()
+        .expect("three small files are compacted")
+        .snapshot
+        .unwrap()
+        .snapshot_id;
+    // The compaction decides nothing either.
+    let facts = engine
+        .manifest_as_of("demo/unique", compacted)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(facts.guarantees.is_empty());
+    assert_eq!(facts.row_count, 6);
+
+    let whole = engine.validate("demo/unique").await.unwrap();
+    assert_eq!(whole.snapshot_id, Some(compacted));
+    assert!(whole.valid, "{:?}", whole.breached);
+    let facts = engine
+        .manifest_as_of("demo/unique", compacted)
+        .await
+        .unwrap()
+        .unwrap();
+    for id in ["ids_unique", "kwh_bounded"] {
+        let k = &facts.guarantees[id];
+        assert_eq!((k.holds, k.snapshot_id), (true, Some(compacted)), "{id}");
+    }
+    let r = engine
+        .write("demo/unique", vec![plain(&cols, &[7])], WriteMode::Append)
+        .await
+        .unwrap();
+    let after = engine
+        .manifest_as_of("demo/unique", r.snapshot.unwrap().snapshot_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.guarantees, facts.guarantees);
+    assert_eq!(after.row_count, 7);
 }
 
 /// Engines writing under different compilations of one contract name share the table: a
@@ -1894,4 +1965,116 @@ async fn a_reader_under_another_compilation_validates_rather_than_combining() {
             .contract
             .compilation_hash
     );
+}
+
+/// The facts an earlier peQL recorded for a snapshot (the bytes a b9002f7 write recorded, in
+/// its format) are not recorded facts here. A write over them commits and records its own
+/// facts, and the table's facts stay unrecorded rather than rebuilt by the write; a read is
+/// answered, validating the snapshot once and recording its facts; a validation rebuilds them
+/// as a validation of the whole computes them. Facts in this format that do not decode are
+/// refused, naming the file.
+#[tokio::test(flavor = "multi_thread")]
+async fn facts_of_an_earlier_peql_are_rebuilt_and_corrupt_facts_refused() {
+    let s = setup().await;
+    let first = s
+        .engine
+        .write("demo/readings", vec![batch(1, 40)], WriteMode::Append)
+        .await
+        .unwrap()
+        .snapshot
+        .unwrap()
+        .snapshot_id;
+    let t = table(&s.catalog, "readings").await;
+    let root = t
+        .metadata()
+        .location()
+        .trim_start_matches("file://")
+        .trim_end_matches('/')
+        .to_owned();
+    // As an earlier peQL left the table: its snapshot's facts in that format, no write facts.
+    std::fs::write(
+        format!("{root}/metadata/peql/{first}/demo__readings.json"),
+        include_bytes!("fixtures/facts-b9002f7/iceberg-snapshot-facts.json"),
+    )
+    .unwrap();
+    std::fs::remove_dir_all(format!("{root}/metadata/peql/writes")).unwrap();
+    let fresh = |name: &str| {
+        let e = Engine::in_memory(s._dir.path().join(name))
+            .with_bindings(Arc::new(IcebergTables::new(s.catalog.clone())));
+        e.register_contract(&readings(), &schema()).unwrap();
+        e
+    };
+    let engine = fresh("upgraded");
+    assert!(
+        engine
+            .manifest_as_of("demo/readings", first)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let r = engine
+        .write("demo/readings", vec![batch(41, 50)], WriteMode::Append)
+        .await
+        .unwrap();
+    assert_eq!(r.verdict.row_count, 10);
+    let second = r.snapshot.unwrap().snapshot_id;
+    let t = table(&s.catalog, "readings").await;
+    let write_id = &t
+        .metadata()
+        .snapshot_by_id(second)
+        .unwrap()
+        .summary()
+        .additional_properties[peql::iceberg_table::SUMMARY_WRITE_ID];
+    assert!(
+        std::path::Path::new(&format!(
+            "{root}/metadata/peql/writes/{write_id}/demo__readings.json"
+        ))
+        .exists()
+    );
+    let facts_of_second = format!("{root}/metadata/peql/{second}/demo__readings.json");
+    assert!(!std::path::Path::new(&facts_of_second).exists());
+    assert!(
+        engine
+            .manifest_as_of("demo/readings", second)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    let res = engine
+        .query(r#"SELECT id FROM "demo/readings""#, &owner())
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), owner_ids(50));
+    assert!(std::path::Path::new(&facts_of_second).exists());
+
+    let rebuilt = engine.validate("demo/readings").await.unwrap();
+    let plan = engine
+        .get("demo/readings")
+        .unwrap()
+        .compilation
+        .validation
+        .plan
+        .clone();
+    let whole = engine.validate_with("demo/readings", plan).await.unwrap();
+    let facts = engine.manifest("demo/readings").unwrap().unwrap();
+    assert_eq!(
+        (facts.row_count, &facts.failures, &facts.data_hash),
+        (whole.row_count, &whole.failures, &whole.data_hash)
+    );
+    assert_eq!(rebuilt.data_hash, whole.data_hash);
+    assert_eq!(facts.row_count, 50);
+
+    // Corrupt facts are refused, by name.
+    for corrupt in [&b"{\"format\": 2, \"contract\": 7}"[..], &b"{ not json"[..]] {
+        std::fs::write(&facts_of_second, corrupt).unwrap();
+        match fresh("reader")
+            .query(r#"SELECT id FROM "demo/readings""#, &owner())
+            .await
+        {
+            Err(PeqlError::Invalid(m)) => assert!(m.contains(&facts_of_second), "{m}"),
+            other => panic!("{:?}", other.map(|r| r.envelope.rows)),
+        }
+    }
 }

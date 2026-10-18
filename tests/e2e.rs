@@ -496,22 +496,26 @@ async fn data_guarantee_denies(binding: Binding) {
         .write("sales/orders", vec![batch(&data)], WriteMode::Overwrite)
         .await
         .unwrap();
-    // The rows break no row rule; the data they make breaks a guarantee about the data.
+    // The rows break no row rule, and a write decides no guarantee: the data is served.
     assert!(report.verdict.valid, "{:?}", report.verdict.breached);
     let facts = engine.manifest("sales/orders").unwrap().unwrap();
-    assert!(!facts.valid);
-    assert_eq!(facts.breached, ["ids_present"]);
-    let q = engine
-        .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
-        .await;
+    assert!(facts.valid);
+    assert!(facts.guarantees.is_empty());
+    let acme = analyst("acme");
+    let read = || engine.query(r#"SELECT COUNT(*) FROM "sales/orders""#, &acme);
+    assert!(read().await.is_ok());
+    // A validation of the whole data decides the guarantee, which does not hold.
+    let whole = engine.validate("sales/orders").await.unwrap();
+    assert_eq!(whole.breached, ["ids_present"]);
+    assert!(!whole.guarantees["ids_present"]);
+    let facts = engine.manifest("sales/orders").unwrap().unwrap();
+    assert!(!facts.guarantees["ids_present"].holds);
+    let q = read().await;
     assert!(
         matches!(q, Err(EngineError::NotServable { ref breached, .. }) if breached == &["ids_present"]),
         "{:?}",
         q.err()
     );
-    let whole = engine.validate("sales/orders").await.unwrap();
-    assert_eq!(whole.breached, ["ids_present"]);
-    assert!(!whole.guarantees["ids_present"]);
 }
 
 async fn append_accumulates(binding: Binding) {

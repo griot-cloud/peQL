@@ -305,9 +305,12 @@ impl ObjectLocation {
         match self.store.get(&self.manifest_path(contract)).await {
             Ok(r) => {
                 let bytes = r.bytes().await.map_err(store_err)?;
-                serde_json::from_slice(&bytes)
-                    .map(Some)
-                    .map_err(|e| PeqlError::Invalid(format!("manifest of `{contract}`: {e}")))
+                crate::manifest::decode(&bytes).map_err(|e| {
+                    PeqlError::Invalid(format!(
+                        "manifest of `{contract}` ({}): {e}",
+                        self.manifest_path(contract)
+                    ))
+                })
             }
             Err(object_store::Error::NotFound { .. }) => Ok(None),
             Err(e) => Err(store_err(e)),
@@ -316,7 +319,7 @@ impl ObjectLocation {
 
     /// One put: object stores replace an object whole, so a reader never sees half of one.
     pub async fn save_manifest(&self, manifest: &Manifest) -> Result<()> {
-        let body = serde_json::to_vec_pretty(manifest)
+        let body = crate::manifest::encode(manifest)
             .map_err(|e| PeqlError::Invalid(format!("manifest: {e}")))?;
         self.store
             .put(
