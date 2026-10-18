@@ -272,7 +272,7 @@ async fn run(cli: Cli) -> R {
             println!(
                 "wrote {} rows to {name} ({} files): {}",
                 report.rows_written,
-                report.files,
+                report.files.len(),
                 if v.valid {
                     "valid".to_owned()
                 } else {

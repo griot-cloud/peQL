@@ -13,9 +13,14 @@
 //! No write deletes a file, and every earlier snapshot stays readable until it is expired.
 //!
 //! What peQL knows about a snapshot's data ([`Manifest`]: the verdict, statistics, data hash
-//! and each file's contract hash and flags) is kept with that snapshot: the writing contract's
-//! name and hashes in the snapshot's summary, and the rest, per contract, in one file keyed by
-//! the snapshot id beside the table's metadata (`metadata/peql/<snapshot>/<contract>.json`).
+//! and each file's contract hash, flags and hash) is kept with that snapshot: the writing
+//! contract's name and hashes in the snapshot's summary, and the rest, per contract, in one
+//! file keyed by the snapshot id beside the table's metadata
+//! (`metadata/peql/<snapshot>/<contract>.json`). A write records the facts of the rows it
+//! wrote ([`WriteFacts`]) before it commits, per contract bound to the table, in
+//! `metadata/peql/writes/<write>/<contract>.json`, and names the write in the snapshot's
+//! summary ([`SUMMARY_WRITE_ID`]); a snapshot's facts are its parent's combined with its
+//! write's, so no write reads a file it did not write.
 //!
 //! ```no_run
 //! # async fn f(catalog: std::sync::Arc<dyn iceberg::Catalog>) -> peql::Result<()> {
@@ -57,8 +62,9 @@ use parcel_core::document::Source;
 use parcel_runtime::plan::col_ref;
 use uuid::Uuid;
 
-use crate::binding::{self, BindingResolver, DataHash, Location};
+use crate::binding::{self, BindingResolver, Location};
 use crate::error::{PeqlError, Result};
+use crate::facts::WriteFacts;
 use crate::manifest::{FileEntry, Manifest};
 
 /// Snapshot summary keys peQL writes: the contract the snapshot's files were written under.
@@ -67,9 +73,13 @@ pub const SUMMARY_CONTRACT_HASH: &str = "peql.contract-hash";
 pub const SUMMARY_COMPILATION_HASH: &str = "peql.compilation-hash";
 /// `append` or `overwrite`: what the write did, whatever operation the snapshot records.
 pub const SUMMARY_WRITE: &str = "peql.write";
+/// The write that made the snapshot, whose facts are under `metadata/peql/writes/<id>/`.
+pub const SUMMARY_WRITE_ID: &str = "peql.write-id";
 
 /// Where a contract's facts for one snapshot live, under the table's location.
 const FACTS_DIR: &str = "metadata/peql";
+/// Where the facts of each write's rows live, under the table's location.
+const WRITES_DIR: &str = "metadata/peql/writes";
 
 /// Contracts bound to tables in one Iceberg catalog. A contract whose document says
 /// `binding: {iceberg: <namespace>.<table>}` is bound to that table in the catalog: every part
@@ -241,7 +251,8 @@ impl IcebergLocation {
         Ok(out)
     }
 
-    /// Manifest entries from each file's footer, read with two ranged reads.
+    /// Manifest entries from each file's footer, read with two ranged reads, and the sha256
+    /// of its bytes: what a validation of the whole snapshot records.
     pub async fn file_entries(
         &self,
         table: &Table,
@@ -256,27 +267,10 @@ impl IcebergLocation {
                 f.bytes,
                 &meta,
                 flag_columns,
+                sha256(table, f).await?,
             ));
         }
         Ok(out)
-    }
-
-    /// The hash [`binding::data_hash`] computes over a directory, over a snapshot's files.
-    pub async fn data_hash(&self, table: &Table, files: &[SnapshotFile]) -> Result<String> {
-        const CHUNK: u64 = 1 << 20;
-        let mut acc = DataHash::default();
-        for f in files {
-            let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
-            let reader = table.file_io().new_input(&f.path)?.reader().await?;
-            let mut at = 0;
-            while at < f.bytes {
-                let end = (at + CHUNK).min(f.bytes);
-                sha2::Digest::update(&mut hasher, &reader.read(at..end).await?);
-                at = end;
-            }
-            acc.add(&f.relative, &hex::encode(sha2::Digest::finalize(hasher)));
-        }
-        Ok(acc.finish())
     }
 
     fn facts_path(table: &Table, snapshot: i64, contract: &str) -> String {
@@ -333,6 +327,62 @@ impl IcebergLocation {
         Ok(())
     }
 
+    fn write_facts_path(table: &Table, write: &str, contract: &str) -> String {
+        format!(
+            "{}/{WRITES_DIR}/{write}/{}.json",
+            table.metadata().location().trim_end_matches('/'),
+            contract.replace('/', "__")
+        )
+    }
+
+    /// Record the facts of one write's rows under one contract, before the write commits.
+    pub(crate) async fn save_write_facts(
+        &self,
+        table: &Table,
+        write: &str,
+        facts: &WriteFacts,
+    ) -> Result<()> {
+        let body = serde_json::to_vec_pretty(facts)
+            .map_err(|e| PeqlError::Invalid(format!("facts of write {write}: {e}")))?;
+        table
+            .file_io()
+            .new_output(Self::write_facts_path(table, write, &facts.facts.contract))?
+            .write(Bytes::from(body))
+            .await?;
+        Ok(())
+    }
+
+    /// The facts of the rows the write that made `snapshot` wrote, under `contract`; `None`
+    /// for a snapshot peQL did not write, or whose write did not record facts under it.
+    pub async fn load_write_facts(
+        &self,
+        table: &Table,
+        snapshot: i64,
+        contract: &str,
+    ) -> Result<Option<WriteFacts>> {
+        let snap = table
+            .metadata()
+            .snapshot_by_id(snapshot)
+            .ok_or_else(|| self.no_snapshot(snapshot))?;
+        let Some(write) = snap.summary().additional_properties.get(SUMMARY_WRITE_ID) else {
+            return Ok(None);
+        };
+        let input = table
+            .file_io()
+            .new_input(Self::write_facts_path(table, write, contract))?;
+        if !input.exists().await? {
+            return Ok(None);
+        }
+        serde_json::from_slice(&input.read().await?)
+            .map(Some)
+            .map_err(|e| {
+                PeqlError::Invalid(format!(
+                    "facts of `{contract}` for write {write} of {}: {e}",
+                    self.table
+                ))
+            })
+    }
+
     fn no_snapshot(&self, snapshot: i64) -> PeqlError {
         PeqlError::Invalid(format!("{} has no snapshot {snapshot}", self.table))
     }
@@ -377,6 +427,7 @@ impl IcebergLocation {
             table.metadata().current_schema(),
         )?);
         Ok(IcebergWrite {
+            id: dir_id.to_string(),
             location: self.clone(),
             base: table.metadata().current_snapshot_id(),
             schema,
@@ -545,6 +596,25 @@ pub fn table_schema(contract: &CompiledContract) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
+/// The files one write wrote to its local directory at `url`, read with the contract's raw
+/// row columns: what the write's validation reads. The files hold every column the table
+/// does, partition columns among them, so their directories name no partition.
+pub(crate) fn written_files(
+    contract: &CompiledContract,
+    url: &str,
+) -> Result<Arc<dyn TableProvider>> {
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    let options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+    let config = ListingTableConfig::new(ListingTableUrl::parse(url)?)
+        .with_listing_options(options)
+        .with_schema(contract.row_schema.clone());
+    Ok(Arc::new(ListingTable::try_new(config)?))
+}
+
 /// The directory a table location names on this filesystem, where DataFusion's writer writes
 /// the data files; `None` for a location in another store (`s3://`, `gs://`, ...).
 fn local_dir(location: &str) -> Result<Option<PathBuf>> {
@@ -562,6 +632,20 @@ fn local_dir(location: &str) -> Result<Option<PathBuf>> {
 
 /// How much of a staged file goes to the table's store per write.
 const UPLOAD_CHUNK: usize = 8 << 20;
+
+/// The sha256 of a snapshot file's bytes, read in chunks through the table's `FileIO`.
+async fn sha256(table: &Table, f: &SnapshotFile) -> Result<String> {
+    const CHUNK: u64 = 1 << 20;
+    let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+    let reader = table.file_io().new_input(&f.path)?.reader().await?;
+    let mut at = 0;
+    while at < f.bytes {
+        let end = (at + CHUNK).min(f.bytes);
+        sha2::Digest::update(&mut hasher, &reader.read(at..end).await?);
+        at = end;
+    }
+    Ok(hex::encode(sha2::Digest::finalize(hasher)))
+}
 
 async fn footer(table: &Table, path: &str, size: u64) -> Result<ParquetMetaData> {
     let bad = |e: &dyn std::fmt::Display| PeqlError::Invalid(format!("{path}: {e}"));
@@ -605,6 +689,8 @@ pub(crate) enum WriteKind {
 /// A write in progress to one Iceberg table.
 #[derive(Debug)]
 pub(crate) struct IcebergWrite {
+    /// Names the write: its data directory and its facts.
+    id: String,
     location: IcebergLocation,
     /// The snapshot current when the write began; an overwrite commits only over it.
     base: Option<i64>,
@@ -633,21 +719,32 @@ impl IcebergWrite {
         &self.schema
     }
 
-    /// The directory the write's data files go to, as DataFusion's writer takes it.
-    pub(crate) fn url(&self) -> Result<String> {
-        binding::local_url(&self.dir, true)
+    /// The local directory the write's data files go to, and only its own.
+    pub(crate) fn dir(&self) -> &Path {
+        &self.dir
     }
 
-    /// Commit the data files the parts wrote as one snapshot, with the writing contract in
-    /// its summary. Returns the table as committed.
+    /// A path under the write's directory as the table's facts name it: relative to the
+    /// table's location, as [`IcebergLocation::files`] gives it.
+    pub(crate) fn table_relative(&self, under_dir: &str) -> String {
+        format!("data/{}/{under_dir}", self.id)
+    }
+
+    /// Commit the data files the parts wrote as one snapshot, with the writing contract and
+    /// the write in its summary, once the facts of the write under every contract in `facts`
+    /// are recorded. Returns the table as committed.
     pub(crate) async fn commit(
         &self,
         contract: &CompiledContract,
+        facts: &[WriteFacts],
     ) -> Result<(Table, SnapshotCommit)> {
         let table =
             self.location.load().await?.ok_or_else(|| {
                 PeqlError::Invalid(format!("{} was dropped", self.location.table))
             })?;
+        for f in facts {
+            self.location.save_write_facts(&table, &self.id, f).await?;
+        }
         let files = self.data_files(&table)?;
         if self.staged {
             self.upload(&table).await?;
@@ -662,12 +759,16 @@ impl IcebergWrite {
                 SUMMARY_COMPILATION_HASH.to_owned(),
                 contract.compilation_hash.clone(),
             ),
+            (SUMMARY_WRITE_ID.to_owned(), self.id.clone()),
         ]);
         let committed = match self.kind {
             WriteKind::Append => {
                 summary.insert(SUMMARY_WRITE.to_owned(), "append".to_owned());
+                // The files are under this write's own directory, so no snapshot holds them:
+                // the duplicate check, which reads every manifest of the table, is not made.
                 let tx = Transaction::new(&table);
                 tx.fast_append()
+                    .with_check_duplicate(false)
                     .add_data_files(files)
                     .set_snapshot_properties(summary)
                     .apply(tx)?

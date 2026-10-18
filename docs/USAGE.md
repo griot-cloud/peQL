@@ -38,7 +38,7 @@ peql register orders.yaml --schema data/orders/part-0.parquet
 
 Replace the sample path with an actual file from your dataset. Registration checks and stores the contract without rewriting the data. On the first query, peQL creates a validation manifest if one is missing. The manifest stores the dataset's verdict and statistics.
 
-Use peQL's write path for subsequent changes. In this version, existing manifests are not automatically refreshed when another program edits the files, and `validate` reports a verdict without saving a replacement manifest.
+Use peQL's write path for subsequent changes. In this version, existing manifests are not automatically refreshed when another program edits the files, and `validate` validates the whole dataset and saves the manifest it computes.
 
 ## Share and inspect a contract
 

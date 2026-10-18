@@ -178,7 +178,9 @@ pub fn status(e: PeqlError) -> Status {
         | PeqlError::NotServable { .. }
         | PeqlError::Ungated(_) => Status::permission_denied(msg),
         PeqlError::BudgetExhausted { .. } => Status::resource_exhausted(msg),
-        PeqlError::NotWritten { .. } => Status::failed_precondition(msg),
+        PeqlError::NotWritten { .. } | PeqlError::Unverified { .. } => {
+            Status::failed_precondition(msg)
+        }
         PeqlError::Compile(_) | PeqlError::Invalid(_) => Status::invalid_argument(msg),
         PeqlError::Signing(_) => Status::unavailable(msg),
         PeqlError::DataFusion(

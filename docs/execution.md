@@ -26,7 +26,7 @@ When peQL writes data, it computes assertion flags and reusable calculations sel
 
 Queries use the manifest to check whether the data can be served. They can reuse stored rule calculations when the files' contract hashes match the current contract. Otherwise, the view evaluates those row calculations live.
 
-These are separate checks: evaluating a row expression live does not refresh a saved dataset verdict. Writes through peQL refresh manifests; external file edits and standalone `validate` calls do not. Contract changes that affect validation should be followed by a rewrite from the source data.
+These are separate checks: evaluating a row expression live does not refresh a saved dataset verdict. Writes through peQL update manifests from the rows they write; `validate` recomputes a manifest from the whole dataset; external file edits update nothing. Contract changes that affect validation should be followed by a rewrite from the source data.
 
 A write is not a transaction that rolls back on a failed quality check. Data can be stored and subsequently marked unservable. The write report tells you which checks failed.
 

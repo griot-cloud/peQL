@@ -503,9 +503,13 @@ async fn a_write_in_parts_refreshes_the_manifest_once() {
     let after = e.manifest("demo/cells").unwrap().unwrap();
     assert_eq!(after.row_count as i64, N + 250);
     assert!(after.written_at > before.written_at);
-    assert_eq!(report.files, after.files.len());
+    // The report is the write's own files; the manifest lists the data's, theirs among them.
+    assert_eq!(report.verdict.row_count, 250);
+    assert!(!report.files.is_empty());
+    assert!(report.files.iter().all(|f| after.files.contains(f)));
+    assert!(after.files.len() > report.files.len());
 
-    // Overwrite removes what was there when the write begins.
+    // An overwrite replaces what is there when it finishes.
     let w = e
         .begin_write("demo/cells", WriteMode::Overwrite)
         .await

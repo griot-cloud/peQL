@@ -34,6 +34,7 @@ pub mod cache;
 pub mod engine;
 pub mod envelope;
 pub mod error;
+pub mod facts;
 pub mod format;
 pub mod functions;
 pub mod gate;

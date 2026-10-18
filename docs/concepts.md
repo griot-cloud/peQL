@@ -68,7 +68,7 @@ Queries can select, join and aggregate the columns exposed by registered contrac
 
 ## Writes and validation
 
-**Writing** saves data under a contract. The CLI reads CSV or Parquet and writes Parquet files. peQL also computes reusable rule calculations and validates the stored dataset.
+**Writing** saves data under a contract. The CLI reads CSV or Parquet and writes Parquet files. peQL also computes reusable rule calculations and validates the rows it writes.
 
 **Validation** produces a verdict: which checks failed, how many rows failed, and whether the dataset can be queried. In the example, an invalid amount excludes that row from results without deleting it from storage. A contract can instead require a failure to block queries to the entire dataset.
 

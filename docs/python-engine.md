@@ -49,7 +49,7 @@ engine.register_compiled(contract: str, compiled: bytes) -> str
 engine.write(name: str, data: pyarrow.Table | pyarrow.RecordBatch, append: bool = False) -> dict
 ```
 
-`name` is a registered contract name. `data` supplies an Arrow schema and batches. With `append=False`, replaces the bound data; `append=True` adds rows. Returns `{"rows_written": int, "files": int, "verdict": dict}`. `files` counts all files after the write, including earlier files when appending. Inspect `verdict["valid"]` to determine whether deny-level checks passed; see [Results and errors](python-results.md). Write failures raise `RuntimeError` or `peql.Refused` when the engine classifies them as a refusal.
+`name` is a registered contract name. `data` supplies an Arrow schema and batches. With `append=False`, replaces the bound data; `append=True` adds rows. Returns `{"rows_written": int, "files": list, "verdict": dict}`. `files` lists the files this write added; `verdict` is the contract's row rules over the rows written. Inspect `verdict["valid"]` to determine whether the written rows passed deny-level checks; see [Results and errors](python-results.md). Write failures raise `RuntimeError` or `peql.Refused` when the engine classifies them as a refusal.
 
 ## `validate`
 

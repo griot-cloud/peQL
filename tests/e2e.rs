@@ -219,15 +219,18 @@ async fn end_to_end(binding: Binding) {
         v.stats["customer_id__null_rate"],
         serde_json::json!(3.0 / 600.0)
     );
-    assert!(v.guarantees["ids_present"]);
-    assert!(v.guarantees["msisdns_mostly_valid"]);
+    // A write's verdict is its row rules over its rows; guarantees are the whole data's.
+    assert!(v.guarantees.is_empty(), "{:?}", v.guarantees);
     assert!(
-        report.files >= 4,
+        report.files.len() >= 4,
         "partitioned by region and dt: {} files",
-        report.files
+        report.files.len()
     );
 
     let manifest = engine.manifest("sales/orders").unwrap().unwrap();
+    assert!(manifest.valid);
+    assert_eq!(manifest.files, report.files);
+    assert_eq!(manifest.data_hash, v.data_hash);
     assert!(
         manifest.flags_current(
             &engine
@@ -245,10 +248,13 @@ async fn end_to_end(binding: Binding) {
             .all(|f| f.flags.contains_key("_c_amount_consistent"))
     );
 
-    // Validation is reproducible: same data, same verdict and data hash.
+    // Validation of the whole data, on demand, finds what the write did: the first write's
+    // rows are all the data.
     let again = engine.validate("sales/orders").await.unwrap();
     assert_eq!(again.data_hash, v.data_hash);
     assert_eq!(again.failures, v.failures);
+    assert!(again.guarantees["ids_present"]);
+    assert!(again.guarantees["msisdns_mostly_valid"]);
 
     // A verifier holding only the compiled bytes reproduces the verdict over the same data.
     let reg = engine.get("sales/orders").unwrap();
@@ -490,9 +496,22 @@ async fn data_guarantee_denies(binding: Binding) {
         .write("sales/orders", vec![batch(&data)], WriteMode::Overwrite)
         .await
         .unwrap();
-    assert!(!report.verdict.valid);
-    assert_eq!(report.verdict.breached, ["ids_present"]);
-    assert!(!report.verdict.guarantees["ids_present"]);
+    // The rows break no row rule; the data they make breaks a guarantee about the data.
+    assert!(report.verdict.valid, "{:?}", report.verdict.breached);
+    let facts = engine.manifest("sales/orders").unwrap().unwrap();
+    assert!(!facts.valid);
+    assert_eq!(facts.breached, ["ids_present"]);
+    let q = engine
+        .query(r#"SELECT COUNT(*) FROM "sales/orders""#, &analyst("acme"))
+        .await;
+    assert!(
+        matches!(q, Err(EngineError::NotServable { ref breached, .. }) if breached == &["ids_present"]),
+        "{:?}",
+        q.err()
+    );
+    let whole = engine.validate("sales/orders").await.unwrap();
+    assert_eq!(whole.breached, ["ids_present"]);
+    assert!(!whole.guarantees["ids_present"]);
 }
 
 async fn append_accumulates(binding: Binding) {
@@ -511,8 +530,32 @@ async fn append_accumulates(binding: Binding) {
         .write("sales/orders", vec![batch(&data[300..])], WriteMode::Append)
         .await
         .unwrap();
-    assert_eq!(r.verdict.row_count, 600);
-    assert_eq!(r.verdict.failures["amount_consistent"], 24);
+    // The write's verdict covers its own rows, and its hash its own files.
+    let half = data[300..]
+        .iter()
+        .filter(|o| o.amount != o.unit * o.qty as i64)
+        .count() as i64;
+    assert_eq!(r.verdict.row_count, 300);
+    assert_eq!(r.verdict.failures["amount_consistent"], half);
+    assert_eq!(r.verdict.data_hash, peql::manifest::data_hash(&r.files));
+
+    // The data's facts are the two writes' combined, and match a validation of the whole.
+    let combined = engine.manifest("sales/orders").unwrap().unwrap();
+    assert_eq!(combined.row_count, 600);
+    assert_eq!(combined.failures["amount_consistent"], 24);
+    assert!(r.files.iter().all(|f| combined.files.contains(f)));
+    let whole = engine.validate("sales/orders").await.unwrap();
+    let validated = engine.manifest("sales/orders").unwrap().unwrap();
+    assert_eq!(combined.data_hash, whole.data_hash);
+    assert_eq!(combined.files, validated.files);
+    assert_eq!(combined.failures, validated.failures);
+    assert_eq!(
+        (combined.valid, &combined.breached),
+        (validated.valid, &validated.breached)
+    );
+    for (k, v) in &combined.stats {
+        assert_eq!(Some(v), validated.stats.get(k), "{k}");
+    }
 }
 
 async fn unwritten_contract_is_reported(binding: Binding) {

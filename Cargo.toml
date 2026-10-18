@@ -82,6 +82,8 @@ wat = "1"
 # A Flight SQL client over a Unix socket, in the flight tests.
 hyper-util = { version = "0.1", features = ["tokio"] }
 tower = { version = "0.5", features = ["util"] }
+# An Iceberg storage that counts what it reads, in the iceberg tests.
+typetag = "0.2"
 
 # DataFusion is large; full debug info for every dependency fills disks quickly.
 [profile.dev]
