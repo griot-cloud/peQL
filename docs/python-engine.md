@@ -46,10 +46,25 @@ engine.register_compiled(contract: str, compiled: bytes) -> str
 ## `write`
 
 ```python
-engine.write(name: str, data: pyarrow.Table | pyarrow.RecordBatch, append: bool = False) -> dict
+engine.write(
+    name: str,
+    data: pyarrow.Table | pyarrow.RecordBatch,
+    append: bool = False,
+    on_violation: str = "refuse",
+) -> dict
 ```
 
-`name` is a registered contract name. `data` supplies an Arrow schema and batches. With `append=False`, replaces the bound data; `append=True` adds rows. Returns `{"rows_written": int, "files": list, "verdict": dict, "table": dict | None}`; `table` holds the dataset's `row_count` and per-column `null_counts` after the write, or `None` while its manifest is not recorded. `files` lists the files this write added; `verdict` is the contract's row rules over the rows written. Inspect `verdict["valid"]` to determine whether the written rows passed deny-level checks; see [Results and errors](python-results.md). Write failures raise `RuntimeError` or `peql.Refused` when the engine classifies them as a refusal.
+`name` is a registered contract name. `data` supplies an Arrow schema and batches. With `append=False`, replaces the bound data; `append=True` adds rows.
+
+`on_violation` says what to do with rows that break a row rule (a `drop` or `deny` assert):
+
+- `"refuse"` (default): if any row breaks one, nothing is written and `peql.Refused` is raised, naming each rule and how many rows broke it.
+- `"exclude"`: only the rows that pass are written; the others are returned in `report["excluded"]`.
+- `"warn"`: every row is written; the verdict is not valid when a deny-level assert fails.
+
+Any other value raises `RuntimeError`.
+
+Returns a dictionary with `rows_written`, `on_violation`, `violations` (rows that broke each rule), `rows_excluded`, `excluded` (a `pyarrow.Table` with a `_violations` column under `"exclude"`, else `None`), `files`, `verdict`, `table` and, for an Iceberg table, `snapshot`. `table` holds the dataset's `row_count` and per-column `null_counts` after the write, or `None` while its manifest is not recorded. `files` lists the files this write added; `verdict` is the contract's row rules over the rows written. See [Results and errors](python-results.md). Write failures raise `RuntimeError` or `peql.Refused` when the engine classifies them as a refusal.
 
 ## `validate`
 
@@ -62,18 +77,20 @@ Runs the contract's validation plan over its bound data and returns a verdict di
 ## `query`
 
 ```python
-engine.query(sql: str, caller: peql.Caller) -> pyarrow.Table
+engine.query(sql: str, caller: peql.Caller, on_violation: str = "exclude") -> pyarrow.Table
 ```
 
-Executes one read-only SQL query as the supplied caller and returns an Arrow table. The result contains only rows and columns exposed under that caller's policy. Raises `peql.Refused` for a policy or visibility refusal; malformed SQL and execution failures raise `RuntimeError`. See [`query_with_envelope`](#query_with_envelope) for metadata.
+Executes one read-only SQL query as the supplied caller and returns an Arrow table. The result contains only rows and columns exposed under that caller's policy, and never a row that breaks a row rule. With `on_violation="exclude"` (default) such rows are left out and counted in the envelope. With `"refuse"`, a query of data that holds any such row raises `peql.Refused`, naming each rule and how many rows broke it. Raises `peql.Refused` for a policy or visibility refusal; malformed SQL and execution failures raise `RuntimeError`. See [`query_with_envelope`](#query_with_envelope) for metadata.
 
 ## `query_with_envelope`
 
 ```python
-engine.query_with_envelope(sql: str, caller: peql.Caller) -> tuple[pyarrow.Table, dict]
+engine.query_with_envelope(
+    sql: str, caller: peql.Caller, on_violation: str = "exclude"
+) -> tuple[pyarrow.Table, dict]
 ```
 
-Takes the same `sql` and `caller` as `query`. Returns `(table, envelope)`: the result table and a dictionary of applied contracts, scan statistics, charges, attestation and audit metadata. See [Results and errors](python-results.md) for the keys. Exceptions follow `query`.
+Takes the same `sql`, `caller` and `on_violation` as `query`. Returns `(table, envelope)`: the result table and a dictionary of applied contracts, scan statistics, charges, attestation and audit metadata. See [Results and errors](python-results.md) for the keys. Exceptions follow `query`.
 
 ## `describe`
 

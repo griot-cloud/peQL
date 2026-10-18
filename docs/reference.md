@@ -29,6 +29,7 @@ peql [--root DIR] COMMAND
 ### Write and registration options
 
 - `--append` on `write` adds records instead of replacing data.
+- `--on-violation refuse|exclude|warn` on `write` says what to do with rows that break a row rule (see [Rows that break a contract](#rows-that-break-a-contract)). The default, `refuse`, writes nothing when any row breaks a rule. `exclude` writes only the rows that pass and requires `--excluded PATH`, where the set-aside rows are written as Parquet with a `_violations` column. `warn` writes every row.
 - `--type COLUMN=TYPE` on `register` or `write` overrides CSV type inference. Repeat it for multiple columns.
 - `--revoke` on `publish` withdraws the specified audience.
 
@@ -43,6 +44,8 @@ peql [--root DIR] COMMAND
 | `--out PATH` | Write results to a file instead of standard output. |
 | `--envelope` | Print query metadata as JSON to standard error. |
 | `--explain` | Show the physical plan without executing it; intended for operators. |
+| `--on-violation exclude` | Leave out rows that break a row rule and note how many per rule on standard error; the default. |
+| `--on-violation refuse` | Refuse the query when the data holds any row that breaks a row rule. |
 
 SQL `EXPLAIN` is refused through the ordinary query interface. `--explain` is a separate operator action and can expose implementation details.
 
@@ -68,7 +71,7 @@ Without a caller file or overrides, the CLI uses ID `cli`, an empty tenant and a
 | Code | Meaning |
 | --- | --- |
 | `0` | The command succeeded; writes and validation passed deny-level checks. |
-| `1` | Query or describe refusal, or a write/validation verdict marking data unservable. |
+| `1` | Query or describe refusal, a write refused for rows that break a row rule, or a write/validation verdict that is not valid. |
 | `2` | Other errors, such as invalid arguments, compilation, missing data or execution failures. |
 
 ## SQL behaviour
@@ -77,9 +80,32 @@ peQL uses DataFusion SQL and accepts one query at a time. Select from a register
 
 Joins, aggregates and subqueries operate over the exposed contract views. DDL, DML, `COPY`, `SET`, SQL `EXPLAIN` and multiple statements are refused. Catalog/schema-qualified table references are not contract names; use the whole contract name as one quoted identifier.
 
+## Rows that break a contract
+
+A row breaks its contract when it fails an `assert` whose `on_fail` is `drop` or `deny`. An assert with `on_fail: report` only counts its failures; no row breaks it. Guarantees are rules about the whole dataset, not rows, and are decided only by `validate`.
+
+**Reads.** A read never returns a row that breaks its contract. The read's `on_violation` (`OnReadViolation` in Rust) chooses what happens when the data holds such rows:
+
+| Mode | Effect |
+| --- | --- |
+| `exclude` | The default. The contract's view leaves the rows out, and the envelope's `excluded` reports how many rows it left out per rule. |
+| `refuse` | The read is refused with `Violated`, naming each rule broken and how many rows broke it. |
+
+There is no mode that returns breaking rows. The counts come from the dataset's manifest: they cover the whole dataset, not only the rows a query's own filters would have reached. A `refuse` read is therefore refused when the dataset holds any breaking row. Caller-level rules (`decide`) are checked first and refuse a read whatever its mode. Columns a contract withholds stay withheld, and masked columns stay masked, in either mode.
+
+**Writes.** A write's `on_violation` (`OnWriteViolation` in Rust) chooses what happens to the rows it is given that break a row rule:
+
+| Mode | Effect |
+| --- | --- |
+| `refuse` | The default. Nothing is committed; the write fails with `Violated`, naming each rule broken and how many rows broke it. |
+| `exclude` | Only the rows that pass are committed. The others are returned to the writer in the contract's row schema plus a `_violations` column listing the rules each row broke. The report counts them per rule. |
+| `warn` | Every row is committed. The verdict is not valid when a deny-level assert fails, and the report counts the breaking rows per rule. Reads leave those rows out. |
+
+A write evaluates only row rules, over its own rows. `Engine::compact` rewrites rows as stored and neither refuses nor sets any aside.
+
 ## Validation and write reports
 
-A write report contains `rows_written`, `files`, `verdict`, `table` and, for an Iceberg table, `snapshot`. `table` is the data's `row_count` and per-column `null_counts` after the write, from its manifest, or null while the manifest is not recorded. `files` lists the files the write added; `verdict` is the contract's row rules over the rows written, with a hash over those files. The dataset's manifest is updated from the write's facts without reading earlier files.
+A write report contains `rows_written`, `on_violation`, `violations`, `rows_excluded`, `files`, `verdict`, `table` and, for an Iceberg table, `snapshot`. `violations` maps each row rule to the number of rows the write was given that broke it: set aside under `exclude`, committed under `warn`. A row that breaks two rules is counted under both. `rows_excluded` is the number of rows set aside rather than committed. `table` is the data's `row_count` and per-column `null_counts` after the write, from its manifest, or null while the manifest is not recorded. `files` lists the files the write added; `verdict` is the contract's row rules over the rows written, with a hash over those files. The dataset's manifest is updated from the write's facts without reading earlier files.
 
 The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`, `stats` and `data_hash`. `failures` maps assertion IDs to failing-row counts. `valid` can be true when drop-level or report-only checks fail. A write's verdict covers only its rows and row rules, so its `guarantees` is empty; `validate` decides each dataset guarantee over the whole data, and the manifest keeps each one's last decision (`holds`, `snapshot_id`, `decided_at`) until the next `validate`.
 
@@ -88,7 +114,7 @@ The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`,
 | Field | Meaning |
 | --- | --- |
 | `caller` | The caller's id, tenant and purpose, as the engine was told them. |
-| `contracts` | Names, versions, hashes, decision rules, annotations, active result rules and use of stored calculations. |
+| `contracts` | Names, versions, hashes, decision rules, annotations, active result rules and use of stored calculations. Each contract's `excluded` maps a row rule to the number of the dataset's rows the view left out for breaking it; it is empty when nothing was left out. |
 | `rows` | Number of returned rows. |
 | `suppress_k` | Active minimum group size, if any. |
 | `charges` | Epsilon this query charged, per budget. |
@@ -106,7 +132,8 @@ The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`,
 | `UnknownContract` | Registration and publication to the caller's tenant. An invisible contract has the same error as an absent one. |
 | `Denied` | The named caller-level rule and supplied context. |
 | `NotWritten` | Whether the contract has data and a validation manifest. |
-| `NotServable` | The dataset's deny-level failures; correct and rewrite the data. |
+| `NotServable` | The deny-level guarantees the dataset failed when `validate` last decided them; correct the data, then validate again. |
+| `Violated` | Rows that break the named row rules, with how many broke each: a write refused them (`refuse`), or a read was asked to refuse them. Correct the rows, or write with `exclude`. |
 | `GuaranteeFailed` | The named dataset requirement, such as freshness or a missing-value limit. |
 | `BudgetExhausted` | Spending and the limit for that caller's named budget. |
 | `Refused` | Whether the SQL is a single supported read-only query. |
@@ -114,7 +141,7 @@ The verdict includes `valid`, `row_count`, `failures`, `breached`, `guarantees`,
 | `Signing` | The configured envelope signer: it refused or did not answer, so the query returns nothing. |
 | `Ungated` | A contract scan is missing its required execution gate; report this as an engine/integration issue. |
 
-In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotServable`, `GuaranteeFailed`, `BudgetExhausted` and `Refused`. `NotWritten` is a separate failure. Python maps the refusal group to `peql.Refused`.
+In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotServable`, `Violated`, `GuaranteeFailed`, `BudgetExhausted` and `Refused`. `NotWritten` is a separate failure. Python maps the refusal group to `peql.Refused`.
 
 ## Workspace files
 
@@ -127,6 +154,20 @@ In Rust, `PeqlError::is_refusal()` includes `UnknownContract`, `Denied`, `NotSer
 | `<binding>/_peql/manifests/` | Per-contract dataset manifests beside the bound data. |
 
 Keep the workspace state and dataset files together when moving or backing up a workspace. Single-file Parquet bindings can be read; peQL's write path requires a directory binding.
+
+## Rust write and read API
+
+| Item | Shape |
+| --- | --- |
+| `Engine::write(name, batches, mode, on_violation)` | Returns `WriteOutcome { report: WriteReport, excluded: Option<RecordBatch> }`; `excluded` holds the rows set aside under `OnWriteViolation::Exclude`. |
+| `Engine::begin_write(name, mode, on_violation)` | Starts a write delivered in parts. |
+| `Engine::write_part(&writing, batches)` | Returns `Part { rows_written, excluded: Option<RecordBatch> }`. Under `Exclude`, each part returns its own set-aside rows; the write keeps none of them. |
+| `Engine::finish_write(writing)` | Returns the `WriteReport`, or `Violated` under `Refuse`, in which case nothing the write wrote is published. |
+| `OnWriteViolation` | `Refuse` (the `Default`), `Exclude` or `Warn`. |
+| `OnReadViolation` | `Exclude` (the `Default`) or `Refuse`. A parameter of `query_as_of`, `plan_for`, `plan_as_of`, `view_for`, `view_as_of` and `check`; `query`, `plan`, `view` and `explain` use the default. |
+| `Resolution::excluded` | `BTreeMap<String, u64>`: rows the contract's view left out, per row rule. |
+| `PeqlError::Violated { contract, violations }` | `violations` is `Vec<(String, u64)>`: each rule broken, in the contract's order, and how many rows broke it. |
+| `peql::violation::VIOLATIONS_COLUMN` | `_violations`, the `List<Utf8>` column of set-aside rows. |
 
 ## Build features
 

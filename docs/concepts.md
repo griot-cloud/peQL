@@ -70,9 +70,11 @@ Queries can select, join and aggregate the columns exposed by registered contrac
 
 **Writing** saves data under a contract. The CLI reads CSV or Parquet and writes Parquet files. peQL also computes reusable rule calculations and validates the rows it writes.
 
-**Validation** produces a verdict: which checks failed, how many rows failed, and whether the dataset can be queried. In the example, an invalid amount excludes that row from results without deleting it from storage. A contract can instead require a failure to block queries to the entire dataset.
+**Validation** produces a verdict: which checks failed, how many rows failed, and whether the dataset can be queried. A row that fails a `drop` or `deny` assert **breaks** the contract; an assert with `on_fail: report` only counts failures.
 
-A write can store data that fails validation. Inspect the write report to see whether it can be queried. peQL saves validation results and dataset statistics in a **manifest**, which later queries use to check dataset requirements.
+A write refuses rows that break the contract unless the writer asks otherwise: it can instead write only the rows that pass and hand the others back, or write every row. A query never returns a row that breaks the contract. By default it leaves those rows out and reports how many it left out per rule; a caller can ask for the query to be refused instead. A failed dataset guarantee with `on_fail: deny` blocks queries to the entire dataset. See [Rows that break a contract](reference.md#rows-that-break-a-contract).
+
+Inspect the write report to see what was written and which rules rows broke. peQL saves validation results and dataset statistics in a **manifest**, which later queries use to check dataset requirements.
 
 You can also register a contract over existing Parquet without rewriting it. See {doc}`USAGE` for that workflow and how to keep validation results current.
 

@@ -45,10 +45,14 @@ Call `register_contract(source, &schema)` with YAML/JSON text and an Arrow schem
 
 | Method | Use it when |
 | --- | --- |
-| `write(name, batches, WriteMode::Overwrite)` | You want peQL to replace the bound Parquet data. |
-| `write(name, batches, WriteMode::Append)` | You want to add batches to the bound data. |
+| `write(name, batches, WriteMode::Overwrite, on_violation)` | You want peQL to replace the bound Parquet data. |
+| `write(name, batches, WriteMode::Append, on_violation)` | You want to add batches to the bound data. |
 | `bind_batches(name, batches)` | The data is already in memory. |
 | `bind_table(name, provider)` | You have a DataFusion `TableProvider`. |
+
+`on_violation` is an `OnWriteViolation`: `Refuse` (the default) writes nothing and returns `PeqlError::Violated` when any row breaks a row rule; `Exclude` writes only the rows that pass and returns the others in `WriteOutcome::excluded`, with a `_violations` column; `Warn` writes every row. `write` returns `WriteOutcome { report, excluded }`. A write that arrives in parts uses `begin_write(name, mode, on_violation)`, `write_part`, which returns `Part { rows_written, excluded }`, and `finish_write`.
+
+Reads never return a row that breaks a row rule. `query`, `plan` and `view` leave such rows out and report them per rule in `Resolution::excluded`. `query_as_of`, `plan_for`, `plan_as_of`, `view_for`, `view_as_of` and `check` take an `OnReadViolation`; with `Refuse`, a read of data that holds any such row returns `PeqlError::Violated`. See [Rows that break a contract](reference.md#rows-that-break-a-contract).
 
 The binding methods validate the supplied table and keep its manifest in memory. They do not write Parquet. `write` requires a file binding that points to a directory, rather than a single file or a bound table.
 

@@ -33,6 +33,8 @@ The `flight` feature adds `peql::flight::FlightSql`, a Flight SQL service over t
 
 Each request names its caller in the `x-peql-caller` header (a `Caller` as base64 JSON; `caller_header` builds it). The header is trusted, so only whoever authenticated the caller may reach the listener. `FlightSql::for_caller` fixes one caller instead.
 
+A read leaves out rows that break a row rule and reports them per rule in each contract's `excluded` in the envelope. A request whose `x-peql-on-violation` header (`ON_VIOLATION_HEADER`) is `refuse` is refused instead, at `GetFlightInfo`, when the data holds any such row; the header's default is `exclude`. An ingest refuses rows that break a row rule unless its `on_violation` option (`ON_VIOLATION_OPTION`) is `warn`. `exclude` is refused for an ingest, because `DoPut` cannot return the set-aside rows; write through `Engine::write` or the parts API to set rows aside. See [Rows that break a contract](reference.md#rows-that-break-a-contract).
+
 ## Result signing
 
 `Engine::with_signer` signs every query's envelope with an `EnvelopeSigner`; the result is `QueryResult::signature`. If signing fails, the query fails. `SocketSigner` reaches a signer over a Unix socket, TCP or any connected stream: one connection per envelope, the envelope as one JSON line out, and `{"jws": ...}` or `{"error": ...}` as one line back.

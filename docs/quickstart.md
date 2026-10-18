@@ -97,9 +97,19 @@ Run this from `peql-demo`:
 peql write orders.yaml --input orders.csv
 ```
 
-Because you supplied a contract file, this command registers the contract and writes the CSV data in one step. peQL uses the CSV's column types to check the contract, writes Parquet under `data/orders/`, and validates the data.
+Because you supplied a contract file, this command registers the contract before it writes. peQL uses the CSV's column types to check the contract. The write is then refused, because order 3 breaks `positive_amount`:
 
-The write report should show four rows written and one row failing `positive_amount`. The dataset remains valid because this rule says to drop the failing row from results rather than deny the whole dataset.
+```text
+refused: `sales/orders` refused rows that break its rules: positive_amount (1 row)
+```
+
+By default a write commits nothing when any row breaks a rule. Write the rows that pass and set the other aside:
+
+```text
+peql write sales/orders --input orders.csv --on-violation exclude --excluded rejected.parquet
+```
+
+peQL writes Parquet under `data/orders/` and validates the rows it wrote. The report shows three rows written and one row of `positive_amount` set aside in `rejected.parquet`, with a `_violations` column naming the rule it broke. `--on-violation warn` would store all four rows instead; queries would still leave order 3 out.
 
 The original CSV stays unchanged. peQL also creates `_peql/` for its registered contracts and state. Running the same write command again replaces the contract's Parquet data; use `--append` only when you want to add more rows.
 
@@ -146,7 +156,7 @@ You should receive:
 +----------+--------+
 ```
 
-Order 2 belongs to Globex and passes the quality check. Order 3 also belongs to Globex, but its negative amount excludes it. Acme's orders are not returned.
+Order 2 belongs to Globex and passes the quality check. Order 3 also belongs to Globex, but its negative amount kept it out of the data. Acme's orders are not returned.
 
 These flags let you try different caller contexts locally. In an application, the application authenticates users and supplies their context to peQL.
 
@@ -172,8 +182,8 @@ This is an expected result. The command exits with status 1 and returns no rows.
 peql validate sales/orders
 ```
 
-The JSON verdict reports four stored rows and one failure of `positive_amount`. Validation checks the underlying data, so it includes the row that queries exclude.
+The JSON verdict reports three stored rows and no failure of `positive_amount`: the failing row was set aside, not stored.
 
-Add `--envelope` to a successful query to see which contract and rules applied. The workspace's `_peql/audit.jsonl` file records your query attempts, including the refusal.
+Add `--envelope` to a successful query to see which contract and rules applied. When stored rows break a rule, each contract's `excluded` in the envelope says how many the query left out. The workspace's `_peql/audit.jsonl` file records your query attempts, including the refusal.
 
 You have now used the same data and SQL with different callers, and seen both row filtering and a complete refusal. Continue to {doc}`USAGE` for Python and Rust integration, or read {doc}`execution` to understand how peQL applies the rules.

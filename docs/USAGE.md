@@ -26,7 +26,15 @@ For CSV fields such as phone numbers or identifiers, override inferred types whe
 peql write sales/orders --input orders.csv --type order_id=int64
 ```
 
-After a write, check the verdict. `valid` means the dataset passes its deny-level checks; it can still contain rows that a rule drops or reports. A `NOT SERVABLE` result means data was written but queries will be refused. Correct the input and write again.
+By default a write refuses rows that break a contract's row rules (its `drop` and `deny` asserts): when any input row breaks one, nothing is written, and the refusal names each rule and how many rows broke it. To write the rows that pass and set the others aside:
+
+```text
+peql write sales/orders --input orders.csv --on-violation exclude --excluded rejected.parquet
+```
+
+`rejected.parquet` holds the set-aside rows with a `_violations` column listing the rules each row broke. `--on-violation warn` writes every row instead; queries still leave the breaking rows out. The write report lists how many rows broke each rule. Rows that fail an assert with `on_fail: report` are only counted and never refused.
+
+Queries never return rows that break a row rule. By default they leave them out and note how many per rule; add `--on-violation refuse` to `peql query` to refuse a query of data that holds any. See [Rows that break a contract](reference.md#rows-that-break-a-contract).
 
 ## Register existing data
 
