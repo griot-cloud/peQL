@@ -617,7 +617,8 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
         .unwrap()
         .snapshot_id;
 
-    // The contract changes shape: `b` goes, `c` comes. The table's schema follows the write.
+    // The contract changes shape: `b` goes, `c` comes. The table gains `c` and keeps `b`,
+    // which the first version and its snapshots still read; the new version simply does not.
     engine
         .register_contract(PLAIN_V2, &plain(&v2_cols, &[]).schema())
         .unwrap();
@@ -643,7 +644,7 @@ async fn a_read_pinned_before_a_schema_change_has_that_snapshots_columns() {
         .iter()
         .map(|f| f.name.clone())
         .collect();
-    assert_eq!(current, ["id", "a", "c"]);
+    assert_eq!(current, ["id", "a", "b", "c"]);
 
     let everyone = Caller::new("x", "demo", "any");
     let res = engine
@@ -2391,4 +2392,611 @@ async fn a_write_reports_the_tables_rows_and_nulls_from_its_facts() {
             .value(0)
     };
     assert_eq!((col("n"), col("a_nulls")), (9, 3));
+}
+
+// A table is read and written through several versions of a contract at once: a write adds
+// the columns it needs and removes none, and a commit the table moved under is tried again
+// by the table's own retry rules.
+
+/// A version of `demo/plain`, as the contract `name`, exposing `id` and the utf8 columns given.
+fn version(name: &str, columns: &[&str]) -> (String, SchemaRef) {
+    let mut doc = format!(
+        "contract: {name}\nversion: 1\nbinding:\n  iceberg: demo.plain\nexpose:\n  - {{name: id, type: int64}}\n"
+    );
+    let mut fields = vec![("id", DataType::Int64)];
+    for c in columns {
+        doc.push_str(&format!("  - {{name: {c}, type: utf8}}\n"));
+        fields.push((c, DataType::Utf8));
+    }
+    doc.push_str("rules:\n  - {id: everyone, op: decide, expr: \"true\"}\n");
+    (doc, plain(&fields, &[]).schema())
+}
+
+/// `ids` as rows of the version exposing `columns`.
+fn rows_of(columns: &[&str], ids: &[i64]) -> RecordBatch {
+    let mut fields = vec![("id", DataType::Int64)];
+    fields.extend(columns.iter().map(|c| (*c, DataType::Utf8)));
+    plain(&fields, ids)
+}
+
+fn register(engine: &Engine, name: &str, columns: &[&str]) {
+    let (doc, schema) = version(name, columns);
+    engine.register_contract(&doc, &schema).unwrap();
+}
+
+async fn append(engine: &Engine, name: &str, columns: &[&str], ids: &[i64]) -> peql::Result<i64> {
+    let written = engine
+        .write(
+            name,
+            vec![rows_of(columns, ids)],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
+        .await?;
+    Ok(written.report.snapshot.unwrap().snapshot_id)
+}
+
+fn column_names(t: &iceberg::table::Table) -> Vec<String> {
+    t.metadata()
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|f| f.name.clone())
+        .collect()
+}
+
+/// An engine over a fresh catalog, with `demo/plain-v11` (`id`, `a`) and `demo/plain-v12`
+/// (`id`, `a`, `b`) registered over one table.
+async fn two_versions(dir: &std::path::Path) -> (Arc<dyn Catalog>, Engine) {
+    let catalog = iceberg_catalog(&dir.join("warehouse"), "demo").await;
+    let engine = Engine::in_memory(dir.join("engine"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    register(&engine, "demo/plain-v11", &["a"]);
+    register(&engine, "demo/plain-v12", &["a", "b"]);
+    (catalog, engine)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_older_version_writing_keeps_the_columns_a_newer_version_added() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine) = two_versions(dir.path()).await;
+    let everyone = Caller::new("x", "demo", "any");
+
+    append(&engine, "demo/plain-v11", &["a"], &[1, 2])
+        .await
+        .unwrap();
+    append(&engine, "demo/plain-v12", &["a", "b"], &[3, 4])
+        .await
+        .unwrap();
+    // The version that does not know `b` writes: its batch has no `b`.
+    append(&engine, "demo/plain-v11", &["a"], &[5])
+        .await
+        .unwrap();
+
+    let t = table(&catalog, "plain").await;
+    assert_eq!(column_names(&t), ["id", "a", "b"], "the table keeps `b`");
+
+    // The newer version reads every row; `b` is null where the row was written without it.
+    let res = engine
+        .query(
+            r#"SELECT id, b FROM "demo/plain-v12" ORDER BY id"#,
+            &everyone,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), [1, 2, 3, 4, 5]);
+    assert_eq!(
+        strings(&res.batches, "b"),
+        [None, None, Some("b3".into()), Some("b4".into()), None]
+    );
+    // The older version reads every row, as it always did.
+    let res = engine
+        .query(
+            r#"SELECT id, a FROM "demo/plain-v11" ORDER BY id"#,
+            &everyone,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), [1, 2, 3, 4, 5]);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compacting_through_an_older_version_keeps_the_columns_it_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine) = two_versions(dir.path()).await;
+    let everyone = Caller::new("x", "demo", "any");
+
+    append(&engine, "demo/plain-v12", &["a", "b"], &[1, 2])
+        .await
+        .unwrap();
+    append(&engine, "demo/plain-v11", &["a"], &[3, 4])
+        .await
+        .unwrap();
+    append(&engine, "demo/plain-v12", &["a", "b"], &[5, 6])
+        .await
+        .unwrap();
+    let report = engine
+        .compact("demo/plain-v11", u64::MAX, 2)
+        .await
+        .unwrap()
+        .expect("three small files are compacted");
+    assert_eq!(report.rows_written, 6);
+
+    let t = table(&catalog, "plain").await;
+    assert_eq!(column_names(&t), ["id", "a", "b"]);
+    assert_eq!(
+        snapshot_paths(&t, report.snapshot.unwrap().snapshot_id)
+            .await
+            .len(),
+        1
+    );
+    let res = engine
+        .query(
+            r#"SELECT id, b FROM "demo/plain-v12" ORDER BY id"#,
+            &everyone,
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), [1, 2, 3, 4, 5, 6]);
+    assert_eq!(
+        strings(&res.batches, "b"),
+        [
+            Some("b1".into()),
+            Some("b2".into()),
+            None,
+            None,
+            Some("b5".into()),
+            Some("b6".into())
+        ],
+        "the compaction through the older version kept the values of `b`"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_writer_lacking_a_required_column_is_refused_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = iceberg_catalog(&dir.path().join("warehouse"), "demo").await;
+    let engine = Engine::in_memory(dir.path().join("engine"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    register(&engine, "demo/plain-v11", &["a"]);
+    // A version that does not expose `id`, which the table requires.
+    let doc = "contract: demo/plain-noid\nversion: 1\nbinding:\n  iceberg: demo.plain\nexpose:\n  - {name: a, type: utf8}\nrules:\n  - {id: everyone, op: decide, expr: \"true\"}\n";
+    let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new("a", DataType::Utf8, true)]));
+    engine.register_contract(doc, &schema).unwrap();
+
+    let before = append(&engine, "demo/plain-v11", &["a"], &[1, 2])
+        .await
+        .unwrap();
+    let t = table(&catalog, "plain").await;
+    assert!(
+        t.metadata()
+            .current_schema()
+            .field_by_name("id")
+            .unwrap()
+            .required,
+        "the table requires `id`"
+    );
+
+    let refused = engine
+        .write(
+            "demo/plain-noid",
+            vec![
+                RecordBatch::try_new(schema.clone(), vec![Arc::new(StringArray::from(vec!["x"]))])
+                    .unwrap(),
+            ],
+            WriteMode::Append,
+            OnWriteViolation::Warn,
+        )
+        .await;
+    match refused {
+        Err(e) => {
+            let m = e.to_string();
+            assert!(m.contains("`id`") && m.contains("required"), "{m}");
+        }
+        Ok(w) => panic!("{:?}", w.report.snapshot),
+    }
+    let t = table(&catalog, "plain").await;
+    assert_eq!(t.metadata().current_snapshot_id(), Some(before));
+    let res = engine
+        .query(
+            r#"SELECT id FROM "demo/plain-v11" ORDER BY id"#,
+            &Caller::new("x", "demo", "any"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), [1, 2], "nothing was written");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_writers_adding_different_columns_at_once_both_columns_stay() {
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Interleaved::new(iceberg_catalog(&dir.path().join("warehouse"), "demo").await);
+    let engine = Engine::in_memory(dir.path().join("one"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    register(&engine, "demo/plain-v11", &["a"]);
+    register(&engine, "demo/plain-x", &["a", "x"]);
+    register(&engine, "demo/plain-y", &["a", "y"]);
+    let (doc, schema) = version("demo/plain-y", &["a", "y"]);
+    let other = other_writer(&dir.path().join("two"), catalog.inner.clone(), &doc, schema);
+    append(&engine, "demo/plain-v11", &["a"], &[1, 2])
+        .await
+        .unwrap();
+
+    // The other writer adds `y` and writes, just before this writer's schema change commits.
+    {
+        let other = other.clone();
+        catalog.before_commit(move || async move {
+            other
+                .write(
+                    "demo/plain-y",
+                    vec![rows_of(&["a", "y"], &[3])],
+                    WriteMode::Append,
+                    OnWriteViolation::Warn,
+                )
+                .await
+                .unwrap();
+        });
+    }
+    append(&engine, "demo/plain-x", &["a", "x"], &[4])
+        .await
+        .unwrap();
+
+    let t = table(&catalog.inner, "plain").await;
+    assert_eq!(column_names(&t), ["id", "a", "y", "x"]);
+    let everyone = Caller::new("x", "demo", "any");
+    let res = engine
+        .query(r#"SELECT id, y FROM "demo/plain-y" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), [1, 2, 3, 4]);
+    assert_eq!(
+        strings(&res.batches, "y"),
+        [None, None, Some("y3".into()), None]
+    );
+    let res = engine
+        .query(r#"SELECT id, x FROM "demo/plain-x" ORDER BY id"#, &everyone)
+        .await
+        .unwrap();
+    assert_eq!(
+        strings(&res.batches, "x"),
+        [None, None, None, Some("x4".into())]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn writers_adding_one_column_each_in_parallel_all_end_in_the_schema() {
+    const WRITERS: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = iceberg_catalog(&dir.path().join("warehouse"), "demo").await;
+    let seed = Engine::in_memory(dir.path().join("seed"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    register(&seed, "demo/plain-v11", &["a"]);
+    append(&seed, "demo/plain-v11", &["a"], &[1]).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(WRITERS));
+    let mut tasks = Vec::new();
+    for i in 0..WRITERS {
+        let (catalog, barrier) = (catalog.clone(), barrier.clone());
+        let path = dir.path().join(format!("w{i}"));
+        tasks.push(tokio::spawn(async move {
+            let col = format!("c{i}");
+            let name = format!("demo/plain-{col}");
+            let engine =
+                Engine::in_memory(path).with_bindings(Arc::new(IcebergTables::new(catalog)));
+            register(&engine, &name, &["a", &col]);
+            barrier.wait().await;
+            append(&engine, &name, &["a", &col], &[10 + i as i64])
+                .await
+                .unwrap();
+        }));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let t = table(&catalog, "plain").await;
+    let mut have = column_names(&t);
+    have.sort();
+    assert_eq!(have, ["a", "c0", "c1", "c2", "id"]);
+    let res = seed
+        .query(
+            r#"SELECT id FROM "demo/plain-v11" ORDER BY id"#,
+            &Caller::new("x", "demo", "any"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ids(&res.batches), [1, 10, 11, 12]);
+}
+
+async fn set_properties(catalog: &Arc<dyn Catalog>, name: &str, props: &[(&str, &str)]) {
+    use iceberg::transaction::{ApplyTransactionAction, Transaction};
+    let t = table(catalog, name).await;
+    let tx = Transaction::new(&t);
+    let mut action = tx.update_table_properties();
+    for (k, v) in props {
+        action = action.set(k.to_string(), v.to_string());
+    }
+    action
+        .apply(tx)
+        .unwrap()
+        .commit(catalog.as_ref())
+        .await
+        .unwrap();
+}
+
+/// `three_small_files`, the table's retry properties as given, and a hook queued before each
+/// of `moves` commits that appends one row; the compaction is then attempted. Returns how many
+/// commits the compaction made before it gave up, and its refusal.
+async fn compaction_that_never_wins(props: &[(&str, &str)], moves: i64) -> (i64, String) {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, other, _) = three_small_files(dir.path()).await;
+    if !props.is_empty() {
+        set_properties(&catalog.inner, "plain", props).await;
+    }
+    for i in 0..moves {
+        let other = other.clone();
+        catalog.before_commit(move || async move {
+            other
+                .write(
+                    "demo/plain",
+                    vec![plain(&PLAIN_COLUMNS, &[100 + i])],
+                    WriteMode::Append,
+                    OnWriteViolation::Warn,
+                )
+                .await
+                .unwrap();
+        });
+    }
+    let refused = engine.compact("demo/plain", u64::MAX, 2).await;
+    let made = moves - catalog.hooks.lock().unwrap().len() as i64;
+    match refused {
+        Err(PeqlError::Conflict(m)) => (made, m),
+        other => panic!("{:?}", other.map(|r| r.map(|r| r.snapshot))),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_compaction_makes_as_many_attempts_as_the_tables_retry_properties_allow() {
+    let quick = [
+        ("commit.retry.min-wait-ms", "1"),
+        ("commit.retry.max-wait-ms", "5"),
+    ];
+    let with = |retries: &'static str| {
+        let mut p = quick.to_vec();
+        p.push(("commit.retry.num-retries", retries));
+        p
+    };
+    // A table set to one retry gives up after one retry: two commits.
+    let (made, m) = compaction_that_never_wins(&with("1"), 40).await;
+    assert_eq!(made, 2, "{m}");
+    assert!(m.contains("2 attempts"), "{m}");
+    // Set to three: four.
+    let (made, m) = compaction_that_never_wins(&with("3"), 40).await;
+    assert_eq!(made, 4, "{m}");
+    assert!(m.contains("4 attempts"), "{m}");
+    // Set to none: one.
+    let (made, m) = compaction_that_never_wins(&with("0"), 40).await;
+    assert_eq!(made, 1, "{m}");
+    // A table that sets none has Iceberg's default of four retries.
+    let (made, m) = compaction_that_never_wins(&[], 40).await;
+    assert_eq!(made, 5, "{m}");
+    assert!(m.contains("5 attempts"), "{m}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_schema_change_makes_as_many_attempts_as_the_tables_retry_properties_allow() {
+    const MOVES: usize = 24;
+    let dir = tempfile::tempdir().unwrap();
+    let catalog = Interleaved::new(iceberg_catalog(&dir.path().join("warehouse"), "demo").await);
+    let engine = Engine::in_memory(dir.path().join("one"))
+        .with_bindings(Arc::new(IcebergTables::new(catalog.clone())));
+    register(&engine, "demo/plain-v11", &["a"]);
+    register(&engine, "demo/plain-x", &["a", "x"]);
+    append(&engine, "demo/plain-v11", &["a"], &[1])
+        .await
+        .unwrap();
+    set_properties(
+        &catalog.inner,
+        "plain",
+        &[
+            ("commit.retry.num-retries", "1"),
+            ("commit.retry.min-wait-ms", "1"),
+            ("commit.retry.max-wait-ms", "5"),
+        ],
+    )
+    .await;
+    // Before every commit, another writer adds a column of its own.
+    for i in 0..MOVES {
+        let name = format!("demo/plain-m{i}");
+        let col = format!("m{i}");
+        let (doc, schema) = version(&name, &["a", &col]);
+        let other = other_writer(
+            &dir.path().join(format!("o{i}")),
+            catalog.inner.clone(),
+            &doc,
+            schema,
+        );
+        catalog.before_commit(move || async move {
+            other
+                .write(
+                    &name,
+                    vec![rows_of(&["a", &col], &[100 + i as i64])],
+                    WriteMode::Append,
+                    OnWriteViolation::Warn,
+                )
+                .await
+                .unwrap();
+        });
+    }
+    let refused = append(&engine, "demo/plain-x", &["a", "x"], &[2]).await;
+    match refused {
+        Err(PeqlError::Conflict(m)) => assert!(m.contains("2 attempts"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    let made = MOVES - catalog.hooks.lock().unwrap().len();
+    assert!(made >= 2, "the change was tried again: {made} commits");
+    assert!(made <= 4, "and gave up: {made} commits");
+}
+
+/// Writers appending to `demo/plain` as fast as they can, each through an engine of its own,
+/// until told to stop; the ids each wrote, and how many of its writes were refused.
+struct HotWriters {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    done: Arc<std::sync::atomic::AtomicUsize>,
+    tasks: Vec<tokio::task::JoinHandle<(Vec<i64>, Vec<i64>)>>,
+}
+
+impl HotWriters {
+    /// `n` writers, which together make at most `cap` writes: a table written to without pause
+    /// grows a snapshot per write, and every commit costs more with each, so writers that
+    /// never stopped would outlast any test.
+    fn start(
+        dir: &std::path::Path,
+        catalog: &Arc<dyn Catalog>,
+        n: usize,
+        cap: usize,
+    ) -> HotWriters {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let stop = Arc::new(AtomicBool::new(false));
+        let done = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let schema = plain(&PLAIN_COLUMNS, &[]).schema();
+        let tasks = (0..n)
+            .map(|w| {
+                let engine = other_writer(
+                    &dir.join(format!("hot{w}")),
+                    catalog.clone(),
+                    PLAIN_V1,
+                    schema.clone(),
+                );
+                let (stop, done, attempts) = (stop.clone(), done.clone(), attempts.clone());
+                tokio::spawn(async move {
+                    let (mut written, mut refused) = (Vec::new(), Vec::new());
+                    let mut k = 0;
+                    while !stop.load(Ordering::SeqCst)
+                        && attempts.fetch_add(1, Ordering::SeqCst) < cap
+                    {
+                        let id = 1_000_000 * (w as i64 + 1) + k;
+                        k += 1;
+                        match engine
+                            .write(
+                                "demo/plain",
+                                vec![plain(&PLAIN_COLUMNS, &[id])],
+                                WriteMode::Append,
+                                OnWriteViolation::Warn,
+                            )
+                            .await
+                        {
+                            Ok(_) => {
+                                written.push(id);
+                                done.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Err(_) => refused.push(id),
+                        }
+                    }
+                    (written, refused)
+                })
+            })
+            .collect();
+        HotWriters { stop, done, tasks }
+    }
+
+    async fn appended(&self, at_least: usize) {
+        while self.done.load(std::sync::atomic::Ordering::SeqCst) < at_least {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    async fn stop(self) -> (Vec<i64>, Vec<i64>) {
+        self.stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        let (mut written, mut refused) = (Vec::new(), Vec::new());
+        for t in self.tasks {
+            let (w, r) = t.await.unwrap();
+            written.extend(w);
+            refused.extend(r);
+        }
+        (written, refused)
+    }
+}
+
+/// One compaction of `demo/plain` while `writers` append without pause; whether it
+/// committed. Every row the writers were told was committed, and the rows `three_small_files`
+/// wrote, are in the table afterwards, once each.
+async fn compaction_among_hot_writers(writers: usize) -> bool {
+    let dir = tempfile::tempdir().unwrap();
+    let (catalog, engine, _, _) = three_small_files(dir.path()).await;
+    // A table that is written to without pause says so: more retries, and shorter waits than
+    // Iceberg's defaults, which are for tables written to now and then.
+    set_properties(
+        &catalog.inner,
+        "plain",
+        &[
+            ("commit.retry.num-retries", "20"),
+            ("commit.retry.min-wait-ms", "20"),
+            ("commit.retry.max-wait-ms", "400"),
+        ],
+    )
+    .await;
+    let hot = HotWriters::start(dir.path(), &catalog.inner, writers, 250);
+    hot.appended(20).await;
+    let during = hot.done.load(std::sync::atomic::Ordering::SeqCst);
+    let compacted = engine.compact("demo/plain", u64::MAX, 2).await;
+    let during = hot.done.load(std::sync::atomic::Ordering::SeqCst) - during;
+    let (written, refused) = hot.stop().await;
+    let committed = match &compacted {
+        Ok(Some(_)) => {
+            assert!(
+                during >= 3,
+                "only {during} writes landed while the compaction ran"
+            );
+            true
+        }
+        Ok(None) => panic!("there were files to compact"),
+        Err(PeqlError::Conflict(m)) => {
+            eprintln!("{writers} writers: compaction refused: {m}");
+            false
+        }
+        Err(e) => panic!("{e}"),
+    };
+    let rows = engine
+        .query(
+            r#"SELECT id FROM "demo/plain" ORDER BY id"#,
+            &Caller::new("x", "demo", "any"),
+        )
+        .await
+        .unwrap();
+    let have = ids(&rows.batches);
+    let mut once = have.clone();
+    once.dedup();
+    assert_eq!(have, once, "no row is duplicated");
+    let mut want: Vec<i64> = (1..=6).collect();
+    want.extend(&written);
+    want.sort();
+    let unsure: Vec<i64> = have.iter().copied().filter(|i| !want.contains(i)).collect();
+    assert!(
+        unsure.iter().all(|i| refused.contains(i)),
+        "rows nobody wrote: {unsure:?}"
+    );
+    for id in &want {
+        assert!(have.contains(id), "row {id} is gone");
+    }
+    eprintln!(
+        "{writers} writers: compacted {committed}, {} rows appended, {} refused",
+        written.len(),
+        refused.len()
+    );
+    committed
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_compaction_commits_while_two_writers_append_without_pause() {
+    for _ in 0..3 {
+        assert!(compaction_among_hot_writers(2).await);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_compaction_commits_while_six_writers_append_without_pause() {
+    for _ in 0..3 {
+        assert!(compaction_among_hot_writers(6).await);
+    }
 }

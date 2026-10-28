@@ -37,6 +37,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -44,9 +45,10 @@ use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use datafusion::catalog::TableProvider;
 use datafusion::catalog::view::ViewTable;
 use datafusion::datasource::provider_as_source;
-use datafusion::logical_expr::{Expr, LogicalPlanBuilder, cast};
+use datafusion::logical_expr::{Expr, LogicalPlan, LogicalPlanBuilder, cast, lit};
 use datafusion::parquet::file::FOOTER_SIZE;
 use datafusion::parquet::file::metadata::{FooterTail, ParquetMetaData, ParquetMetaDataReader};
+use datafusion::scalar::ScalarValue;
 use datafusion_iceberg::IcebergStaticTableProvider;
 use iceberg::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ManifestContentType,
@@ -220,6 +222,15 @@ impl IcebergLocation {
         Ok(Arc::new(ViewTable::new(plan, None)))
     }
 
+    /// The table as of `snapshot`, every column it has, as stored: what a compaction copies.
+    /// A column no version of the contract names is a column of the rows all the same.
+    pub async fn whole(&self, table: &Table, snapshot: i64) -> Result<Arc<dyn TableProvider>> {
+        Ok(Arc::new(
+            IcebergStaticTableProvider::try_new_from_table_snapshot(table.clone(), snapshot)
+                .await?,
+        ))
+    }
+
     /// The data files alive in `snapshot`, in path order.
     pub async fn files(&self, table: &Table, snapshot: i64) -> Result<Vec<SnapshotFile>> {
         let snap = table
@@ -390,10 +401,12 @@ impl IcebergLocation {
         PeqlError::Invalid(format!("{} has no snapshot {snapshot}", self.table))
     }
 
-    /// Begin a write under `contract`: create the table if the catalog has none, and make its
-    /// schema the columns the contract writes (columns the contract no longer writes are
-    /// removed from the schema, not from any snapshot). The write starts from the table's
-    /// current snapshot. Its data files land in the table's own directory when the table is
+    /// Begin a write under `contract`: create the table if the catalog has none, and add to
+    /// its schema the columns the contract writes that it lacks. No column is ever removed
+    /// from the schema by a write: another version of the contract, or a snapshot, still
+    /// reads it, and the rows this write adds have no value for a column the contract does
+    /// not name (null), so a table column the contract lacks that is required is refused.
+    /// The write starts from the table's current snapshot. Its data files land in the table's own directory when the table is
     /// on this filesystem; otherwise under `staging`, and go to the table through its
     /// `FileIO` when the write commits.
     pub(crate) async fn begin_write(
@@ -418,6 +431,18 @@ impl IcebergLocation {
                     .await?
             }
         };
+        if !matches!(kind, WriteKind::Rewrite(_)) {
+            // A row this write adds has no value for a column the contract does not name.
+            for f in table.metadata().current_schema().as_struct().fields() {
+                if f.required && want.field_with_name(&f.name).is_err() {
+                    return Err(PeqlError::Invalid(format!(
+                        "column `{}` of {} is required, and `{}` does not write it: a write \
+                         may not leave a required column without a value",
+                        f.name, self.table, contract.name
+                    )));
+                }
+            }
+        }
         let location = table.metadata().location().trim_end_matches('/').to_owned();
         let dir_id = Uuid::new_v4();
         let prefix = format!("{location}/data/{dir_id}");
@@ -441,27 +466,39 @@ impl IcebergLocation {
         })
     }
 
-    /// Make the table's current schema the columns in `want`, by name. A column whose type
-    /// changed is refused: the table would read its old files as something they are not.
+    /// Add to the table's current schema the columns in `want` that it lacks, by name, and
+    /// remove none: a column `want` does not name stays, for the other versions of the
+    /// contract and the snapshots that read it. A column whose type changed is refused: the
+    /// table would read its old files as something they are not.
     ///
     /// The change is computed over the table as it is, and committed; when another writer
     /// changed the schema first, it is computed again over the table as that writer left it
-    /// and committed again, at most [`COMMIT_ATTEMPTS`] times. A table that already has the
-    /// columns (by name, of the same types) is left as it is, with no commit, so of writers
-    /// making one change at once, one commits it and the others find it made. A column another
-    /// writer gave a different type is refused, naming both types.
+    /// and committed again, as the table's retry properties allow ([`CommitRetry`]). A table
+    /// that already has the columns (by name, of the same types) is left as it is, with no
+    /// commit, so of writers making one change at once, one commits it and the others find it
+    /// made. A column another writer gave a different type is refused, naming both types.
     async fn evolve(&self, table: Table, want: &Schema) -> Result<Table> {
         let mut table = table;
         let mut refused = None;
-        for _ in 0..COMMIT_ATTEMPTS {
+        let mut retry = CommitRetry::of(&table)?.start();
+        loop {
             let tx = Transaction::new(&table);
             let Some(update) = self.schema_change(&table, want, &tx, refused.is_some())? else {
                 return Ok(table);
             };
             match update.apply(tx)?.commit(self.catalog.as_ref()).await {
-                // Committed: the loop finds nothing left to change, unless the crate's own
-                // retry applied the change over a schema another writer had changed again.
-                Ok(committed) => table = committed,
+                Ok(committed) => {
+                    table = committed;
+                    // The crate's own retry may have applied the change over a schema
+                    // another writer had changed again: look once more.
+                    let tx = Transaction::new(&table);
+                    if self
+                        .schema_change(&table, want, &tx, refused.is_some())?
+                        .is_none()
+                    {
+                        return Ok(table);
+                    }
+                }
                 Err(e) => {
                     let now = self.load().await?.ok_or_else(|| {
                         PeqlError::Invalid(format!(
@@ -481,21 +518,31 @@ impl IcebergLocation {
                     table = now;
                 }
             }
+            if !retry.wait().await {
+                break;
+            }
+            table = self.load().await?.ok_or_else(|| {
+                PeqlError::Invalid(format!(
+                    "{} was dropped while its schema was changed",
+                    self.table
+                ))
+            })?;
         }
         let tx = Transaction::new(&table);
         match self.schema_change(&table, want, &tx, true)? {
             None => Ok(table),
             Some(_) => Err(PeqlError::Conflict(format!(
-                "the schema of {} changed under each of {COMMIT_ATTEMPTS} attempts to make it \
-                 the contract's columns; the last refusal: {}",
+                "the schema of {} changed under each of {} attempts to make it have the \
+                 contract's columns; the last refusal: {}",
                 self.table,
+                retry.attempts(),
                 refused.map_or_else(|| "none".to_owned(), |e| e.to_string())
             ))),
         }
     }
 
-    /// The change that makes `table`'s current schema the columns in `want`, or `None` when
-    /// it has them. `raced` says the schema was changed by another writer since this write
+    /// The change that adds to `table`'s current schema the columns in `want` that it lacks,
+    /// or `None` when it has them. Nothing is removed. `raced` says the schema was changed by another writer since this write
     /// first looked, for the refusal of a column whose type differs.
     fn schema_change(
         &self,
@@ -538,15 +585,6 @@ impl IcebergLocation {
                             .add_column(AddColumn::optional(f.name(), ty)),
                     );
                 }
-            }
-        }
-        for f in current.fields() {
-            if want.field_with_name(f.name()).is_err() {
-                update = Some(
-                    update
-                        .unwrap_or_else(|| tx.update_schema())
-                        .delete_column(f.name()),
-                );
             }
         }
         Ok(update)
@@ -673,9 +711,94 @@ async fn footer(table: &Table, path: &str, size: u64) -> Result<ParquetMetaData>
 /// The snapshot a write committed, and the one before it.
 pub use crate::engine::SnapshotCommit;
 
-/// How many times a commit is computed again over a table another writer moved meanwhile:
-/// a schema change, or a rewrite's carrying forward of what was appended since its snapshot.
-const COMMIT_ATTEMPTS: usize = 8;
+/// How a commit that the table moved under is tried again: a schema change, or a rewrite's
+/// carrying forward of what was appended since its snapshot. The table's own Iceberg retry
+/// properties say how often and how long to wait; a table that sets none has Iceberg's
+/// defaults (Iceberg documentation, Configuration, "Table behavior properties"):
+///
+/// | property | default |
+/// |---|---|
+/// | `commit.retry.num-retries` | 4 retries after the first attempt |
+/// | `commit.retry.min-wait-ms` | 100 |
+/// | `commit.retry.max-wait-ms` | 60000 (1 minute) |
+/// | `commit.retry.total-timeout-ms` | 1800000 (30 minutes) |
+///
+/// The defaults are the Iceberg crate's own constants for these properties
+/// (`TableProperties::PROPERTY_COMMIT_*_DEFAULT`), read through the table's typed
+/// properties, so a table's value and the default come from one place. The wait before the
+/// n-th retry is `min-wait-ms * 2^n`, plus a random share of itself up to the same again
+/// (so writers that conflicted together do not meet again together), at most `max-wait-ms`;
+/// no retry starts once `total-timeout-ms` has passed since the first attempt. One policy
+/// serves every commit that is computed again here, and the crate's own commits retry by
+/// the same properties.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CommitRetry {
+    retries: usize,
+    min_wait: Duration,
+    max_wait: Duration,
+    total: Duration,
+}
+
+impl CommitRetry {
+    fn of(table: &Table) -> Result<CommitRetry> {
+        let p = table.metadata().table_properties();
+        Ok(CommitRetry {
+            retries: p.commit_num_retries()?,
+            min_wait: Duration::from_millis(p.commit_min_retry_wait_ms()?),
+            max_wait: Duration::from_millis(p.commit_max_retry_wait_ms()?),
+            total: Duration::from_millis(p.commit_total_retry_timeout_ms()?),
+        })
+    }
+
+    fn start(self) -> Retrying {
+        Retrying {
+            policy: self,
+            retried: 0,
+            started: Instant::now(),
+        }
+    }
+
+    /// The wait before retry number `retried + 1`; `unit`, in `[0, 1]`, is the random share.
+    fn wait_for(&self, retried: usize, unit: f64) -> Duration {
+        let base = self
+            .min_wait
+            .saturating_mul(1u32.checked_shl(retried.min(31) as u32).unwrap_or(u32::MAX));
+        let base = base.min(self.max_wait);
+        base.saturating_add(base.mul_f64(unit.clamp(0.0, 1.0)))
+            .min(self.max_wait)
+    }
+}
+
+/// A [`CommitRetry`] that has begun: the attempts made so far.
+#[derive(Debug)]
+struct Retrying {
+    policy: CommitRetry,
+    retried: usize,
+    started: Instant,
+}
+
+impl Retrying {
+    /// Wait as long as the next retry is due, and say that it is. `false`, with no wait,
+    /// once the retries are used or the total time would be passed.
+    async fn wait(&mut self) -> bool {
+        if self.retried >= self.policy.retries {
+            return false;
+        }
+        let unit = (Uuid::new_v4().as_u128() >> 64) as f64 / u64::MAX as f64;
+        let wait = self.policy.wait_for(self.retried, unit);
+        if self.started.elapsed().saturating_add(wait) > self.policy.total {
+            return false;
+        }
+        self.retried += 1;
+        tokio::time::sleep(wait).await;
+        true
+    }
+
+    /// The attempts made, the first among them.
+    fn attempts(&self) -> usize {
+        self.retried + 1
+    }
+}
 
 /// What a write's snapshot does to the table's files.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,8 +841,32 @@ impl Drop for IcebergWrite {
 }
 
 impl IcebergWrite {
-    pub(crate) fn schema(&self) -> &SchemaRef {
-        &self.schema
+    /// `plan` as a data file of this table holds it: every column of the table's schema, in
+    /// its order, cast to its type and carrying its field id. A column the plan lacks is null
+    /// (a data file may lack an optional column; readers see null), and one the table
+    /// requires is refused by name: no null is written into a required column.
+    pub(crate) fn project(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        let mut columns = Vec::with_capacity(self.schema.fields().len());
+        for f in self.schema.fields() {
+            let metadata: std::collections::BTreeMap<String, String> = f
+                .metadata()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
+            let value = if plan.schema().has_column_with_unqualified_name(f.name()) {
+                cast(col_ref(f.name()), f.data_type().clone())
+            } else if f.is_nullable() {
+                lit(ScalarValue::try_from(f.data_type())?)
+            } else {
+                return Err(PeqlError::Invalid(format!(
+                    "column `{}` of {} is required, and the rows written have no value for it",
+                    f.name(),
+                    self.location.table
+                )));
+            };
+            columns.push(value.alias_with_metadata(f.name(), Some(metadata.into())));
+        }
+        Ok(LogicalPlanBuilder::from(plan).project(columns)?.build()?)
     }
 
     /// The local directory the write's data files go to, and only its own.
@@ -964,7 +1111,7 @@ impl IcebergWrite {
     /// added since `of`: so it holds `files` and every file appended since, and commits only
     /// while the table is still at the snapshot it was produced over. When another writer
     /// moves the table first, what is carried forward is computed again over the table as
-    /// that writer left it, at most [`COMMIT_ATTEMPTS`] times.
+    /// that writer left it, as the table's retry properties allow ([`CommitRetry`]).
     ///
     /// Refused ([`PeqlError::Conflict`]) when, since `of`, a snapshot replaced or removed any
     /// of `of`'s files (an overwrite, a delete, another rewrite), added delete files (they
@@ -986,23 +1133,18 @@ impl IcebergWrite {
                 md.format_version()
             )));
         }
-        let rewritten = Rewritten::of(&self.location, &table, of).await?;
-        let mut refused = None;
-        for attempt in 0..COMMIT_ATTEMPTS {
-            if attempt > 0 {
-                table = self.location.load().await?.ok_or_else(|| {
-                    PeqlError::Invalid(format!(
-                        "{} was dropped while snapshot {of} was rewritten",
-                        self.location.table
-                    ))
-                })?;
-            }
-            let now = table.metadata().current_snapshot_id().ok_or_else(|| {
-                PeqlError::Conflict(format!(
-                    "{} has no current snapshot; snapshot {of} was being rewritten",
-                    self.location.table
-                ))
-            })?;
+        let mut rewritten = Rewritten::of(&self.location, &table, of).await?;
+        let mut retry = CommitRetry::of(&table)?.start();
+        // Read what was appended since `of` before the first attempt, so that no attempt
+        // spends the table's retries on reading manifests: an attempt reads only the ones
+        // that landed after the one before it.
+        table = self.reload(of).await?;
+        let now = Self::current(&self.location, &table, of)?;
+        rewritten.carried(&self.location, &table, now).await?;
+        let mut refused;
+        loop {
+            table = self.reload(of).await?;
+            let now = Self::current(&self.location, &table, of)?;
             let (carried, totals) = rewritten.carried(&self.location, &table, now).await?;
             let md = table.metadata();
             let list = format!(
@@ -1045,16 +1187,40 @@ impl IcebergWrite {
             table.file_io().delete(&list).await?;
             match result? {
                 Ok(committed) => return Ok(committed),
-                Err(e) if e.kind() == ErrorKind::CatalogCommitConflicts => refused = Some(e),
+                Err(e) if e.kind() == ErrorKind::CatalogCommitConflicts => refused = e,
                 Err(e) => return Err(e.into()),
+            }
+            if !retry.wait().await {
+                break;
             }
         }
         Err(PeqlError::Conflict(format!(
-            "{} moved under each of {COMMIT_ATTEMPTS} attempts to commit the rewrite of \
-             snapshot {of}; the last refusal: {}",
+            "{} moved under each of {} attempts to commit the rewrite of snapshot {of}; \
+             the last refusal: {}",
             self.location.table,
-            refused.map_or_else(|| "none".to_owned(), |e| e.to_string())
+            retry.attempts(),
+            refused
         )))
+    }
+
+    /// The table as the catalog has it now, while snapshot `of` is rewritten.
+    async fn reload(&self, of: i64) -> Result<Table> {
+        self.location.load().await?.ok_or_else(|| {
+            PeqlError::Invalid(format!(
+                "{} was dropped while snapshot {of} was rewritten",
+                self.location.table
+            ))
+        })
+    }
+
+    /// The table's current snapshot, while snapshot `of` is rewritten.
+    fn current(location: &IcebergLocation, table: &Table, of: i64) -> Result<i64> {
+        table.metadata().current_snapshot_id().ok_or_else(|| {
+            PeqlError::Conflict(format!(
+                "{} has no current snapshot; snapshot {of} was being rewritten",
+                location.table
+            ))
+        })
     }
 
     fn conflict(&self, now: Option<i64>) -> PeqlError {
@@ -1065,20 +1231,34 @@ impl IcebergWrite {
     }
 }
 
-/// The snapshot a rewrite replaces the files of: its manifests, and the data files alive in
-/// them.
+/// The snapshot a rewrite replaces the files of: its manifests. Manifests are immutable, so
+/// while every one of them is still listed by the table's current snapshot, none of the files
+/// the rewrite replaces has been replaced, removed or deleted from; that, and no delete files
+/// since, is all a rewrite must hold to be committed over appends (Iceberg's rewrite
+/// validates the same, and nothing about the files added meanwhile).
 struct Rewritten {
     snapshot: i64,
     manifests: HashSet<String>,
-    files: HashSet<String>,
+    /// The manifests added since the snapshot that had to be read, and what their files add
+    /// up to: a manifest is immutable, so it is read once however many attempts the rewrite
+    /// makes.
+    scanned: HashMap<String, Totals>,
 }
 
 /// What a snapshot's data files add up to, as its summary counts them.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Totals {
     records: u64,
     files: u64,
     bytes: u64,
+}
+
+impl Totals {
+    fn add(&mut self, other: &Totals) {
+        self.records += other.records;
+        self.files += other.files;
+        self.bytes += other.bytes;
+    }
 }
 
 impl Rewritten {
@@ -1088,20 +1268,15 @@ impl Rewritten {
             .snapshot_by_id(snapshot)
             .ok_or_else(|| location.no_snapshot(snapshot))?;
         let list = table.manifest_list_reader(snap).load().await?;
-        let mut manifests = HashSet::new();
-        let mut files = HashSet::new();
-        for m in list.entries() {
-            manifests.insert(m.manifest_path.clone());
-            for e in table.manifest_reader().read(m).await?.entries() {
-                if e.is_alive() && e.content_type() == DataContentType::Data {
-                    files.insert(e.file_path().to_owned());
-                }
-            }
-        }
+        let manifests = list
+            .entries()
+            .iter()
+            .map(|m| m.manifest_path.clone())
+            .collect();
         Ok(Rewritten {
             snapshot,
             manifests,
-            files,
+            scanned: HashMap::new(),
         })
     }
 
@@ -1110,7 +1285,7 @@ impl Rewritten {
     /// anything since replaced or removed the rewritten snapshot's files, or could delete
     /// rows of them.
     async fn carried(
-        &self,
+        &mut self,
         location: &IcebergLocation,
         table: &Table,
         now: i64,
@@ -1158,8 +1333,14 @@ impl Rewritten {
                 "its files were replaced or removed (manifest {gone} is no longer listed)"
             )));
         }
+        // A manifest is immutable and its list entry counts its files and rows, so what an
+        // attempt must know of the manifests added since `of` it reads from the list, and
+        // reads no manifest: the cost of an attempt does not grow with the appends made
+        // while the rewrite ran, and a manifest costs a read of the store only when its
+        // entry lacks a count.
         let mut carried = Vec::new();
         let mut totals = Totals::default();
+        let mut counted = Vec::new();
         for m in list.entries() {
             if self.manifests.contains(&m.manifest_path) {
                 continue;
@@ -1170,29 +1351,77 @@ impl Rewritten {
                     m.added_snapshot_id
                 )));
             }
-            for e in table.manifest_reader().read(m).await?.entries() {
-                if self.files.contains(e.file_path()) {
-                    return Err(refused(format!(
-                        "snapshot {} listed its file {} again",
-                        m.added_snapshot_id,
-                        e.file_path()
-                    )));
+            carried.push(m.clone());
+            if let Some(seen) = self.scanned.get(&m.manifest_path) {
+                totals.add(seen);
+                continue;
+            }
+            match (
+                m.added_files_count,
+                m.existing_files_count,
+                m.added_rows_count,
+                m.existing_rows_count,
+            ) {
+                (Some(af), Some(ef), Some(ar), Some(er)) => {
+                    totals.files += u64::from(af) + u64::from(ef);
+                    totals.records += ar + er;
+                    counted.push(m);
                 }
-                if e.is_alive() {
-                    if e.content_type() != DataContentType::Data {
-                        return Err(refused(format!(
-                            "snapshot {} added delete files",
-                            m.added_snapshot_id
-                        )));
-                    }
-                    totals.records += e.data_file().record_count();
-                    totals.files += 1;
-                    totals.bytes += e.data_file().file_size_in_bytes();
+                _ => {
+                    let seen = self.scan(table, m).await.map_err(|e| match e {
+                        PeqlError::Conflict(why) => refused(why),
+                        e => e,
+                    })?;
+                    totals.add(&seen);
                 }
             }
-            carried.push(m.clone());
+        }
+        // The bytes of the files are not in the list. The table's snapshots count them as
+        // they go (`total-files-size`), so those since `of` are the difference of the two
+        // counts; only when a snapshot does not count them are the manifests read.
+        let size = |id: i64| {
+            md.snapshot_by_id(id)?
+                .summary()
+                .additional_properties
+                .get("total-files-size")?
+                .parse::<u64>()
+                .ok()
+        };
+        match (size(now), size(of)) {
+            (Some(n), Some(o)) if n >= o => totals.bytes = n - o,
+            _ => {
+                for m in counted {
+                    let seen = self.scan(table, m).await?;
+                    totals.bytes += seen.bytes;
+                }
+            }
         }
         Ok((carried, totals))
+    }
+
+    /// What the data files of manifest `m`, added since the rewritten snapshot, add up to;
+    /// read once, whatever the number of attempts.
+    async fn scan(&mut self, table: &Table, m: &ManifestFile) -> Result<Totals> {
+        if let Some(seen) = self.scanned.get(&m.manifest_path) {
+            return Ok(seen.clone());
+        }
+        let mut of_manifest = Totals::default();
+        for e in table.manifest_reader().read(m).await?.entries() {
+            if e.is_alive() {
+                if e.content_type() != DataContentType::Data {
+                    return Err(PeqlError::Conflict(format!(
+                        "snapshot {} added delete files",
+                        m.added_snapshot_id
+                    )));
+                }
+                of_manifest.records += e.data_file().record_count();
+                of_manifest.files += 1;
+                of_manifest.bytes += e.data_file().file_size_in_bytes();
+            }
+        }
+        self.scanned
+            .insert(m.manifest_path.clone(), of_manifest.clone());
+        Ok(of_manifest)
     }
 }
 
@@ -1363,6 +1592,61 @@ impl Catalog for Pinned {
         self.inner.register_table(table, metadata_location).await
     }
     async fn update_table(&self, commit: TableCommit) -> iceberg::Result<Table> {
-        self.inner.update_table(commit).await
+        // A commit the catalog refused is computed again by the caller (a rewrite) or is a
+        // conflict (an overwrite), never retried by the crate: its retry would wait out its
+        // backoff only to be refused by `load_table` above.
+        self.inner
+            .update_table(commit)
+            .await
+            .map_err(|e| match e.kind() {
+                ErrorKind::CatalogCommitConflicts => e.with_retryable(false),
+                _ => e,
+            })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn policy(retries: usize, min: u64, max: u64, total: u64) -> CommitRetry {
+        CommitRetry {
+            retries,
+            min_wait: Duration::from_millis(min),
+            max_wait: Duration::from_millis(max),
+            total: Duration::from_millis(total),
+        }
+    }
+
+    #[test]
+    fn the_wait_doubles_from_the_minimum_with_a_random_share_and_stops_at_the_maximum() {
+        let p = policy(10, 100, 1_000, 60_000);
+        let none: Vec<u128> = (0..6).map(|n| p.wait_for(n, 0.0).as_millis()).collect();
+        assert_eq!(none, [100, 200, 400, 800, 1_000, 1_000]);
+        let most: Vec<u128> = (0..6).map(|n| p.wait_for(n, 1.0).as_millis()).collect();
+        assert_eq!(most, [200, 400, 800, 1_000, 1_000, 1_000]);
+        // Two writers that conflicted together do not wait alike.
+        assert_ne!(p.wait_for(1, 0.2), p.wait_for(1, 0.7));
+        // A shift past the width of the counter is the maximum, not an overflow.
+        assert_eq!(p.wait_for(500, 0.5), Duration::from_millis(1_000));
+    }
+
+    #[tokio::test]
+    async fn retries_are_the_tables_and_end_with_the_total_time() {
+        let mut r = policy(2, 1, 5, 60_000).start();
+        assert!(r.wait().await);
+        assert!(r.wait().await);
+        assert!(!r.wait().await, "two retries were allowed");
+        assert_eq!(r.attempts(), 3);
+
+        let mut none = policy(0, 1, 5, 60_000).start();
+        assert!(!none.wait().await);
+        assert_eq!(none.attempts(), 1);
+
+        // The wait would pass the total time: no retry, and no wait.
+        let mut late = policy(5, 1_000, 1_000, 10).start();
+        let at = Instant::now();
+        assert!(!late.wait().await);
+        assert!(at.elapsed() < Duration::from_millis(500));
     }
 }
