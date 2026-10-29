@@ -962,18 +962,7 @@ impl Engine {
         // the table's schema has it, with its id.
         #[cfg(feature = "iceberg")]
         let plan = match &w.iceberg {
-            Some(iw) => {
-                let columns = iw.schema().fields().iter().map(|f| {
-                    let metadata: BTreeMap<String, String> = f
-                        .metadata()
-                        .iter()
-                        .map(|(k, v)| (k.clone(), v.clone()))
-                        .collect();
-                    datafusion::logical_expr::cast(col_ref(f.name()), f.data_type().clone())
-                        .alias_with_metadata(f.name(), Some(metadata.into()))
-                });
-                LogicalPlanBuilder::from(plan).project(columns)?.build()?
-            }
+            Some(iw) => iw.project(plan)?,
             None => plan,
         };
         let df = ctx
@@ -1361,7 +1350,8 @@ impl Engine {
             return Ok(None);
         }
         let c = &reg.compilation;
-        let stored = t.provider(&table, &c.contract, true, snapshot).await?;
+        // Every column of the table, not only the contract's: the rows are copied as stored.
+        let stored = t.whole(&table, snapshot).await?;
         let replaced = files.into_iter().map(|f| f.relative).collect();
         let w = self
             // The rows are rewritten as stored: a compaction neither refuses nor sets aside any.
@@ -1385,16 +1375,7 @@ impl Engine {
         let scan = LogicalPlanBuilder::scan("stored", provider_as_source(stored), None)?
             .repartition(datafusion::logical_expr::Partitioning::RoundRobinBatch(1))?
             .build()?;
-        let columns = iw.schema().fields().iter().map(|f| {
-            let metadata: BTreeMap<String, String> = f
-                .metadata()
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            datafusion::logical_expr::cast(col_ref(f.name()), f.data_type().clone())
-                .alias_with_metadata(f.name(), Some(metadata.into()))
-        });
-        let plan = LogicalPlanBuilder::from(scan).project(columns)?.build()?;
+        let plan = iw.project(scan)?;
         let df = ctx.execute_logical_plan(plan).await?;
         let (options, parquet) = write_options(c, None, 0)?;
         let counts = df

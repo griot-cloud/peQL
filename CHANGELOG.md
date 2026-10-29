@@ -5,6 +5,30 @@ based on [Keep a Changelog](https://keepachangelog.com/).
 
 ## [Unreleased]: the engine cut for a guest
 
+**Fixed**
+- A write to an Iceberg table no longer removes columns. It adds the columns its contract
+  names that the table lacks and leaves the rest: a version of a contract that does not name a
+  column another version added used to delete it from the table's schema, so the newer
+  version could no longer read the table, and two versions each adding a column ended with
+  only the last writer's. The rows such a write adds hold null for the columns it does not
+  name; a table column that is required and that the contract does not name refuses the write,
+  naming the column, before anything is written. A new version that stops exposing a column
+  is served by projection; the column stays for the versions and snapshots that read it. The
+  type of a column still cannot change.
+- `Engine::compact` copies every column of the table, those the compacting contract does not
+  name among them; it read only the contract's columns.
+- A compaction or a schema change whose commit the table moved under was computed again up to
+  eight times with no wait between, which hot writers never left room for. Both now retry by
+  the table's own `commit.retry.num-retries`, `commit.retry.min-wait-ms`,
+  `commit.retry.max-wait-ms` and `commit.retry.total-timeout-ms` (Iceberg's defaults, 4, 100,
+  60000 and 1800000, when the table sets none), waiting between attempts for twice as long
+  each time, plus a random share. A compaction attempt also no longer reads the manifests
+  appended while it ran (their list entries count their files and rows, and the table's
+  snapshots count the bytes), reads none twice, and no longer waits out the Iceberg crate's own
+  backoff inside an attempt that is already refused. The compaction's conflict checks are
+  unchanged where Iceberg's rewrite requires them: every manifest of the snapshot it read is
+  still listed, and no delete files were added.
+
 **Removed**
 - The `signed-bundle` feature (`peql::signed_bundle`, `p256`): who vouches for a compiled
   contract, and how, is the embedding application's.
